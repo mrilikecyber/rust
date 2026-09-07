@@ -2,16 +2,16 @@
 
 use ide_db::SymbolKind;
 use itertools::Itertools;
-use syntax::{AstToken, Direction, NodeOrToken, SyntaxKind, algo, ast::Ident};
+use syntax::{AstToken, Direction, NodeOrToken, SmolStr, SyntaxKind, algo, ast::Ident};
 
 use crate::{CompletionItem, completions::Completions, context::CompletionContext};
 
-pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_, '_>) {
     let add_completion = |item: &str| {
         let mut completion =
             CompletionItem::new(SymbolKind::BuiltinAttr, ctx.source_range(), item, ctx.edition);
         completion.insert_text(format!(r#""{item}""#));
-        acc.add(completion.build(ctx.db));
+        completion.add_to(acc, ctx.db);
     };
 
     // FIXME: Move this into context/analysis.rs
@@ -49,17 +49,26 @@ pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
                     ctx.edition,
                 );
                 item.insert_text(insert_text);
-
-                acc.add(item.build(ctx.db));
+                item.add_to(acc, ctx.db);
             }),
         },
         None => ctx
             .krate
             .potential_cfg(ctx.db)
-            .get_cfg_keys()
-            .unique()
-            .map(|s| (s.as_str(), ""))
-            .chain(CFG_CONDITION.iter().copied())
+            .into_iter()
+            .map(|x| match x {
+                hir::CfgAtom::Flag(key) => (key.as_str(), "".into()),
+                hir::CfgAtom::KeyValue { key, .. } => (
+                    key.as_str(),
+                    if ctx.config.snippet_cap.is_some() {
+                        SmolStr::from_iter([key.as_str(), " = $0"])
+                    } else {
+                        SmolStr::default()
+                    },
+                ),
+            })
+            .chain(CFG_CONDITION.iter().map(|&(k, snip)| (k, SmolStr::new_static(snip))))
+            .unique_by(|&(s, _)| s)
             .for_each(|(s, snippet)| {
                 let mut item = CompletionItem::new(
                     SymbolKind::BuiltinAttr,
@@ -72,7 +81,7 @@ pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
                 {
                     item.insert_snippet(cap, snippet);
                 }
-                acc.add(item.build(ctx.db));
+                item.add_to(acc, ctx.db);
             }),
     }
 }
@@ -105,7 +114,7 @@ const KNOWN_ARCH: [&str; 20] = [
 
 const KNOWN_ENV: [&str; 7] = ["eabihf", "gnu", "gnueabihf", "msvc", "relibc", "sgx", "uclibc"];
 
-const KNOWN_OS: [&str; 20] = [
+const KNOWN_OS: [&str; 21] = [
     "cuda",
     "dragonfly",
     "emscripten",
@@ -119,6 +128,7 @@ const KNOWN_OS: [&str; 20] = [
     "netbsd",
     "none",
     "openbsd",
+    "ps3",
     "psp",
     "redox",
     "solaris",

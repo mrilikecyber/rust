@@ -1,5 +1,5 @@
 #![warn(clippy::while_let_loop)]
-#![allow(clippy::uninlined_format_args)]
+#![expect(clippy::uninlined_format_args)]
 //@no-rustfix
 fn main() {
     let y = Some(true);
@@ -251,5 +251,26 @@ fn let_assign() {
         if x == 3 {
             break;
         }
+    }
+}
+
+fn issue16378() {
+    // This does not lint today because of the extra statement(s)
+    // before the `break`.
+    // TODO: When the `break` statement/expr in the `let`/`else` is the
+    // only way to leave the loop, the lint could trigger and move
+    // the statements preceeding the `break` after the loop, as in:
+    // ```rust
+    // while let Some(x) = std::hint::black_box(None::<i32>) {
+    //     println!("x = {x}");
+    // }
+    // println!("fail");
+    // ```
+    loop {
+        let Some(x) = std::hint::black_box(None::<i32>) else {
+            println!("fail");
+            break;
+        };
+        println!("x = {x}");
     }
 }

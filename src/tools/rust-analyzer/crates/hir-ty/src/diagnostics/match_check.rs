@@ -14,14 +14,15 @@ use hir_def::{
     expr_store::{Body, path::Path},
     hir::PatId,
     item_tree::FieldsShape,
+    signatures::{StructSignature, UnionSignature},
 };
 use hir_expand::name::Name;
-use rustc_type_ir::inherent::{IntoKind, SliceLike};
+use rustc_type_ir::inherent::IntoKind;
 use span::Edition;
 use stdx::{always, never, variance::PhantomCovariantLifetime};
 
 use crate::{
-    InferenceResult,
+    ByRef, InferenceResult,
     db::HirDatabase,
     display::{HirDisplay, HirDisplayError, HirFormatter},
     infer::BindingMode,
@@ -96,7 +97,7 @@ pub(crate) enum PatKind<'db> {
 
 pub(crate) struct PatCtxt<'a, 'db> {
     db: &'db dyn HirDatabase,
-    infer: &'a InferenceResult<'db>,
+    infer: &'db InferenceResult<'db>,
     body: &'a Body,
     pub(crate) errors: Vec<PatternError>,
 }
@@ -104,7 +105,7 @@ pub(crate) struct PatCtxt<'a, 'db> {
 impl<'a, 'db> PatCtxt<'a, 'db> {
     pub(crate) fn new(
         db: &'db dyn HirDatabase,
-        infer: &'a InferenceResult<'db>,
+        infer: &'db InferenceResult<'db>,
         body: &'a Body,
     ) -> Self {
         Self { db, infer, body, errors: Vec::new() }
@@ -119,12 +120,15 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
         let unadjusted_pat = self.lower_pattern_unadjusted(pat);
         self.infer.pat_adjustments.get(&pat).map(|it| &**it).unwrap_or_default().iter().rev().fold(
             unadjusted_pat,
-            |subpattern, ref_ty| Pat { ty: *ref_ty, kind: Box::new(PatKind::Deref { subpattern }) },
+            |subpattern, ref_ty| Pat {
+                ty: ref_ty.source.as_ref(),
+                kind: Box::new(PatKind::Deref { subpattern }),
+            },
         )
     }
 
     fn lower_pattern_unadjusted(&mut self, pat: PatId) -> Pat<'db> {
-        let mut ty = self.infer[pat];
+        let mut ty = self.infer.pat_ty(pat);
         let variant = self.infer.variant_resolution_for_pat(pat);
 
         let kind = match self.body[pat] {
@@ -151,11 +155,11 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
 
             hir_def::hir::Pat::Bind { id, subpat, .. } => {
                 let bm = self.infer.binding_modes[pat];
-                ty = self.infer[id];
+                ty = self.infer.binding_ty(id);
                 let name = &self.body[id].name;
                 match (bm, ty.kind()) {
-                    (BindingMode::Ref(_), TyKind::Ref(_, rty, _)) => ty = rty,
-                    (BindingMode::Ref(_), _) => {
+                    (BindingMode(ByRef::Yes(_), _), TyKind::Ref(_, rty, _)) => ty = rty,
+                    (BindingMode(ByRef::Yes(_), _), _) => {
                         never!(
                             "`ref {}` has wrong type {:?}",
                             name.display(self.db, Edition::LATEST),
@@ -273,7 +277,7 @@ impl<'a, 'db> PatCtxt<'a, 'db> {
     }
 
     fn lower_path(&mut self, pat: PatId, _path: &Path) -> Pat<'db> {
-        let ty = self.infer[pat];
+        let ty = self.infer.pat_ty(pat);
 
         let pat_from_kind = |kind| Pat { ty, kind: Box::new(kind) };
 
@@ -326,23 +330,17 @@ impl<'db> HirDisplay<'db> for Pat<'db> {
                     match variant {
                         VariantId::EnumVariantId(v) => {
                             let loc = v.lookup(f.db);
-                            write!(
-                                f,
-                                "{}",
-                                loc.parent.enum_variants(f.db).variants[loc.index as usize]
-                                    .1
-                                    .display(f.db, f.edition())
-                            )?;
+                            write!(f, "{}", loc.name.display(f.db, f.edition()))?;
                         }
                         VariantId::StructId(s) => write!(
                             f,
                             "{}",
-                            f.db.struct_signature(s).name.display(f.db, f.edition())
+                            StructSignature::of(f.db, s).name.display(f.db, f.edition())
                         )?,
                         VariantId::UnionId(u) => write!(
                             f,
                             "{}",
-                            f.db.union_signature(u).name.display(f.db, f.edition())
+                            UnionSignature::of(f.db, u).name.display(f.db, f.edition())
                         )?,
                     };
 

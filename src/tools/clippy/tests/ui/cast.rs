@@ -1,18 +1,18 @@
 //@no-rustfix: only some diagnostics have suggestions
 
 #![warn(
-    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
 )]
-#![allow(
+#![expect(
     clippy::cast_abs_to_unsigned,
+    clippy::identity_op,
     clippy::no_effect,
-    clippy::unnecessary_min_or_max,
-    clippy::unnecessary_operation,
     clippy::unnecessary_literal_unwrap,
-    clippy::identity_op
+    clippy::unnecessary_min_or_max,
+    clippy::unnecessary_operation
 )]
 
 // FIXME(f16_f128): add tests once const casting is available for these types
@@ -581,4 +581,24 @@ mod issue14150 {
         _ = 1u8 as i8;
         //~^ cast_possible_wrap
     }
+}
+
+fn issue16045() {
+    fn f() -> Result<(), ()> {
+        let val = Ok::<_, ()>(0u8);
+        _ = val? as i8;
+        //~^ cast_possible_wrap
+
+        Ok(())
+    }
+}
+
+fn issue_17501() {
+    macro_rules! cast_from_macro {
+        () => {
+            5_i64
+        };
+    }
+    let _ = cast_from_macro!() as i32;
+    //~^ cast_possible_truncation
 }

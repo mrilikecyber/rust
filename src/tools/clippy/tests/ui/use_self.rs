@@ -1,15 +1,9 @@
 //@aux-build:proc_macro_derive.rs
 
 #![warn(clippy::use_self)]
-#![allow(dead_code, unreachable_code)]
-#![allow(
-    clippy::should_implement_trait,
-    clippy::upper_case_acronyms,
-    clippy::from_over_into,
-    clippy::self_named_constructors,
-    clippy::needless_lifetimes,
-    clippy::missing_transmute_annotations
-)]
+#![expect(incomplete_features, clippy::from_over_into, clippy::self_named_constructors)]
+#![feature(adt_const_params)]
+#![feature(unsized_const_params)]
 
 #[macro_use]
 extern crate proc_macro_derive;
@@ -157,7 +151,6 @@ mod nesting {
     struct Foo;
     impl Foo {
         fn foo() {
-            #[allow(unused_imports)]
             use self::Foo; // Can't use Self here
             struct Bar {
                 foo: Foo, // Foo != Self
@@ -192,7 +185,6 @@ mod nesting {
     }
     impl Enum {
         fn method() {
-            #[allow(unused_imports)]
             use self::Enum::*; // Issue 3425
             static STATIC: Enum = Enum::A; // Can't use Self as type
         }
@@ -767,5 +759,27 @@ mod issue_13277 {
         // when checking whether `Option<Bar<'foo>>` has a lifetime, check not only the outer
         // `Option<T>`, but also the inner `Bar<'foo>`
         type Item<'foo> = Option<Bar<'foo>>;
+    }
+}
+
+mod issue16164 {
+    trait Bits {
+        fn bit<const I: u8>(self) -> bool;
+    }
+
+    impl Bits for u8 {
+        fn bit<const I: u8>(self) -> bool {
+            todo!()
+        }
+    }
+
+    trait T {
+        fn f<const C: (u8, u8)>(self) -> bool;
+    }
+
+    impl T for u8 {
+        fn f<const C: (u8, u8)>(self) -> bool {
+            todo!()
+        }
     }
 }

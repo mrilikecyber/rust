@@ -67,6 +67,8 @@ pub enum HlMod {
     /// `foo` in `fn foo(x: i32)` is a definition, `foo` in `foo(90 + 2)` is
     /// not.
     Definition,
+    /// Used for things with the `#[deprecated]` attribute.
+    Deprecated,
     /// Doc-strings like this one.
     Documentation,
     /// Highlighting injection like rust code in doc strings or ra_fixture.
@@ -142,6 +144,7 @@ impl HlTag {
                 SymbolKind::BuiltinAttr => "builtin_attr",
                 SymbolKind::Const => "constant",
                 SymbolKind::ConstParam => "const_param",
+                SymbolKind::CrateRoot => "crate_root",
                 SymbolKind::Derive => "derive",
                 SymbolKind::DeriveHelper => "derive_helper",
                 SymbolKind::Enum => "enum",
@@ -224,6 +227,7 @@ impl HlMod {
         HlMod::CrateRoot,
         HlMod::DefaultLibrary,
         HlMod::Definition,
+        HlMod::Deprecated,
         HlMod::Documentation,
         HlMod::Injected,
         HlMod::IntraDocLink,
@@ -250,6 +254,7 @@ impl HlMod {
             HlMod::CrateRoot => "crate_root",
             HlMod::DefaultLibrary => "default_library",
             HlMod::Definition => "declaration",
+            HlMod::Deprecated => "deprecated",
             HlMod::Documentation => "documentation",
             HlMod::Injected => "injected",
             HlMod::IntraDocLink => "intra_doc_link",

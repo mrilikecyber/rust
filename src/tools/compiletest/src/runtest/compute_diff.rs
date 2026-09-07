@@ -1,21 +1,16 @@
 use std::collections::VecDeque;
-use std::fs::{File, FileType};
-
-use camino::Utf8Path;
-
-use crate::runtest::TestCx;
 
 #[derive(Debug, PartialEq)]
-pub enum DiffLine {
+pub(crate) enum DiffLine {
     Context(String),
     Expected(String),
     Resulting(String),
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Mismatch {
-    pub line_number: u32,
-    pub lines: Vec<DiffLine>,
+pub(crate) struct Mismatch {
+    pub(crate) line_number: u32,
+    pub(crate) lines: Vec<DiffLine>,
 }
 
 impl Mismatch {
@@ -25,7 +20,7 @@ impl Mismatch {
 }
 
 // Produces a diff between the expected output and actual output.
-pub fn make_diff(expected: &str, actual: &str, context_size: usize) -> Vec<Mismatch> {
+pub(crate) fn make_diff(expected: &str, actual: &str, context_size: usize) -> Vec<Mismatch> {
     let mut line_number = 1;
     let mut context_queue: VecDeque<&str> = VecDeque::with_capacity(context_size);
     let mut lines_since_mismatch = context_size + 1;
@@ -110,54 +105,53 @@ pub(crate) fn write_diff(expected: &str, actual: &str, context_size: usize) -> S
     output
 }
 
-/// Filters based on filetype and extension whether to diff a file.
-///
-/// Returns whether any data was actually written.
-pub(crate) fn write_filtered_diff<Filter>(
-    cx: &TestCx<'_>,
-    diff_filename: &str,
-    out_dir: &Utf8Path,
-    compare_dir: &Utf8Path,
-    verbose: bool,
-    filter: Filter,
-) -> bool
-where
-    Filter: Fn(FileType, Option<&str>) -> bool,
-{
-    use std::io::{Read, Write};
-    let mut diff_output = File::create(diff_filename).unwrap();
-    let mut wrote_data = false;
-    for entry in walkdir::WalkDir::new(out_dir.as_std_path()) {
-        let entry = entry.expect("failed to read file");
-        let extension = entry.path().extension().and_then(|p| p.to_str());
-        if filter(entry.file_type(), extension) {
-            let expected_path = compare_dir
-                .as_std_path()
-                .join(entry.path().strip_prefix(&out_dir.as_std_path()).unwrap());
-            let expected = if let Ok(s) = std::fs::read(&expected_path) { s } else { continue };
-            let actual_path = entry.path();
-            let actual = std::fs::read(&actual_path).unwrap();
-            let diff = unified_diff::diff(
-                &expected,
-                &expected_path.to_str().unwrap(),
-                &actual,
-                &actual_path.to_str().unwrap(),
-                3,
-            );
-            wrote_data |= !diff.is_empty();
-            diff_output.write_all(&diff).unwrap();
+pub(crate) fn diff_by_lines(expected: &[String], actual: &[String]) -> String {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+    let mut output = String::new();
+    let mut expected_counts: HashMap<&str, usize> = HashMap::new();
+    let mut actual_counts: HashMap<&str, usize> = HashMap::new();
+
+    for line in expected {
+        *expected_counts.entry(line.as_str()).or_insert(0) += 1;
+    }
+    for line in actual {
+        *actual_counts.entry(line.as_str()).or_insert(0) += 1;
+    }
+
+    fn write_expected_only_lines(
+        output: &mut String,
+        expected_lines: &HashMap<&str, usize>,
+        actual_lines: &HashMap<&str, usize>,
+    ) {
+        let mut expected_only: Vec<(&str, usize)> = expected_lines
+            .iter()
+            .filter_map(|(&line, &expected_count)| {
+                let actual_count = actual_lines.get(line).copied().unwrap_or(0);
+                if expected_count > actual_count {
+                    Some((line, expected_count - actual_count))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        expected_only.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        if expected_only.is_empty() {
+            writeln!(output, "(no lines found)").unwrap();
+        } else {
+            for (line, diff) in expected_only {
+                for _ in 0..diff {
+                    writeln!(output, "{line}").unwrap();
+                }
+            }
         }
     }
 
-    if !wrote_data {
-        writeln!(cx.stdout, "note: diff is identical to nightly rustdoc");
-        assert!(diff_output.metadata().unwrap().len() == 0);
-        return false;
-    } else if verbose {
-        writeln!(cx.stderr, "printing diff:");
-        let mut buf = Vec::new();
-        diff_output.read_to_end(&mut buf).unwrap();
-        std::io::stderr().lock().write_all(&mut buf).unwrap();
-    }
-    true
+    writeln!(output, "Compare output by lines enabled, diff by lines:").unwrap();
+    writeln!(output, "Expected contains these lines that are not in actual:").unwrap();
+    write_expected_only_lines(&mut output, &expected_counts, &actual_counts);
+    writeln!(output, "Actual contains these lines that are not in expected:").unwrap();
+    write_expected_only_lines(&mut output, &actual_counts, &expected_counts);
+    output
 }

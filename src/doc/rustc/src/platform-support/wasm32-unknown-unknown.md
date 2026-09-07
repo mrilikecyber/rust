@@ -15,8 +15,9 @@ but many parts of the standard library do not work and return errors. For
 example `println!` does nothing, `std::fs` always return errors, and
 `std::thread::spawn` will panic. There is no means by which this can be
 overridden. For a WebAssembly target that more fully supports the standard
-library see the [`wasm32-wasip1`](./wasm32-wasip1.md) or
-[`wasm32-wasip2`](./wasm32-wasip2.md) targets.
+library see the [`wasm32-wasip1`](./wasm32-wasip1.md),
+[`wasm32-wasip2`](./wasm32-wasip2.md), or
+[`wasm32-wasip3`](./wasm32-wasip3.md), targets.
 
 The `wasm32-unknown-unknown` target has full support for the `core` and `alloc`
 crates. It additionally supports the `HashMap` type in the `std` crate, although
@@ -267,3 +268,18 @@ the meantime using `-Cpanic=unwind` will require using [`-Zbuild-std`] and
 passing the appropriate flags to rustc.
 
 [`-Zbuild-std`]: ../../cargo/reference/unstable.html#build-std
+
+### The exception tag for panics
+
+Rust panics are currently implemented as a specific class of C++ exceptions.
+This is because llvm only supports throwing and catching the C++ exception tag
+from `wasm_throw` intrinsic and the lowering for the catchpads emitted by the
+Rust try intrinsic.
+
+In particular, llvm throw and catch blocks expect a `WebAssembly.Tag` symbol
+called `__cpp_exception`. If it is not defined somewhere, llvm will generate an
+Emscripten style import from `env.__cpp_exception`. We don't want this, so we
+define the symbol in `libunwind` but only for wasm32-unknown-unknown. WASI
+doesn't currently support unwinding at all, and the Emscripten linker provides
+the tag in an appropriate manner depending on what sort of binary is being
+linked.

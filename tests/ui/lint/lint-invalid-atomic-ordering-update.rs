@@ -1,5 +1,6 @@
 //@ only-x86_64
-#![feature(atomic_try_update)]
+
+#![allow(deprecated)]
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 

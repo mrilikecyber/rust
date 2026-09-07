@@ -3,14 +3,17 @@ use super::utils::make_iterator_snippet;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::ForLoop;
 use clippy_utils::macros::root_macro_call_first_node;
-use clippy_utils::source::snippet;
+use clippy_utils::source::{snippet, snippet_with_context};
 use clippy_utils::visitors::{Descend, for_each_expr_without_closures};
+use clippy_utils::{contains_return, sym};
+use rustc_ast::BinOpKind;
 use rustc_errors::Applicability;
 use rustc_hir::{
-    Block, Destination, Expr, ExprKind, HirId, InlineAsm, InlineAsmOperand, Node, Pat, Stmt, StmtKind, StructTailExpr,
+    Block, Closure, Destination, Expr, ExprKind, HirId, InlineAsm, InlineAsmOperand, Node, Pat, Stmt, StmtKind,
+    StructTailExpr,
 };
 use rustc_lint::LateContext;
-use rustc_span::{BytePos, Span, sym};
+use rustc_span::{BytePos, Span};
 use std::iter::once;
 use std::ops::ControlFlow;
 
@@ -23,8 +26,9 @@ pub(super) fn check<'tcx>(
 ) {
     match never_loop_block(cx, block, &mut Vec::new(), loop_id) {
         NeverLoopResult::Diverging {
-            ref break_spans,
-            ref never_spans,
+            break_spans,
+            never_spans,
+            non_obvious_exprs,
         } => {
             span_lint_and_then(cx, NEVER_LOOP, span, "this loop never actually loops", |diag| {
                 if let Some(ForLoop {
@@ -51,9 +55,9 @@ pub(super) fn check<'tcx>(
                         for_span.with_hi(iterator.span.hi()),
                         for_to_if_let_sugg(cx, iterator, pat),
                     )];
-                    // Make sure to clear up the diverging sites when we remove a loopp.
-                    suggestions.extend(break_spans.iter().map(|span| (*span, String::new())));
-                    diag.multipart_suggestion_verbose(
+                    // Make sure to clear up the diverging sites when we remove a loop.
+                    suggestions.extend(break_spans.into_iter().map(|span| (span, String::new())));
+                    diag.multipart_suggestion(
                         "if you need the first element of the iterator, try writing",
                         suggestions,
                         app,
@@ -61,14 +65,48 @@ pub(super) fn check<'tcx>(
 
                     for span in never_spans {
                         diag.span_help(
-                            *span,
+                            span,
                             "this code is unreachable. Consider moving the reachable parts out",
                         );
                     }
                 }
+
+                let non_obvious_spans = non_obvious_exprs
+                    .into_iter()
+                    .map(|hir_id| cx.tcx.hir_expect_expr(hir_id))
+                    .flat_map(|expr| find_non_obvious_spans(cx, expr));
+
+                for span in non_obvious_spans {
+                    diag.span_note(span, "this expression never returns");
+                }
             });
         },
         NeverLoopResult::MayContinueMainLoop | NeverLoopResult::Normal => (),
+    }
+}
+
+pub(super) fn check_iterator_reduction<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    recv: &'tcx Expr<'tcx>,
+    closure: &'tcx Closure<'tcx>,
+) {
+    let closure_body = cx.tcx.hir_body(closure.body).value;
+    let body_ty = cx.typeck_results().expr_ty(closure_body);
+    if body_ty.is_never() && !contains_return(closure_body) {
+        span_lint_and_then(
+            cx,
+            NEVER_LOOP,
+            expr.span,
+            "this iterator reduction never loops (closure always diverges)",
+            |diag| {
+                let mut app = Applicability::HasPlaceholders;
+                let recv_snip = snippet_with_context(cx, recv.span, expr.span.ctxt(), "<iter>", &mut app).0;
+                diag.note("if you only need one element, `if let Some(x) = iter.next()` is clearer");
+                let sugg = format!("if let Some(x) = {recv_snip}.next() {{ ... }}");
+                diag.span_suggestion_verbose(expr.span, "consider this pattern", sugg, app);
+            },
+        );
     }
 }
 
@@ -92,8 +130,7 @@ fn contains_label(asm: &InlineAsm<'_>) -> bool {
 ///
 /// * Has any (reachable) code path hit a `continue` of the main loop?
 /// * Is the current code path diverging (that is, the next expression is not reachable)
-/// * For each block label `'a` inside the main loop, has any (reachable) code path encountered a
-///   `break 'a`?
+/// * For each block label `'a` inside the main loop, has any (reachable) code path encountered a `break 'a`?
 ///
 /// The first two bits of information are in this enum, and the last part is in the
 /// `local_labels` variable, which contains a list of `(block_id, reachable)` pairs ordered by
@@ -107,6 +144,7 @@ enum NeverLoopResult {
     Diverging {
         break_spans: Vec<Span>,
         never_spans: Vec<Span>,
+        non_obvious_exprs: Vec<HirId>,
     },
     /// We have not encountered any main loop continue,
     /// and subsequent control flow is (possibly) reachable
@@ -153,17 +191,21 @@ fn combine_branches(b1: NeverLoopResult, b2: NeverLoopResult) -> NeverLoopResult
             NeverLoopResult::Diverging {
                 break_spans: mut break_spans1,
                 never_spans: mut never_spans1,
+                non_obvious_exprs: mut non_obvious_exprs1,
             },
             NeverLoopResult::Diverging {
                 break_spans: mut break_spans2,
                 never_spans: mut never_spans2,
+                non_obvious_exprs: mut non_obvious_exprs2,
             },
         ) => {
             break_spans1.append(&mut break_spans2);
             never_spans1.append(&mut never_spans2);
+            non_obvious_exprs1.append(&mut non_obvious_exprs2);
             NeverLoopResult::Diverging {
                 break_spans: break_spans1,
                 never_spans: never_spans1,
+                non_obvious_exprs: non_obvious_exprs1,
             }
         },
     }
@@ -250,7 +292,7 @@ fn is_label_for_block(cx: &LateContext<'_>, dest: &Destination) -> bool {
 #[expect(clippy::too_many_lines)]
 fn never_loop_expr<'tcx>(
     cx: &LateContext<'tcx>,
-    expr: &Expr<'tcx>,
+    expr: &'tcx Expr<'tcx>,
     local_labels: &mut Vec<(HirId, bool)>,
     main_loop_id: HirId,
 ) -> NeverLoopResult {
@@ -278,6 +320,9 @@ fn never_loop_expr<'tcx>(
             }
         },
         ExprKind::Call(e, es) => never_loop_expr_all(cx, once(e).chain(es.iter()), local_labels, main_loop_id),
+        ExprKind::Binary(op, e1, _) if matches!(op.node, BinOpKind::And | BinOpKind::Or) => {
+            never_loop_expr(cx, e1, local_labels, main_loop_id)
+        },
         ExprKind::Binary(_, e1, e2)
         | ExprKind::Assign(e1, e2, _)
         | ExprKind::AssignOp(_, e1, e2)
@@ -304,6 +349,7 @@ fn never_loop_expr<'tcx>(
                     NeverLoopResult::Diverging {
                         break_spans: vec![],
                         never_spans: vec![],
+                        non_obvious_exprs: vec![],
                     },
                     |a, b| combine_branches(a, never_loop_expr(cx, b.body, local_labels, main_loop_id)),
                 )
@@ -330,6 +376,7 @@ fn never_loop_expr<'tcx>(
                 NeverLoopResult::Diverging {
                     break_spans: all_spans_after_expr(cx, expr),
                     never_spans: vec![],
+                    non_obvious_exprs: vec![],
                 }
             }
         },
@@ -343,6 +390,7 @@ fn never_loop_expr<'tcx>(
                 NeverLoopResult::Diverging {
                     break_spans: vec![],
                     never_spans: vec![],
+                    non_obvious_exprs: vec![],
                 }
             })
         },
@@ -360,6 +408,7 @@ fn never_loop_expr<'tcx>(
                         all_spans_after_expr(cx, expr)
                     },
                     never_spans: vec![],
+                    non_obvious_exprs: vec![],
                 }
             })
         },
@@ -367,6 +416,7 @@ fn never_loop_expr<'tcx>(
             NeverLoopResult::Diverging {
                 break_spans: vec![],
                 never_spans: vec![],
+                non_obvious_exprs: vec![],
             }
         }),
         ExprKind::InlineAsm(asm) => combine_seq_many(asm.operands.iter().map(|(o, _)| match o {
@@ -403,11 +453,13 @@ fn never_loop_expr<'tcx>(
         | ExprKind::Lit(_)
         | ExprKind::Err(_) => NeverLoopResult::Normal,
     };
+
     let result = combine_seq(result, || {
         if cx.typeck_results().expr_ty(expr).is_never() {
             NeverLoopResult::Diverging {
                 break_spans: vec![],
                 never_spans: all_spans_after_expr(cx, expr),
+                non_obvious_exprs: vec![expr.hir_id],
             }
         } else {
             NeverLoopResult::Normal
@@ -448,4 +500,60 @@ fn mark_block_as_reachable(expr: &Expr<'_>, local_labels: &mut [(HirId, bool)]) 
     {
         *reachable = true;
     }
+}
+
+fn find_non_obvious_spans<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'tcx>) -> Vec<Span> {
+    let mut spans = vec![];
+
+    for_each_expr_without_closures(e, |expr: &'tcx Expr<'tcx>| -> ControlFlow<(), Descend> {
+        if cx.typeck_results().expr_ty(expr).is_never() && !expr.span.from_expansion() {
+            match expr.kind {
+                // The first arm handles both directly divergent expressions and expressions
+                // that contain divergence indirectly. The latter are inspected to identify
+                // possible inner non-trivial divergent expressions.
+                ExprKind::Break(..)
+                | ExprKind::Continue(..)
+                | ExprKind::Ret(..)
+                | ExprKind::Become(..)
+                | ExprKind::Loop(..)
+                | ExprKind::Block(..)
+                | ExprKind::Match(..)
+                | ExprKind::If(..) => {
+                    return ControlFlow::Continue(Descend::Yes);
+                },
+                ExprKind::ConstBlock(..)
+                | ExprKind::Array(..)
+                | ExprKind::Call(..)
+                | ExprKind::MethodCall(..)
+                | ExprKind::Use(..)
+                | ExprKind::Tup(..)
+                | ExprKind::Binary(..)
+                | ExprKind::Unary(..)
+                | ExprKind::Lit(..)
+                | ExprKind::Cast(..)
+                | ExprKind::Type(..)
+                | ExprKind::DropTemps(..)
+                | ExprKind::Let(..)
+                | ExprKind::Closure(..)
+                | ExprKind::Assign(..)
+                | ExprKind::AssignOp(..)
+                | ExprKind::Field(..)
+                | ExprKind::Index(..)
+                | ExprKind::Path(..)
+                | ExprKind::AddrOf(..)
+                | ExprKind::InlineAsm(..)
+                | ExprKind::OffsetOf(..)
+                | ExprKind::Struct(..)
+                | ExprKind::Repeat(..)
+                | ExprKind::Yield(..)
+                | ExprKind::UnsafeBinderCast(..)
+                | ExprKind::Err(..) => {
+                    spans.push(expr.span);
+                    return ControlFlow::Continue(Descend::No);
+                },
+            }
+        }
+        ControlFlow::Continue(Descend::Yes)
+    });
+    spans
 }

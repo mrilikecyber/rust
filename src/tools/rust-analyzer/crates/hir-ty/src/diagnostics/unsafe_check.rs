@@ -5,11 +5,12 @@ use std::mem;
 
 use either::Either;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FieldId, FunctionId, VariantId,
-    expr_store::{Body, path::Path},
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
+    VariantId,
+    expr_store::{Body, ExpressionStore, path::Path},
     hir::{AsmOperand, Expr, ExprId, ExprOrPatId, InlineAsmKind, Pat, PatId, Statement, UnaryOp},
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
-    signatures::StaticFlags,
+    signatures::{FunctionSignature, StaticFlags, StaticSignature},
     type_ref::Rawness,
 };
 use rustc_type_ir::inherent::IntoKind;
@@ -34,15 +35,15 @@ pub fn missing_unsafe(db: &dyn HirDatabase, def: DefWithBodyId) -> MissingUnsafe
     let _p = tracing::info_span!("missing_unsafe").entered();
 
     let is_unsafe = match def {
-        DefWithBodyId::FunctionId(it) => db.function_signature(it).is_unsafe(),
+        DefWithBodyId::FunctionId(it) => FunctionSignature::of(db, it).is_unsafe(),
         DefWithBodyId::StaticId(_) | DefWithBodyId::ConstId(_) | DefWithBodyId::VariantId(_) => {
             false
         }
     };
 
     let mut res = MissingUnsafeResult { fn_is_unsafe: is_unsafe, ..MissingUnsafeResult::default() };
-    let body = db.body(def);
-    let infer = db.infer(def);
+    let body = Body::of(db, def);
+    let infer = InferenceResult::of(db, def);
     let mut callback = |diag| match diag {
         UnsafeDiagnostic::UnsafeOperation { node, inside_unsafe_block, reason } => {
             if inside_unsafe_block == InsideUnsafeBlock::No {
@@ -55,15 +56,15 @@ pub fn missing_unsafe(db: &dyn HirDatabase, def: DefWithBodyId) -> MissingUnsafe
             }
         }
     };
-    let mut visitor = UnsafeVisitor::new(db, &infer, &body, def, &mut callback);
-    visitor.walk_expr(body.body_expr);
+    let mut visitor = UnsafeVisitor::new(db, infer, body, def.into(), &mut callback);
+    visitor.walk_expr(body.root_expr());
 
     if !is_unsafe {
         // Unsafety in function parameter patterns (that can only be union destructuring)
         // cannot be inserted into an unsafe block, so even with `unsafe_op_in_unsafe_fn`
         // it is turned off for unsafe functions.
-        for &param in &body.params {
-            visitor.walk_pat(param);
+        for param in &body.params {
+            visitor.walk_pat(param.formal);
         }
     }
 
@@ -97,9 +98,9 @@ enum UnsafeDiagnostic {
     DeprecatedSafe2024 { node: ExprId, inside_unsafe_block: InsideUnsafeBlock },
 }
 
-pub fn unsafe_operations_for_body<'db>(
-    db: &'db dyn HirDatabase,
-    infer: &InferenceResult<'db>,
+pub fn unsafe_operations_for_body(
+    db: &dyn HirDatabase,
+    infer: &InferenceResult<'_>,
     def: DefWithBodyId,
     body: &Body,
     callback: &mut dyn FnMut(ExprOrPatId),
@@ -109,18 +110,18 @@ pub fn unsafe_operations_for_body<'db>(
             callback(node);
         }
     };
-    let mut visitor = UnsafeVisitor::new(db, infer, body, def, &mut visitor_callback);
-    visitor.walk_expr(body.body_expr);
-    for &param in &body.params {
-        visitor.walk_pat(param);
+    let mut visitor = UnsafeVisitor::new(db, infer, body, def.into(), &mut visitor_callback);
+    visitor.walk_expr(body.root_expr());
+    for param in &body.params {
+        visitor.walk_pat(param.formal);
     }
 }
 
-pub fn unsafe_operations<'db>(
-    db: &'db dyn HirDatabase,
-    infer: &InferenceResult<'db>,
-    def: DefWithBodyId,
-    body: &Body,
+pub fn unsafe_operations(
+    db: &dyn HirDatabase,
+    infer: &InferenceResult<'_>,
+    def: ExpressionStoreOwnerId,
+    body: &ExpressionStore,
     current: ExprId,
     callback: &mut dyn FnMut(ExprOrPatId, InsideUnsafeBlock),
 ) {
@@ -137,14 +138,14 @@ pub fn unsafe_operations<'db>(
 struct UnsafeVisitor<'db> {
     db: &'db dyn HirDatabase,
     infer: &'db InferenceResult<'db>,
-    body: &'db Body,
+    body: &'db ExpressionStore,
     resolver: Resolver<'db>,
-    def: DefWithBodyId,
+    def: ExpressionStoreOwnerId,
     inside_unsafe_block: InsideUnsafeBlock,
     inside_assignment: bool,
     inside_union_destructure: bool,
     callback: &'db mut dyn FnMut(UnsafeDiagnostic),
-    def_target_features: TargetFeatures,
+    def_target_features: TargetFeatures<'db>,
     // FIXME: This needs to be the edition of the span of each call.
     edition: Edition,
     /// On some targets (WASM), calling safe functions with `#[target_feature]` is always safe, even when
@@ -156,16 +157,19 @@ impl<'db> UnsafeVisitor<'db> {
     fn new(
         db: &'db dyn HirDatabase,
         infer: &'db InferenceResult<'db>,
-        body: &'db Body,
-        def: DefWithBodyId,
+        body: &'db ExpressionStore,
+        def: ExpressionStoreOwnerId,
         unsafe_expr_cb: &'db mut dyn FnMut(UnsafeDiagnostic),
     ) -> Self {
         let resolver = def.resolver(db);
         let def_target_features = match def {
-            DefWithBodyId::FunctionId(func) => TargetFeatures::from_attrs(&db.attrs(func.into())),
+            ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(func))
+            | ExpressionStoreOwnerId::Signature(GenericDefId::FunctionId(func)) => {
+                TargetFeatures::from_fn(db, func)
+            }
             _ => TargetFeatures::default(),
         };
-        let krate = resolver.module().krate();
+        let krate = resolver.krate();
         let edition = krate.data(db).edition;
         let target_feature_is_safe = match &krate.workspace_data(db).target {
             Ok(target) => target_feature_is_safe_in_target(target),
@@ -249,18 +253,18 @@ impl<'db> UnsafeVisitor<'db> {
                 | Pat::TupleStruct { .. }
                 | Pat::Ref { .. }
                 | Pat::Box { .. }
+                | Pat::Deref { .. }
                 | Pat::Expr(..)
-                | Pat::ConstBlock(..) => {
-                    self.on_unsafe_op(current.into(), UnsafetyReason::UnionField)
-                }
+                | Pat::ConstBlock(..)
+                | Pat::NotNull => self.on_unsafe_op(current.into(), UnsafetyReason::UnionField),
                 // `Or` only wraps other patterns, and `Missing`/`Wild` do not constitute a read.
-                Pat::Missing | Pat::Wild | Pat::Or(_) => {}
+                Pat::Missing | Pat::Rest | Pat::Wild | Pat::Or(_) => {}
             }
         }
 
         match pat {
             Pat::Record { .. } => {
-                if let Some((AdtId::UnionId(_), _)) = self.infer[current].as_adt() {
+                if let Some((AdtId::UnionId(_), _)) = self.infer.pat_ty(current).as_adt() {
                     let old_inside_union_destructure =
                         mem::replace(&mut self.inside_union_destructure, true);
                     self.body.walk_pats_shallow(current, |pat| self.walk_pat(pat));
@@ -286,14 +290,14 @@ impl<'db> UnsafeVisitor<'db> {
         let inside_assignment = mem::replace(&mut self.inside_assignment, false);
         match expr {
             &Expr::Call { callee, .. } => {
-                let callee = self.infer[callee];
+                let callee = self.infer.expr_ty(callee);
                 if let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(func)), _) =
                     callee.kind()
                 {
                     self.check_call(current, func);
                 }
                 if let TyKind::FnPtr(_, hdr) = callee.kind()
-                    && hdr.safety == Safety::Unsafe
+                    && hdr.safety() == Safety::Unsafe
                 {
                     self.on_unsafe_op(current.into(), UnsafetyReason::UnsafeFnCall);
                 }
@@ -311,9 +315,7 @@ impl<'db> UnsafeVisitor<'db> {
                     // https://github.com/rust-lang/rust/pull/129248
                     // Taking a raw ref to a deref place expr is always safe.
                     Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-                        self.body
-                            .walk_child_exprs_without_pats(expr, |child| self.walk_expr(child));
-
+                        self.walk_expr(expr);
                         return;
                     }
                     _ => (),
@@ -341,7 +343,7 @@ impl<'db> UnsafeVisitor<'db> {
                 }
             }
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-                if let TyKind::RawPtr(..) = self.infer[*expr].kind() {
+                if let TyKind::RawPtr(..) = self.infer.expr_ty(*expr).kind() {
                     self.on_unsafe_op(current.into(), UnsafetyReason::RawPtrDeref);
                 }
             }
@@ -402,7 +404,7 @@ impl<'db> UnsafeVisitor<'db> {
                 });
                 return;
             }
-            Expr::Block { statements, .. } | Expr::Async { statements, .. } => {
+            Expr::Block { statements, .. } => {
                 self.walk_pats_top(
                     statements.iter().filter_map(|statement| match statement {
                         &Statement::Let { pat, .. } => Some(pat),
@@ -420,7 +422,6 @@ impl<'db> UnsafeVisitor<'db> {
             Expr::Closure { args, .. } => {
                 self.walk_pats_top(args.iter().copied(), current);
             }
-            Expr::Const(e) => self.walk_expr(*e),
             _ => {}
         }
 
@@ -430,8 +431,8 @@ impl<'db> UnsafeVisitor<'db> {
     fn mark_unsafe_path(&mut self, node: ExprOrPatId, path: &Path) {
         let hygiene = self.body.expr_or_pat_path_hygiene(node);
         let value_or_partial = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene);
-        if let Some(ResolveValueResult::ValueNs(ValueNs::StaticId(id), _)) = value_or_partial {
-            let static_data = self.db.static_signature(id);
+        if let Some(ResolveValueResult::ValueNs(ValueNs::StaticId(id))) = value_or_partial {
+            let static_data = StaticSignature::of(self.db, id);
             if static_data.flags.contains(StaticFlags::MUTABLE) {
                 self.on_unsafe_op(node, UnsafetyReason::MutableStatic);
             } else if static_data.flags.contains(StaticFlags::EXTERN)

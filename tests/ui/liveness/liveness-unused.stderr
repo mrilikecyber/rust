@@ -167,49 +167,55 @@ error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:183:5
    |
 LL |     a += b;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a -= c;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:185:5
    |
 LL |     a -= c;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a *= d;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:187:5
    |
 LL |     a *= d;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a /= e;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:189:5
    |
 LL |     a /= e;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a |= f;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:191:5
    |
 LL |     a |= f;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a &= g;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:193:5
    |
 LL |     a &= g;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a %= h;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:195:5
@@ -231,33 +237,37 @@ error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:229:5
    |
 LL |     a += b;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a -= c;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:231:5
    |
 LL |     a -= c;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a *= d;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:233:5
    |
 LL |     a *= d;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a /= e;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:235:5
    |
 LL |     a /= e;
-   |     ^^^^^^
-   |
-   = help: maybe it is overwritten before being read?
+   |     ^^^^^^ this value is reassigned later and never used
+LL |
+LL |     a %= f;
+   |     ------ `a` is overwritten here before the previous value is read
 
 error: value assigned to `a` is never read
   --> $DIR/liveness-unused.rs:237:5
@@ -283,5 +293,21 @@ LL |     a = b;
    |
    = help: maybe it is overwritten before being read?
 
-error: aborting due to 34 previous errors; 1 warning emitted
+error: variable `a` is assigned to, but never used
+  --> $DIR/liveness-unused.rs:247:12
+   |
+LL | fn f10b<T>(mut a: Box<T>, b: Box<T>) {
+   |            ^^^^^
+   |
+   = note: consider using `_a` instead
+
+error: value assigned to `a` is never read
+  --> $DIR/liveness-unused.rs:248:5
+   |
+LL |     a = b;
+   |     ^
+   |
+   = help: maybe it is overwritten before being read?
+
+error: aborting due to 36 previous errors; 1 warning emitted
 

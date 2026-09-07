@@ -1,4 +1,4 @@
-use rustc_abi::{Align, AlignFromBytesError, CanonAbi, Size};
+use rustc_abi::{Align, AlignFromBytesError, Size};
 use rustc_ast::expand::allocator::SpecialAllocatorMethod;
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
@@ -52,7 +52,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             | Arch::Bpf
             | Arch::Msp430
             | Arch::Nvptx64
-            | Arch::PowerPC64LE
             | Arch::SpirV
             | Arch::Other(_)) => bug!("unsupported target architecture for malloc: `{arch}`"),
         };
@@ -124,8 +123,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         match method {
             SpecialAllocatorMethod::Alloc | SpecialAllocatorMethod::AllocZeroed => {
-                let [size, align] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let [size, align] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize, core::mem::Alignment) -> *_),
+                    (link_name, abi, args),
+                )?;
                 let size = this.read_target_usize(size)?;
                 let align = this.read_target_usize(align)?;
 
@@ -145,8 +146,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_pointer(ptr, dest)
             }
             SpecialAllocatorMethod::Dealloc => {
-                let [ptr, old_size, align] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let [ptr, old_size, align] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(*_, usize, core::mem::Alignment) -> ()),
+                    (link_name, abi, args),
+                )?;
                 let ptr = this.read_pointer(ptr)?;
                 let old_size = this.read_target_usize(old_size)?;
                 let align = this.read_target_usize(align)?;
@@ -159,8 +162,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )
             }
             SpecialAllocatorMethod::Realloc => {
-                let [ptr, old_size, align, new_size] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let [ptr, old_size, align, new_size] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(*_, usize, core::mem::Alignment, usize) -> *_),
+                    (link_name, abi, args),
+                )?;
                 let ptr = this.read_pointer(ptr)?;
                 let old_size = this.read_target_usize(old_size)?;
                 let align = this.read_target_usize(align)?;

@@ -42,11 +42,10 @@ pub fn foo2() -> Box<dyn TestTrait2> {
 }
 
 //~ MONO_ITEM fn <TestStruct2 as TestTrait2>::test_func2
-//~ MONO_ITEM fn alloc::alloc::exchange_malloc
 //~ MONO_ITEM fn foo2
-//~ MONO_ITEM fn std::alloc::Global::alloc_impl
+//~ MONO_ITEM fn std::alloc::Global::alloc_impl_runtime
 //~ MONO_ITEM fn std::boxed::Box::<TestStruct2>::new
-//~ MONO_ITEM fn std::alloc::Layout::from_size_align_unchecked::precondition_check
+//~ MONO_ITEM fn std::boxed::box_new_uninit
 //~ MONO_ITEM fn std::ptr::NonNull::<T>::new_unchecked::precondition_check
 
 struct Counter {
@@ -80,10 +79,11 @@ pub fn foo3() -> Box<dyn Iterator<Item = usize>> {
 //~ MONO_ITEM fn <Counter as std::iter::Iterator>::nth
 //~ MONO_ITEM fn <Counter as std::iter::Iterator>::size_hint
 //~ MONO_ITEM fn <Counter as std::iter::Iterator>::try_fold::<std::num::NonZero<usize>, {closure@<Counter as std::iter::Iterator::advance_by::SpecAdvanceBy>::spec_advance_by::{closure#0}}, std::option::Option<std::num::NonZero<usize>>>
-//~ MONO_ITEM fn <std::option::Option<std::num::NonZero<usize>> as std::ops::FromResidual<std::option::Option<std::convert::Infallible>>>::from_residual
+//~ MONO_ITEM fn <std::option::Option<std::num::NonZero<usize>> as std::ops::FromResidual<std::option::Option<!>>>::from_residual
 //~ MONO_ITEM fn <std::option::Option<std::num::NonZero<usize>> as std::ops::Try>::branch
 //~ MONO_ITEM fn <std::option::Option<std::num::NonZero<usize>> as std::ops::Try>::from_output
 //~ MONO_ITEM fn foo3
 //~ MONO_ITEM fn std::boxed::Box::<Counter>::new
 //~ MONO_ITEM fn Counter::new
 //~ MONO_ITEM fn std::fmt::Arguments::<'_>::from_str
+//~ MONO_ITEM fn std::boxed::box_new_uninit

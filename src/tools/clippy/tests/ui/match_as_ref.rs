@@ -1,4 +1,3 @@
-#![allow(unused)]
 #![warn(clippy::match_as_ref)]
 
 fn match_as_ref() {
@@ -112,5 +111,19 @@ fn issue15932() {
         //~^ match_as_ref
         None => None,
         Some(ref mut v) => Some(v),
+    };
+}
+
+fn wrongly_unmangled_macros() {
+    macro_rules! test_expr {
+        ($val:expr) => {
+            Some($val)
+        };
+    }
+
+    let _: Option<&u32> = match test_expr!(42) {
+        //~^ match_as_ref
+        None => None,
+        Some(ref v) => Some(v),
     };
 }

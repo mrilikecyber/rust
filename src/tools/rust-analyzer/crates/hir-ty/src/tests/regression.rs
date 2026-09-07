@@ -2,7 +2,19 @@ mod new_solver;
 
 use expect_test::expect;
 
+use crate::tests::check;
+
 use super::{check_infer, check_no_mismatches, check_types};
+
+#[test]
+fn closure_in_enum_discriminant_does_not_panic() {
+    check(
+        r#"
+        enum Enum { X = || {} }
+                     // ^^^^^ expected isize, got impl Fn()
+        "#,
+    );
+}
 
 #[test]
 fn bug_484() {
@@ -38,6 +50,26 @@ fn no_panic_on_field_of_enum() {
             31..32 'x': X
             31..43 'x.some_field': {unknown}
         "#]],
+    );
+}
+
+#[test]
+fn anon_const_projection_in_impl_predicate() {
+    check_no_mismatches(
+        r#"
+trait Trait {
+    type Assoc;
+}
+
+struct S<const N: usize>;
+
+impl<const N: usize> S<N>
+where
+    S<{ N }>: Trait,
+{
+    fn new(_: <S<N> as Trait>::Assoc) {}
+}
+        "#,
     );
 }
 
@@ -268,8 +300,6 @@ fn infer_std_crash_5() {
         "#,
         expect![[r#"
             26..322 '{     ...   } }': ()
-            32..320 'for co...     }': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
-            32..320 'for co...     }': <{unknown} as IntoIterator>::IntoIter
             32..320 'for co...     }': !
             32..320 'for co...     }': {unknown}
             32..320 'for co...     }': &'? mut {unknown}
@@ -279,27 +309,29 @@ fn infer_std_crash_5() {
             32..320 'for co...     }': ()
             32..320 'for co...     }': ()
             32..320 'for co...     }': ()
-            36..43 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            36..43 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
             47..60 'doesnt_matter': {unknown}
+            47..60 'doesnt_matter': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
+            47..60 'doesnt_matter': <{unknown} as IntoIterator>::IntoIter
             61..320 '{     ...     }': ()
-            75..79 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            82..166 'if doe...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            75..79 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            82..166 'if doe...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
             85..98 'doesnt_matter': bool
             99..128 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
             113..118 'first': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            134..166 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            148..156 '&content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            149..156 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            181..188 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            191..313 'if ICE...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            194..231 'ICE_RE..._VALUE': bool
+            134..166 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            148..156 '&content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            149..156 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            181..188 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            191..313 'if ICE...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            194..231 'ICE_RE..._VALUE': {unknown}
             194..247 'ICE_RE...&name)': bool
-            241..246 '&name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            242..246 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            248..276 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            262..266 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            282..313 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
-            296..303 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            241..246 '&name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            242..246 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            248..276 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            262..266 'name': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            282..313 '{     ...     }': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
+            296..303 'content': &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? &'? {unknown}
         "#]],
     );
 }
@@ -414,7 +446,7 @@ fn issue_2669() {
             120..215 '{     ...     }': ()
             130..133 'end': fn end<{unknown}>()
             130..135 'end()': ()
-            164..209 '{     ...     }': ()
+            164..209 '{     ...     }': !
             182..184 '_x': !
             191..198 'loop {}': !
             196..198 '{}': ()
@@ -629,7 +661,7 @@ fn issue_4053_diesel_where_clauses() {
             65..69 'self': Self
             267..271 'self': Self
             466..470 'self': SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}>
-            488..522 '{     ...     }': <SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}> as BoxedDsl<DB>>::Output
+            488..522 '{     ...     }': ()
             498..502 'self': SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}>
             498..508 'self.order': O
             498..515 'self.o...into()': dyn QueryFragment<DB> + 'static
@@ -725,7 +757,7 @@ fn issue_4885() {
             138..146 'bar(key)': impl Future<Output = <K as Foo<R>>::Bar>
             142..145 'key': &'? K
             162..165 'key': &'? K
-            224..227 '{ }': impl Future<Output = <K as Foo<R>>::Bar>
+            224..227 '{ }': ()
         "#]],
     );
 }
@@ -891,13 +923,14 @@ use core::ops::Deref;
 
 struct BufWriter {}
 
-struct Mutex<T> {}
-struct MutexGuard<'a, T> {}
+struct Mutex<T>(T);
+struct MutexGuard<'a, T>(&'a T);
 impl<T> Mutex<T> {
     fn lock(&self) -> MutexGuard<'_, T> {}
 }
 impl<'a, T: 'a> Deref for MutexGuard<'a, T> {
     type Target = T;
+    fn deref(&self) -> &Self::Target { loop {} }
 }
 fn flush(&self) {
     let w: &Mutex<BufWriter>;
@@ -905,14 +938,18 @@ fn flush(&self) {
 }
 "#,
         expect![[r#"
-            123..127 'self': &'? Mutex<T>
-            150..152 '{}': MutexGuard<'?, T>
-            234..238 'self': &'? {unknown}
-            240..290 '{     ...()); }': ()
-            250..251 'w': &'? Mutex<BufWriter>
-            276..287 '*(w.lock())': BufWriter
-            278..279 'w': &'? Mutex<BufWriter>
-            278..286 'w.lock()': MutexGuard<'?, BufWriter>
+            129..133 'self': &'? Mutex<T>
+            156..158 '{}': MutexGuard<'?, T>
+            242..246 'self': &'? MutexGuard<'a, T>
+            265..276 '{ loop {} }': &'? T
+            267..274 'loop {}': !
+            272..274 '{}': ()
+            289..293 'self': &'? {unknown}
+            295..345 '{     ...()); }': ()
+            305..306 'w': &'? Mutex<BufWriter>
+            331..342 '*(w.lock())': BufWriter
+            333..334 'w': &'? Mutex<BufWriter>
+            333..341 'w.lock()': MutexGuard<'?, BufWriter>
         "#]],
     );
 }
@@ -1052,7 +1089,7 @@ fn cfg_tail() {
             216..227 '{ "third" }': ()
             218..225 '"third"': &'static str
             293..357 '{     ...] 15 }': ()
-            299..311 '{ "fourth" }': &'static str
+            299..311 '{ "fourth" }': &'? str
             301..309 '"fourth"': &'static str
         "#]],
     )
@@ -1254,8 +1291,6 @@ fn test() {
         "#,
         expect![[r#"
             10..68 '{     ...   } }': ()
-            16..66 'for _ ...     }': fn into_iter<()>(()) -> <() as IntoIterator>::IntoIter
-            16..66 'for _ ...     }': <() as IntoIterator>::IntoIter
             16..66 'for _ ...     }': !
             16..66 'for _ ...     }': {unknown}
             16..66 'for _ ...     }': &'? mut {unknown}
@@ -1267,6 +1302,8 @@ fn test() {
             16..66 'for _ ...     }': ()
             20..21 '_': {unknown}
             25..39 '{ let x = 0; }': ()
+            25..39 '{ let x = 0; }': fn into_iter<()>(()) -> <() as IntoIterator>::IntoIter
+            25..39 '{ let x = 0; }': <() as IntoIterator>::IntoIter
             31..32 'x': i32
             35..36 '0': i32
             40..66 '{     ...     }': ()
@@ -1951,7 +1988,7 @@ fn main() {
     Alias::Braced;
   //^^^^^^^^^^^^^ {unknown}
     let Alias::Braced = loop {};
-      //^^^^^^^^^^^^^ !
+      //^^^^^^^^^^^^^ {unknown}
   let Alias::Braced(..) = loop {};
     //^^^^^^^^^^^^^^^^^ Enum
 
@@ -2008,18 +2045,20 @@ where
 
 #[test]
 fn tait_async_stack_overflow_17199() {
-    check_types(
+    // The error here is because we don't support TAITs.
+    check(
         r#"
     //- minicore: fmt, future
     type Foo = impl core::fmt::Debug;
 
     async fn foo() -> Foo {
         ()
+     // ^^ expected impl Debug, got ()
     }
 
     async fn test() {
         let t = foo().await;
-         // ^ impl Debug
+         // ^ type: impl Debug
     }
 "#,
     );
@@ -2230,7 +2269,6 @@ async fn f<A, B, C>() -> Bar {}
 "#,
         expect![[r#"
             64..66 '{}': ()
-            64..66 '{}': impl Future<Output = ()>
         "#]],
     );
 }
@@ -2359,12 +2397,13 @@ fn test() {
 }
 "#,
         expect![[r#"
+            46..49 'Foo': Foo<_>
             93..97 'self': Foo<N>
             108..125 '{     ...     }': usize
             118..119 'N': usize
             139..157 '{     ...= N; }': ()
-            149..150 '_': Foo<N>
-            153..154 'N': Foo<N>
+            149..150 '_': Foo<_>
+            153..154 'N': Foo<_>
         "#]],
     );
 }
@@ -2374,6 +2413,7 @@ fn rust_destruct_option_clone() {
     check_types(
         r#"
 //- minicore: option, drop
+#![feature(lang_items)]
 fn test(o: &Option<i32>) {
     o.my_clone();
   //^^^^^^^^^^^^ Option<i32>
@@ -2518,6 +2558,675 @@ fn foo() {
 
     let _: my_mod::Bool;
      // ^ bool
+}
+    "#,
+    );
+}
+
+#[test]
+fn issue_9881_super_trait_blanket_impl() {
+    check_types(
+        r#"
+pub trait TryStream: Stream {
+    fn try_poll_next(&self) {}
+}
+
+pub trait Stream {
+    type Item;
+    fn poll_next(&self) {}
+}
+
+trait StreamAlias: Stream<Item = ()> {}
+
+impl<S: Stream<Item = ()>> TryStream for S {}
+
+impl<S: Stream<Item = ()>> StreamAlias for S {}
+
+struct StreamImpl;
+
+impl Stream for StreamImpl {
+    type Item = ();
+}
+
+fn foo() -> impl StreamAlias {
+    StreamImpl
+}
+
+fn main() {
+    let alias = foo();
+    let _: () = alias.try_poll_next();
+     // ^ ()
+    let _: () = alias.poll_next();
+     // ^ ()
+}
+        "#,
+    );
+}
+
+#[test]
+fn regression_21429() {
+    check_no_mismatches(
+        r#"
+trait DatabaseLike {
+    type ForeignKey: ForeignKeyLike<DB = Self>;
+}
+
+trait ForeignKeyLike {
+    type DB: DatabaseLike;
+
+    fn host_columns(&self, database: &Self::DB);
+}
+
+trait ColumnLike {
+    type DB: DatabaseLike;
+
+    fn foo() -> &&<<Self as ColumnLike>::DB as DatabaseLike>::ForeignKey {
+        loop {}
+    }
+
+    fn foreign_keys(&self, database: &Self::DB) {
+        let fk = Self::foo();
+        fk.host_columns(database);
+    }
+}
+    "#,
+    );
+}
+
+#[test]
+fn issue_21006_generic_predicates_for_param_supertrait_cycle() {
+    check_no_mismatches(
+        r#"
+trait VCipherSuite {}
+
+trait CipherSuite
+where
+    OprfHash<Self>: Hash,
+{
+}
+
+type Bar<CS: CipherSuite> = <CS::Baz as VCipherSuite>::Hash;
+
+type OprfHash<CS: CipherSuite> = <CS::Baz as VCipherSuite>::Hash;
+
+impl<CS: CipherSuite> Foo<CS> {
+    fn seal() {}
+}
+        "#,
+    );
+}
+
+#[test]
+fn issue_21006_self_assoc_trait() {
+    check_types(
+        r#"
+trait Baz {
+    fn baz(&self);
+}
+
+trait Foo {
+    type Assoc;
+}
+
+trait Bar: Foo
+where
+    Self::Assoc: Baz,
+{
+    fn bar(v: Self::Assoc) {
+        let _ = v.baz();
+        //  ^ ()
+    }
+}
+        "#,
+    );
+}
+
+#[test]
+fn issue_21560() {
+    check_no_mismatches(
+        r#"
+mod bindings {
+    use super::*;
+    pub type HRESULT = i32;
+}
+use bindings::*;
+
+
+mod error {
+    use super::*;
+    pub fn nonzero_hresult(hr: HRESULT) -> crate::HRESULT {
+        hr
+    }
+}
+pub use error::*;
+
+mod hresult {
+    use super::*;
+    pub struct HRESULT(pub i32);
+}
+pub use hresult::HRESULT;
+
+        "#,
+    );
+}
+
+#[test]
+fn regression_21577() {
+    check_no_mismatches(
+        r#"
+pub trait FilterT<F: FilterT<F, V = Self::V> = Self> {
+    type V;
+
+    fn foo() {}
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21605() {
+    check_infer(
+        r#"
+//- minicore: fn, coerce_unsized, dispatch_from_dyn, iterator, iterators
+pub struct Filter<'a, 'b, T>
+where
+    T: 'b,
+    'a: 'b,
+{
+    filter_fn: dyn Fn(&'a T) -> bool,
+    t: Option<T>,
+    b: &'b (),
+}
+
+impl<'a, 'b, T> Filter<'a, 'b, T>
+where
+    T: 'b,
+    'a: 'b,
+{
+    pub fn new(filter_fn: dyn Fn(&T) -> bool) -> Self {
+        Self {
+            filter_fn: filter_fn,
+            t: None,
+            b: &(),
+        }
+    }
+}
+
+pub trait FilterExt<T> {
+    type Output;
+    fn filter(&self, filter: &Filter<T>) -> Self::Output;
+}
+
+impl<const N: usize, T> FilterExt<T> for [T; N]
+where
+    T: IntoIterator,
+{
+    type Output = T;
+    fn filter(&self, filter: &Filter<T>) -> Self::Output {
+        let _ = self.into_iter().filter(filter.filter_fn);
+        loop {}
+    }
+}
+"#,
+        expect![[r#"
+            214..223 'filter_fn': dyn Fn(&'? T) -> bool + 'static
+            253..360 '{     ...     }': Filter<'a, 'b, T>
+            263..354 'Self {...     }': Filter<'a, 'b, T>
+            293..302 'filter_fn': dyn Fn(&'? T) -> bool + 'static
+            319..323 'None': Option<T>
+            340..343 '&()': &'? ()
+            341..343 '()': ()
+            421..425 'self': &'? Self
+            427..433 'filter': &'? Filter<'?, '?, T>
+            580..584 'self': &'? [T; N]
+            586..592 'filter': &'? Filter<'?, '?, T>
+            622..704 '{     ...     }': T
+            636..637 '_': Filter<Iter<'?, T>, dyn Fn(&'? T) -> bool + '?>
+            640..644 'self': &'? [T; N]
+            640..656 'self.i...iter()': Iter<'?, T>
+            640..681 'self.i...er_fn)': Filter<Iter<'?, T>, dyn Fn(&'? T) -> bool + '?>
+            664..670 'filter': &'? Filter<'?, '?, T>
+            664..680 'filter...ter_fn': dyn Fn(&'? T) -> bool + 'static
+            691..698 'loop {}': !
+            696..698 '{}': ()
+        "#]],
+    );
+}
+
+#[test]
+fn extern_fns_cannot_have_param_patterns() {
+    check_no_mismatches(
+        r#"
+macro_rules! m {
+    () => { Builder };
+}
+
+pub(crate) struct Builder;
+
+unsafe extern "C" {
+    pub(crate) fn foo(Builder: (), m!(): ());
+}
+    "#,
+    );
+}
+
+#[test]
+fn trait_assoc_fns_cannot_have_param_patterns() {
+    check_no_mismatches(
+        r#"
+macro_rules! m {
+    () => { Builder };
+}
+
+pub(crate) struct Builder;
+
+trait Trait {
+    fn foo(Builder: (), m!(): ());
+}
+    "#,
+    );
+    // But assoc fns with bodies do have patterns:
+    check(
+        r#"
+macro_rules! m {
+    () => { Builder };
+}
+
+pub(crate) struct Builder;
+
+trait Trait {
+    fn foo(Builder: (),
+        // ^^^^^^^ expected (), got Builder
+        m!(): ()) {}
+     // ^^ expected (), got Builder
+}
+    "#,
+    );
+}
+
+#[test]
+fn infinitely_sized_type() {
+    check_infer(
+        r#"
+//- minicore: sized
+
+pub struct Recursive {
+    pub content: Recursive,
+}
+
+fn is_sized<T: Sized>() {}
+
+fn foo() {
+    is_sized::<Recursive>();
+}
+    "#,
+        expect![[r#"
+            79..81 '{}': ()
+            92..124 '{     ...>(); }': ()
+            98..119 'is_siz...rsive>': fn is_sized<Recursive>()
+            98..121 'is_siz...ive>()': ()
+        "#]],
+    );
+}
+
+#[test]
+fn regression_21742() {
+    check_no_mismatches(
+        r#"
+pub trait IntoIterator {
+    type Item;
+}
+
+pub trait Collection: IntoIterator<Item = <Self as Collection>::Item> {
+    type Item;
+    fn contains(&self, item: &<Self as Collection>::Item);
+}
+
+fn contains_0<S: Collection<Item = i32>>(points: &S) {
+    points.contains(&0)
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21773() {
+    check_no_mismatches(
+        r#"
+trait Neg {
+    type Output;
+}
+
+trait Abs: Neg {
+    fn abs(&self) -> Self::Output;
+}
+
+trait SelfAbs: Abs + Neg
+where
+    Self::Output: Neg<Output = Self::Output> + Abs,
+{
+}
+
+fn wrapped_abs<T: SelfAbs<Output = T>>(v: T) -> T {
+    v.abs()
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21899() {
+    check_no_mismatches(
+        r#"
+trait B where
+    Self::T: B,
+{
+    type T;
+}
+
+fn foo<T: B>(v: T::T) {}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22007() {
+    check_types(
+        r#"
+//- minicore: fn
+trait Super {
+    type Assoc;
+    fn foo(self) -> Self::Assoc
+    where
+        Self: Sub,
+    { loop {} }
+}
+trait Sub: Super {}
+
+struct Struct;
+impl Super for Struct {
+    type Assoc = u8;
+}
+impl Sub for Struct {}
+
+fn foo() {
+    Struct.foo();
+ // ^^^^^^^^^^^^ u8
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21885() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_unsized, future, result
+use core::future::Future;
+
+trait Foo {
+    type Assoc;
+
+    fn foo() -> &dyn Future<Output = Result<Self::Assoc, ()>>;
+}
+
+struct Bar;
+
+impl Foo for Bar {
+    type Assoc = NotFound;
+
+    fn foo() -> &dyn Future<Output = Result<Self::Assoc, ()>> {
+        &async {
+            Err(())
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn regression_unresolved_deferred_closure_call_resolution() {
+    check_no_mismatches(
+        r#"
+//- minicore: fn
+fn caller() {
+    let _: &[u8] = &(|| encode_fn())();
+}
+"#,
+    );
+}
+
+#[test]
+fn regression_22772() {
+    check_no_mismatches(
+        r#"
+trait Resolve {
+    type Prev;
+}
+
+fn migrations_preserve_index() {
+    pub struct RefExpr1<'x> {
+        pub foo: &'x schema::v0::_Ref0,
+    }
+
+    pub fn new_column<'x, C>() -> &'x C {
+        loop {}
+    }
+
+    RefExpr1 { foo: new_column::<schema::Foo>() };
+
+    mod schema {
+        pub struct Foo {}
+        pub struct FooNew {}
+
+        impl crate::Resolve for FooNew {
+            type Prev = Foo;
+        }
+
+        pub mod v0 {
+            pub type _Ref0 = <super::FooNew as crate::Resolve>::Prev;
+        }
+    }
+}
+    "#,
+    );
+}
+
+#[test]
+fn array_repeat_closure() {
+    check(
+        r#"
+fn f() {[_; || ()]}
+     // ^^^^^^^^^^ expected (), got [{unknown}; _]
+    "#,
+    );
+}
+
+#[test]
+fn regression_22795() {
+    check_no_mismatches(
+        r#"
+trait T { fn m(&self); }
+impl T for Self::Self {}
+struct S;
+impl T for S { fn m(&self) {} }
+fn f(s: S) { s.m(); }
+    "#,
+    );
+}
+
+#[test]
+fn regression_22799() {
+    check_no_mismatches(
+        r#"
+struct S;
+fn f() {
+    <S as S>::S;
+}
+    "#,
+    );
+}
+
+#[test]
+fn braced_const_path() {
+    check_types(
+        r#"
+//- minicore: default, builtin_impls
+trait ToNum {
+    type Num;
+}
+trait Bar {
+    type Ty;
+}
+struct Gen<const B: bool>;
+struct Int<const B: bool>;
+
+impl<const B: bool> ToNum for Gen<{ B }> {
+    type Num = Int<B>;
+}
+
+impl Bar for Int<true> {
+    type Ty = i32;
+}
+impl Bar for Int<false> {
+    type Ty = f32;
+}
+
+type A = <<Gen<true> as ToNum>::Num as Bar>::Ty;
+
+fn main() {
+    let x = A::default();
+     // ^ i32
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22820() {
+    check_no_mismatches(
+        r#"
+//- minicore: copy
+trait MyTrait: Copy {
+    const ASSOC: usize;
+}
+
+const fn output<T: MyTrait>(_: T) -> usize {
+    <T as MyTrait>::ASSOC
+}
+
+const fn yeet() -> impl Clone {
+    let x = [0u8; output(yeet())];
+}
+    "#,
+    );
+}
+
+#[test]
+fn rpit_function_with_non_trivial_anon_const() {
+    check_no_mismatches(
+        r#"
+fn f() -> impl Sized {
+    let x = [0u8; 1 + 2];
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22836() {
+    check(
+        r#"
+fn main() {
+  match () {
+    const {
+      async | v | ()
+   // ^^^^^^^^^^^^^^ expected (), got impl AsyncFn({unknown})
+    }
+  }
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22986() {
+    check_no_mismatches(
+        r#"
+fn main() {
+    let _: &[u8; 0] = b"\
+        ";
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_23065() {
+    check_no_mismatches(
+        r#"
+trait Trait {
+    type Assoc<const N: usize>;
+}
+
+struct Struct;
+struct GenericStruct<'a>(&'a ());
+
+impl<const X: usize> Trait for Struct {
+    type Assoc<'a, const N: usize> = GenericStruct<'a>;
+
+    fn g(&self) -> Self::Assoc<{ X }> {
+        loop {}
+    }
+}
+
+struct OtherStruct;
+
+impl Trait for OtherStruct {
+    type Assoc<'a> = &'a ();
+}
+
+fn other() -> <OtherStruct as Trait>::Assoc<0> {
+    loop {}
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_23083() {
+    check_no_mismatches(
+        r#"
+fn main() {
+    match 2 {
+        x if let true = return => {
+            x;
+        }
+        _ => {}
+    }
+}
+    "#,
+    );
+}
+
+#[test]
+fn dyn_trait_binder_inside_fn_ptr() {
+    check_no_mismatches(
+        r#"
+trait Trait<'a> {}
+fn f<'a>(_: fn() -> &'a dyn Trait<'a>) {}
+    "#,
+    );
+}
+
+#[test]
+fn regression_23113() {
+    check_no_mismatches(
+        r#"
+//- minicore: range
+fn main() {
+    0..loop {};
 }
     "#,
     );

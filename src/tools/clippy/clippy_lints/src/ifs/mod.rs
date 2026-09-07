@@ -2,14 +2,87 @@ use clippy_config::Conf;
 use clippy_utils::ty::InteriorMut;
 use clippy_utils::{if_sequence, is_else_clause, is_lint_allowed};
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
 
 mod branches_sharing_code;
 mod if_same_then_else;
 mod ifs_same_cond;
 mod same_functions_in_if_cond;
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks if the blocks of an `if`/`else`, or the arms of a `match`, contain shared code that
+    /// can be moved out of the branches.
+    ///
+    /// ### Why is this bad?
+    /// Duplicate code is less maintainable.
+    ///
+    /// ### Example
+    /// ```ignore
+    /// let foo = if … {
+    ///     println!("Hello World");
+    ///     13
+    /// } else {
+    ///     println!("Hello World");
+    ///     42
+    /// };
+    /// ```
+    ///
+    /// Use instead:
+    /// ```ignore
+    /// println!("Hello World");
+    /// let foo = if … {
+    ///     13
+    /// } else {
+    ///     42
+    /// };
+    /// ```
+    ///
+    /// For a `match`, when every arm ends with the same expression it can be moved after the
+    /// `match`:
+    /// ```ignore
+    /// match mode {
+    ///     Mode::A => { a(); Ok(()) }
+    ///     Mode::B => { b(); Ok(()) }
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```ignore
+    /// match mode {
+    ///     Mode::A => { a(); }
+    ///     Mode::B => { b(); }
+    /// }
+    /// Ok(())
+    /// ```
+    #[clippy::version = "1.53.0"]
+    pub BRANCHES_SHARING_CODE,
+    nursery,
+    "`if` statement with shared code in all blocks"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `if/else` with the same body as the *then* part
+    /// and the *else* part.
+    ///
+    /// ### Why is this bad?
+    /// This is probably a copy & paste error.
+    ///
+    /// ### Example
+    /// ```ignore
+    /// let foo = if … {
+    ///     42
+    /// } else {
+    ///     42
+    /// };
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub IF_SAME_THEN_ELSE,
+    style,
+    "`if` with the same `then` and `else` blocks"
+}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -91,61 +164,12 @@ declare_clippy_lint! {
     "consecutive `if`s with the same function call"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for `if/else` with the same body as the *then* part
-    /// and the *else* part.
-    ///
-    /// ### Why is this bad?
-    /// This is probably a copy & paste error.
-    ///
-    /// ### Example
-    /// ```ignore
-    /// let foo = if … {
-    ///     42
-    /// } else {
-    ///     42
-    /// };
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub IF_SAME_THEN_ELSE,
-    style,
-    "`if` with the same `then` and `else` blocks"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks if the `if` and `else` block contain shared code that can be
-    /// moved out of the blocks.
-    ///
-    /// ### Why is this bad?
-    /// Duplicate code is less maintainable.
-    ///
-    /// ### Example
-    /// ```ignore
-    /// let foo = if … {
-    ///     println!("Hello World");
-    ///     13
-    /// } else {
-    ///     println!("Hello World");
-    ///     42
-    /// };
-    /// ```
-    ///
-    /// Use instead:
-    /// ```ignore
-    /// println!("Hello World");
-    /// let foo = if … {
-    ///     13
-    /// } else {
-    ///     42
-    /// };
-    /// ```
-    #[clippy::version = "1.53.0"]
-    pub BRANCHES_SHARING_CODE,
-    nursery,
-    "`if` statement with shared code in all blocks"
-}
+impl_lint_pass!(CopyAndPaste<'_> => [
+    BRANCHES_SHARING_CODE,
+    IFS_SAME_COND,
+    IF_SAME_THEN_ELSE,
+    SAME_FUNCTIONS_IN_IF_CONDITION,
+]);
 
 pub struct CopyAndPaste<'tcx> {
     interior_mut: InteriorMut<'tcx>,
@@ -159,16 +183,12 @@ impl<'tcx> CopyAndPaste<'tcx> {
     }
 }
 
-impl_lint_pass!(CopyAndPaste<'_> => [
-    IFS_SAME_COND,
-    SAME_FUNCTIONS_IN_IF_CONDITION,
-    IF_SAME_THEN_ELSE,
-    BRANCHES_SHARING_CODE
-]);
-
 impl<'tcx> LateLintPass<'tcx> for CopyAndPaste<'tcx> {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if !expr.span.from_expansion() && matches!(expr.kind, ExprKind::If(..)) && !is_else_clause(cx.tcx, expr) {
+        if expr.span.from_expansion() {
+            return;
+        }
+        if matches!(expr.kind, ExprKind::If(..)) && !is_else_clause(cx.tcx, expr) {
             let (conds, blocks) = if_sequence(expr);
             ifs_same_cond::check(cx, &conds, &mut self.interior_mut);
             same_functions_in_if_cond::check(cx, &conds);
@@ -177,6 +197,8 @@ impl<'tcx> LateLintPass<'tcx> for CopyAndPaste<'tcx> {
             if !all_same && conds.len() != blocks.len() {
                 branches_sharing_code::check(cx, &conds, &blocks, expr);
             }
+        } else if let ExprKind::Match(_, arms, _) = expr.kind {
+            branches_sharing_code::check_match(cx, expr, arms);
         }
     }
 }

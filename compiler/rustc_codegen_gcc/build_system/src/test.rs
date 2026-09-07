@@ -43,6 +43,7 @@ fn get_runners() -> Runners {
     runners.insert("--extended-regex-tests", ("Run extended regex tests", extended_regex_tests));
     runners.insert("--mini-tests", ("Run mini tests", mini_tests));
     runners.insert("--cargo-tests", ("Run cargo tests", cargo_tests));
+    runners.insert("--no-builtins-tests", ("Test #![no_builtins] attribute", no_builtins_tests));
     runners
 }
 
@@ -64,8 +65,6 @@ fn show_usage() {
         r#"
 `test` command help:
 
-    --release              : Build codegen in release mode
-    --sysroot-panic-abort  : Build the sysroot without unwinding support.
     --features [arg]       : Add a new feature [arg]
     --use-system-gcc       : Use system installed libgccjit
     --build-only           : Only build rustc_codegen_gcc then exits
@@ -92,7 +91,6 @@ struct TestArg {
     test_args: Vec<String>,
     nb_parts: Option<usize>,
     current_part: Option<usize>,
-    sysroot_panic_abort: bool,
     config_info: ConfigInfo,
     sysroot_features: Vec<String>,
     keep_lto_tests: bool,
@@ -127,9 +125,6 @@ impl TestArg {
                 "--current-part" => {
                     test_arg.current_part =
                         Some(get_number_after_arg(&mut args, "--current-part")?);
-                }
-                "--sysroot-panic-abort" => {
-                    test_arg.sysroot_panic_abort = true;
                 }
                 "--keep-lto-tests" => {
                     test_arg.keep_lto_tests = true;
@@ -215,14 +210,6 @@ fn cargo_tests(test_env: &Env, test_args: &TestArg) -> Result<(), String> {
     // That would force `cg_gcc` to *rebuild itself* and only then run tests, which is undesirable.
     let mut env = HashMap::new();
     env.insert(
-        "LD_LIBRARY_PATH".into(),
-        test_env.get("LD_LIBRARY_PATH").expect("LD_LIBRARY_PATH missing!").to_string(),
-    );
-    env.insert(
-        "LIBRARY_PATH".into(),
-        test_env.get("LIBRARY_PATH").expect("LIBRARY_PATH missing!").to_string(),
-    );
-    env.insert(
         "CG_RUSTFLAGS".into(),
         test_env.get("CG_RUSTFLAGS").map(|s| s.as_str()).unwrap_or("").to_string(),
     );
@@ -299,7 +286,7 @@ fn build_sysroot(env: &Env, args: &TestArg) -> Result<(), String> {
     Ok(())
 }
 
-// TODO(GuillaumeGomez): when rewriting in Rust, refactor with the code in tests/lang_tests_common.rs if possible.
+// FIXME(GuillaumeGomez): when rewriting in Rust, refactor with the code in tests/lang_tests_common.rs if possible.
 fn maybe_run_command_in_vm(
     command: &[&dyn AsRef<OsStr>],
     env: &Env,
@@ -328,6 +315,65 @@ fn maybe_run_command_in_vm(
         vec![&"sudo", &"chroot", &vm_dir, &"qemu-m68k-static", &inside_vm_exe_path];
     vm_command.extend_from_slice(command);
     run_command_with_output_and_env(&vm_command, Some(&vm_parent_dir), Some(env))?;
+    Ok(())
+}
+
+/// Compile a source file to an object file and check if it contains a memset reference.
+fn object_has_memset(
+    env: &Env,
+    args: &TestArg,
+    src_file: &str,
+    obj_file_name: &str,
+) -> Result<bool, String> {
+    let cargo_target_dir = Path::new(&args.config_info.cargo_target_dir);
+    let obj_file = cargo_target_dir.join(obj_file_name);
+    let obj_file_str = obj_file.to_str().expect("obj_file to_str");
+
+    let mut command = args.config_info.rustc_command_vec();
+    command.extend_from_slice(&[
+        &src_file,
+        &"--emit",
+        &"obj",
+        &"-O",
+        &"--target",
+        &args.config_info.target_triple,
+        &"-o",
+    ]);
+    command.push(&obj_file_str);
+    run_command_with_env(&command, None, Some(env))?;
+
+    let nm_output = run_command_with_env(&[&"nm", &obj_file_str], None, Some(env))?;
+    let nm_stdout = String::from_utf8_lossy(&nm_output.stdout);
+
+    Ok(nm_stdout.contains("memset"))
+}
+
+fn no_builtins_tests(env: &Env, args: &TestArg) -> Result<(), String> {
+    // Test that the #![no_builtins] attribute prevents GCC from replacing
+    // code patterns (like loops) with calls to builtins (like memset).
+    // See https://github.com/rust-lang/rustc_codegen_gcc/issues/570
+
+    // Test 1: WITH #![no_builtins] - memset should NOT be present
+    println!("[TEST] no_builtins attribute (with #![no_builtins])");
+    let has_memset =
+        object_has_memset(env, args, "tests/no_builtins/no_builtins.rs", "no_builtins_test.o")?;
+    if has_memset {
+        return Err("no_builtins test FAILED: Found 'memset' in object file.\n\
+             The #![no_builtins] attribute should prevent GCC from replacing \n\
+             code patterns with builtin calls."
+            .to_string());
+    }
+
+    // Test 2: WITHOUT #![no_builtins] - memset SHOULD be present
+    println!("[TEST] no_builtins attribute (without #![no_builtins])");
+    let has_memset =
+        object_has_memset(env, args, "tests/no_builtins/with_builtins.rs", "with_builtins_test.o")?;
+    if !has_memset {
+        return Err("no_builtins test FAILED: 'memset' NOT found in object file.\n\
+             Without #![no_builtins], GCC should replace the loop with memset."
+            .to_string());
+    }
+
     Ok(())
 }
 
@@ -662,16 +708,16 @@ fn test_projects(env: &Env, args: &TestArg) -> Result<(), String> {
         "https://github.com/BurntSushi/memchr",
         "https://github.com/dtolnay/itoa",
         "https://github.com/rust-lang/cfg-if",
-        //"https://github.com/rust-lang-nursery/lazy-static.rs", // TODO: re-enable when the
+        //"https://github.com/rust-lang-nursery/lazy-static.rs", // FIXME: re-enable when the
         //failing test is fixed upstream.
         //"https://github.com/marshallpierce/rust-base64", // FIXME: one test is OOM-killed.
-        // TODO: ignore the base64 test that is OOM-killed.
+        // FIXME: ignore the base64 test that is OOM-killed.
         //"https://github.com/time-rs/time", // FIXME: one test fails (https://github.com/time-rs/time/issues/719).
         "https://github.com/rust-lang/log",
         "https://github.com/bitflags/bitflags",
         //"https://github.com/serde-rs/serde", // FIXME: one test fails.
-        //"https://github.com/rayon-rs/rayon", // TODO: very slow, only run on master?
-        //"https://github.com/rust-lang/cargo", // TODO: very slow, only run on master?
+        //"https://github.com/rayon-rs/rayon", // FIXME: very slow, only run on master?
+        //"https://github.com/rust-lang/cargo", // FIXME: very slow, only run on master?
     ];
 
     let mut env = env.clone();
@@ -693,10 +739,10 @@ fn test_projects(env: &Env, args: &TestArg) -> Result<(), String> {
     create_dir(projects_path)?;
 
     let nb_parts = args.nb_parts.unwrap_or(0);
-    if nb_parts > 0 {
+    if let Some(count) = projects.len().checked_div(nb_parts) {
         // We increment the number of tests by one because if this is an odd number, we would skip
         // one test.
-        let count = projects.len() / nb_parts + 1;
+        let count = count + 1;
         let current_part = args.current_part.unwrap();
         let start = current_part * count;
         // We remove the projects we don't want to test.
@@ -713,7 +759,7 @@ fn test_libcore(env: &Env, args: &TestArg) -> Result<(), String> {
     println!("[TEST] libcore");
     let path = get_sysroot_dir().join("sysroot_src/library/coretests");
     let _ = remove_dir_all(path.join("target"));
-    // TODO(antoyo): run in release mode when we fix the failures.
+    // FIXME(antoyo): run in release mode when we fix the failures.
     run_cargo_command(&[&"test"], Some(&path), env, args)?;
     Ok(())
 }
@@ -840,8 +886,6 @@ fn valid_ui_error_pattern_test(file: &str) -> bool {
         "type-alias-impl-trait/auxiliary/cross_crate_ice.rs",
         "type-alias-impl-trait/auxiliary/cross_crate_ice2.rs",
         "macros/rfc-2011-nicer-assert-messages/auxiliary/common.rs",
-        "imports/ambiguous-1.rs",
-        "imports/ambiguous-4-extern.rs",
         "entry-point/auxiliary/bad_main_functions.rs",
     ]
     .iter()
@@ -1065,6 +1109,7 @@ where
         &test_dir,
         &"--compiletest-rustc-args",
         &rustc_args,
+        &"--bypass-ignore-backends",
     ];
 
     if run_ignored_tests {
@@ -1261,6 +1306,7 @@ fn run_all(env: &Env, args: &TestArg) -> Result<(), String> {
     test_libcore(env, args)?;
     extended_sysroot_tests(env, args)?;
     cargo_tests(env, args)?;
+    no_builtins_tests(env, args)?;
     test_rustc(env, args)?;
 
     Ok(())
@@ -1275,11 +1321,6 @@ pub fn run() -> Result<(), String> {
 
     if !args.use_system_gcc {
         args.config_info.setup_gcc_path()?;
-        let gcc_path = args.config_info.gcc_path.clone().expect(
-            "The config module should have emitted an error if the GCC path wasn't provided",
-        );
-        env.insert("LIBRARY_PATH".to_string(), gcc_path.clone());
-        env.insert("LD_LIBRARY_PATH".to_string(), gcc_path);
     }
 
     build_if_no_backend(&env, &args)?;

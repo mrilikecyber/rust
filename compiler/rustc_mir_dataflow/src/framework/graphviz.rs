@@ -7,6 +7,9 @@ use std::sync::OnceLock;
 use std::{io, ops, str};
 
 use regex::Regex;
+use rustc_graphviz as dot;
+use rustc_hir::attrs::{BorrowckGraphvizFormatKind, RustcMirKind};
+use rustc_hir::find_attr;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::{
     self, BasicBlock, Body, Location, MirDumper, graphviz_safe_def_name, traversal,
@@ -14,16 +17,11 @@ use rustc_middle::mir::{
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_span::def_id::DefId;
-use rustc_span::{Symbol, sym};
 use tracing::debug;
-use {rustc_ast as ast, rustc_graphviz as dot};
 
 use super::fmt::{DebugDiffWithAdapter, DebugWithAdapter, DebugWithContext};
 use super::{
     Analysis, CallReturnPlaces, Direction, Results, ResultsCursor, ResultsVisitor, visit_results,
-};
-use crate::errors::{
-    DuplicateValuesFor, PathMustEndInFilename, RequiresAnArgument, UnknownFormatter,
 };
 
 /// Writes a DOT file containing the results of a dataflow analysis if the user requested it via
@@ -43,10 +41,7 @@ where
     use std::io::Write;
 
     let def_id = body.source.def_id();
-    let Ok(attrs) = RustcMirAttrs::parse(tcx, def_id) else {
-        // Invalid `rustc_mir` attrs are reported in `RustcMirAttrs::parse`
-        return Ok(());
-    };
+    let attrs = RustcMirAttrs::parse(tcx, def_id);
 
     let file = try {
         match attrs.output_path(A::NAME) {
@@ -72,10 +67,7 @@ where
         Err(e) => return Err(e),
     };
 
-    let style = match attrs.formatter {
-        Some(sym::two_phase) => OutputStyle::BeforeAndAfter,
-        _ => OutputStyle::AfterOnly,
-    };
+    let style = attrs.formatter.unwrap_or(OutputStyle::AfterOnly);
 
     let mut buf = Vec::new();
 
@@ -98,71 +90,32 @@ where
 #[derive(Default)]
 struct RustcMirAttrs {
     basename_and_suffix: Option<PathBuf>,
-    formatter: Option<Symbol>,
+    formatter: Option<OutputStyle>,
 }
 
 impl RustcMirAttrs {
-    fn parse(tcx: TyCtxt<'_>, def_id: DefId) -> Result<Self, ()> {
-        let mut result = Ok(());
+    fn parse(tcx: TyCtxt<'_>, def_id: DefId) -> Self {
         let mut ret = RustcMirAttrs::default();
 
-        let rustc_mir_attrs = tcx
-            .get_attrs(def_id, sym::rustc_mir)
-            .flat_map(|attr| attr.meta_item_list().into_iter().flat_map(|v| v.into_iter()));
-
-        for attr in rustc_mir_attrs {
-            let attr_result = match attr.name() {
-                Some(name @ sym::borrowck_graphviz_postflow) => {
-                    Self::set_field(&mut ret.basename_and_suffix, tcx, name, &attr, |s| {
-                        let path = PathBuf::from(s.to_string());
-                        match path.file_name() {
-                            Some(_) => Ok(path),
-                            None => {
-                                tcx.dcx().emit_err(PathMustEndInFilename { span: attr.span() });
-                                Err(())
+        if let Some(rustc_mir_attrs) = find_attr!(tcx, def_id, RustcMir(kind) => kind) {
+            for attr in rustc_mir_attrs {
+                match attr {
+                    RustcMirKind::BorrowckGraphvizPostflow { path } => {
+                        ret.basename_and_suffix = Some(path.clone());
+                    }
+                    RustcMirKind::BorrowckGraphvizFormat { format } => {
+                        ret.formatter = match format {
+                            BorrowckGraphvizFormatKind::TwoPhase => {
+                                Some(OutputStyle::BeforeAndAfter)
                             }
-                        }
-                    })
-                }
-                Some(name @ sym::borrowck_graphviz_format) => {
-                    Self::set_field(&mut ret.formatter, tcx, name, &attr, |s| match s {
-                        sym::two_phase => Ok(s),
-                        _ => {
-                            tcx.dcx().emit_err(UnknownFormatter { span: attr.span() });
-                            Err(())
-                        }
-                    })
-                }
-                _ => Ok(()),
-            };
-
-            result = result.and(attr_result);
+                        };
+                    }
+                    _ => (),
+                };
+            }
         }
 
-        result.map(|()| ret)
-    }
-
-    fn set_field<T>(
-        field: &mut Option<T>,
-        tcx: TyCtxt<'_>,
-        name: Symbol,
-        attr: &ast::MetaItemInner,
-        mapper: impl FnOnce(Symbol) -> Result<T, ()>,
-    ) -> Result<(), ()> {
-        if field.is_some() {
-            tcx.dcx().emit_err(DuplicateValuesFor { span: attr.span(), name });
-
-            return Err(());
-        }
-
-        if let Some(s) = attr.value_str() {
-            *field = Some(mapper(s)?);
-            Ok(())
-        } else {
-            tcx.dcx()
-                .emit_err(RequiresAnArgument { span: attr.span(), name: attr.name().unwrap() });
-            Err(())
-        }
+        ret
     }
 
     /// Returns the path where dataflow results should be written, or `None`
@@ -334,7 +287,7 @@ where
     fn write_node_label(
         &mut self,
         block: BasicBlock,
-        diffs: StateDiffCollector<A::Domain>,
+        diffs: StateDiffCollector<'_, 'tcx, A>,
     ) -> io::Result<Vec<u8>> {
         use std::io::Write;
 
@@ -440,13 +393,13 @@ where
                 })?;
             }
 
-            mir::TerminatorKind::Yield { resume, resume_arg, .. } => {
+            mir::TerminatorKind::Yield { resume_arg, .. } => {
                 self.write_row(w, "", "(on yield resume)", |this, w, fmt| {
                     let state_on_coroutine_drop = this.cursor.get().clone();
                     this.cursor.apply_custom_effect(|analysis, state| {
                         analysis.apply_call_return_effect(
                             state,
-                            resume,
+                            block,
                             CallReturnPlaces::Yield(resume_arg),
                         );
                     });
@@ -574,7 +527,7 @@ where
         &mut self,
         w: &mut impl io::Write,
         block: BasicBlock,
-        diffs: StateDiffCollector<A::Domain>,
+        diffs: StateDiffCollector<'_, 'tcx, A>,
     ) -> io::Result<()> {
         let mut diffs_before = diffs.before.map(|v| v.into_iter());
         let mut diffs_after = diffs.after.into_iter();
@@ -674,25 +627,26 @@ where
     }
 }
 
-struct StateDiffCollector<D> {
-    prev_state: D,
+struct StateDiffCollector<'a, 'tcx, A: Analysis<'tcx>> {
+    analysis: &'a A,
+    prev_state: A::Domain,
     before: Option<Vec<String>>,
     after: Vec<String>,
 }
 
-impl<D> StateDiffCollector<D> {
-    fn run<'tcx, A>(
+impl<'a, 'tcx, A: Analysis<'tcx>> StateDiffCollector<'a, 'tcx, A> {
+    fn run(
         body: &Body<'tcx>,
         block: BasicBlock,
-        results: &Results<'tcx, A>,
+        results: &'a Results<'tcx, A>,
         style: OutputStyle,
     ) -> Self
     where
-        A: Analysis<'tcx, Domain = D>,
-        D: DebugWithContext<A>,
+        A::Domain: DebugWithContext<A>,
     {
         let mut collector = StateDiffCollector {
-            prev_state: results.analysis.bottom_value(body),
+            analysis: &results.analysis,
+            prev_state: results.entry_states[block].clone(),
             after: vec![],
             before: (style == OutputStyle::BeforeAndAfter).then_some(vec![]),
         };
@@ -702,68 +656,52 @@ impl<D> StateDiffCollector<D> {
     }
 }
 
-impl<'tcx, A> ResultsVisitor<'tcx, A> for StateDiffCollector<A::Domain>
+impl<'a, 'tcx, A: Analysis<'tcx>> ResultsVisitor<'tcx, A> for StateDiffCollector<'a, 'tcx, A>
 where
     A: Analysis<'tcx>,
     A::Domain: DebugWithContext<A>,
 {
-    fn visit_block_start(&mut self, state: &A::Domain) {
-        if A::Direction::IS_FORWARD {
-            self.prev_state.clone_from(state);
-        }
-    }
-
-    fn visit_block_end(&mut self, state: &A::Domain) {
-        if A::Direction::IS_BACKWARD {
-            self.prev_state.clone_from(state);
-        }
-    }
-
     fn visit_after_early_statement_effect(
         &mut self,
-        analysis: &A,
         state: &A::Domain,
         _statement: &mir::Statement<'tcx>,
         _location: Location,
     ) {
         if let Some(before) = self.before.as_mut() {
-            before.push(diff_pretty(state, &self.prev_state, analysis));
+            before.push(diff_pretty(state, &self.prev_state, self.analysis));
             self.prev_state.clone_from(state)
         }
     }
 
     fn visit_after_primary_statement_effect(
         &mut self,
-        analysis: &A,
         state: &A::Domain,
         _statement: &mir::Statement<'tcx>,
         _location: Location,
     ) {
-        self.after.push(diff_pretty(state, &self.prev_state, analysis));
+        self.after.push(diff_pretty(state, &self.prev_state, self.analysis));
         self.prev_state.clone_from(state)
     }
 
     fn visit_after_early_terminator_effect(
         &mut self,
-        analysis: &A,
         state: &A::Domain,
         _terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
         if let Some(before) = self.before.as_mut() {
-            before.push(diff_pretty(state, &self.prev_state, analysis));
+            before.push(diff_pretty(state, &self.prev_state, self.analysis));
             self.prev_state.clone_from(state)
         }
     }
 
     fn visit_after_primary_terminator_effect(
         &mut self,
-        analysis: &A,
         state: &A::Domain,
         _terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
-        self.after.push(diff_pretty(state, &self.prev_state, analysis));
+        self.after.push(diff_pretty(state, &self.prev_state, self.analysis));
         self.prev_state.clone_from(state)
     }
 }

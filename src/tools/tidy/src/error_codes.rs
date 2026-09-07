@@ -36,11 +36,11 @@ const IGNORE_DOCTEST_CHECK: &[&str] = &["E0464", "E0570", "E0601", "E0602", "E07
 const IGNORE_UI_TEST_CHECK: &[&str] =
     &["E0461", "E0465", "E0514", "E0554", "E0640", "E0717", "E0729"];
 
-pub fn check(root_path: &Path, search_paths: &[&Path], ci_info: &crate::CiInfo, tidy_ctx: TidyCtx) {
+pub fn check(root_path: &Path, search_paths: &[&Path], tidy_ctx: TidyCtx) {
     let mut check = tidy_ctx.start_check("error_codes");
 
     // Check that no error code explanation was removed.
-    check_removed_error_code_explanation(ci_info, &mut check);
+    check_removed_error_code_explanation(&tidy_ctx.base_commit, &mut check);
 
     // Stage 1: create list
     let error_codes = extract_error_codes(root_path, &mut check);
@@ -57,8 +57,8 @@ pub fn check(root_path: &Path, search_paths: &[&Path], ci_info: &crate::CiInfo, 
     check_error_codes_used(search_paths, &error_codes, &mut check, &no_longer_emitted);
 }
 
-fn check_removed_error_code_explanation(ci_info: &crate::CiInfo, check: &mut RunningCheck) {
-    let Some(base_commit) = &ci_info.base_commit else {
+fn check_removed_error_code_explanation(base_commit: &Option<String>, check: &mut RunningCheck) {
+    let Some(base_commit) = base_commit else {
         check.verbose_msg("Skipping error code explanation removal check");
         return;
     };
@@ -91,20 +91,16 @@ fn extract_error_codes(root_path: &Path, check: &mut RunningCheck) -> Vec<String
         let line_index = line_index + 1;
         let line = line.trim();
 
-        if line.starts_with('E') {
-            let split_line = line.split_once(':');
-
-            // Extract the error code from the line. Emit a fatal error if it is not in the correct
-            // format.
-            let Some(split_line) = split_line else {
+        if line.starts_with(|c: char| c.is_ascii_digit()) {
+            let mut chars = line.chars();
+            let err_code = chars.by_ref().take(4).collect::<String>();
+            if chars.next() != Some(',') {
                 check.error(format!(
-                    "{path}:{line_index}: Expected a line with the format `Eabcd: abcd, \
-                    but got \"{line}\" without a `:` delimiter",
+                    "{path}:{line_index}: Expected a line with the format `abcd,` \
+                    but got \"{line}\" without a `,` delimiter",
                 ));
                 continue;
-            };
-
-            let err_code = split_line.0.to_owned();
+            }
 
             // If this is a duplicate of another error code, emit a fatal error.
             if error_codes.contains(&err_code) {
@@ -114,35 +110,13 @@ fn extract_error_codes(root_path: &Path, check: &mut RunningCheck) -> Vec<String
                 continue;
             }
 
-            let mut chars = err_code.chars();
-            assert_eq!(chars.next(), Some('E'));
-            let error_num_as_str = chars.as_str();
-
-            // Ensure that the line references the correct markdown file.
-            let rest = split_line.1.split_once(',');
-            let Some(rest) = rest else {
-                check.error(format!(
-                    "{path}:{line_index}: Expected a line with the format `Eabcd: abcd, \
-                    but got \"{line}\" without a `,` delimiter",
-                ));
-                continue;
-            };
-            if error_num_as_str != rest.0.trim() {
-                check.error(format!(
-                    "{path}:{line_index}: `{}:` should be followed by `{},` but instead found `{}` in \
-                    `compiler/rustc_error_codes/src/lib.rs`",
-                    err_code,
-                    error_num_as_str,
-                    split_line.1,
-                ));
-                continue;
-            }
-            if !rest.1.trim().is_empty() && !rest.1.trim().starts_with("//") {
+            let rest = chars.as_str().trim();
+            if !rest.is_empty() && !rest.starts_with("//") {
                 check.error(format!("{path}:{line_index}: should only have one error per line"));
                 continue;
             }
 
-            error_codes.push(err_code);
+            error_codes.push(format!("E{err_code}"));
         }
     }
 

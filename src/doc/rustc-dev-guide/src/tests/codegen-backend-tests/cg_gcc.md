@@ -9,7 +9,7 @@ Note that the backend currently only supports the `x86_64-unknown-linux-gnu` tar
 
 ## Running into GCC backend CI errors
 
-If you ran into an error related to tests executed with the GCC codegen backend on CI in the `x86_64-gnu-gcc` job,
+If you ran into an error related to tests executed with the GCC codegen backend on CI in the `test-x86_64-gnu-gcc` job,
 you can use the following command to run UI tests locally using the GCC backend, which reproduces what happens on CI:
 
 ```bash
@@ -21,7 +21,7 @@ you can use the following command to run UI tests locally using the GCC backend,
 
 If a different test suite has failed on CI, you will have to modify the `tests/ui` part.
 
-To reproduce the whole CI job locally, you can run `cargo run --manifest-path src/ci/citool/Cargo.toml run-local x86_64-gnu-gcc`.
+To reproduce the whole CI job locally, you can run `cargo run --manifest-path src/ci/citool/Cargo.toml run-local test-x86_64-gnu-gcc`.
 See [Testing with Docker](../docker.md) for more information.
 
 ### What to do in case of a GCC job failure?
@@ -76,6 +76,26 @@ The `gcc.download-ci-gcc` bootstrap option controls if GCC (which is a dependenc
 will be downloaded from CI or built locally.
 The default value is `true`, which will download GCC from CI
 if there are no local changes to the GCC sources and the given host target is available on CI.
+
+## Providing your own GCC
+
+There are cases where you will want to provide your own `libgccjit.so` file.
+One such case is when you want to cross-compile `rustc` to another target since GCC is not a multi-target compiler.
+To support this use case, there is the bootstrap option `gcc.libgccjit-libs-dir`.
+This option overrides `gcc.download-ci-gcc`, meaning `libgccjit.so` won't be downloaded or built locally by bootstrap.
+The directory structure of this directory is `<host>/<target>/libgccjit.so`, for instance:
+
+```
+.
+├── m68k-unknown-linux-gnu
+│   └── m68k-unknown-linux-gnu
+│       └── libgccjit.so
+└── x86_64-unknown-linux-gnu
+    ├── m68k-unknown-linux-gnu
+    │   └── libgccjit.so
+    └── x86_64-unknown-linux-gnu
+        └── libgccjit.so
+```
 
 ## Running tests of the backend itself
 

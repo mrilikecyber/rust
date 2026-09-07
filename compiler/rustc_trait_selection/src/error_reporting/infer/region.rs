@@ -2,30 +2,31 @@ use std::iter;
 
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{
-    Applicability, Diag, E0309, E0310, E0311, E0803, Subdiagnostic, struct_span_code_err,
+    Applicability, Diag, E0309, E0310, E0311, E0803, Subdiagnostic, msg, struct_span_code_err,
 };
-use rustc_hir::def::DefKind;
+use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, ParamName};
 use rustc_middle::bug;
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
+use rustc_middle::ty::print::RegionHighlightMode;
 use rustc_middle::ty::{
     self, IsSuggestable, Region, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
 };
-use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw};
+use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw, sym};
 use tracing::{debug, instrument};
 
 use super::ObligationCauseAsDiagArg;
 use super::nice_region_error::find_anon_type;
-use crate::error_reporting::TypeErrCtxt;
-use crate::error_reporting::infer::ObligationCauseExt;
-use crate::errors::{
+use crate::diagnostics::{
     self, FulfillReqLifetime, LfBoundNotSatisfied, OutlivesBound, OutlivesContent,
     RefLongerThanData, RegionOriginNote, WhereClauseSuggestions, note_and_explain,
 };
-use crate::fluent_generated as fluent;
+use crate::error_reporting::TypeErrCtxt;
+use crate::error_reporting::infer::ObligationCauseExt;
+use crate::error_reporting::infer::nice_region_error::placeholder_error::Highlighted;
 use crate::infer::region_constraints::GenericKind;
 use crate::infer::{
     BoundRegionConversionTime, InferCtxt, RegionResolutionError, RegionVariableOrigin,
@@ -228,18 +229,22 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 expected_found: self.values_str(trace.values, &trace.cause, err.long_ty_path()),
             }
             .add_to_diag(err),
-            SubregionOrigin::Reborrow(span) => {
-                RegionOriginNote::Plain { span, msg: fluent::trait_selection_reborrow }
-                    .add_to_diag(err)
+            SubregionOrigin::Reborrow(span) => RegionOriginNote::Plain {
+                span,
+                msg: msg!("...so that reference does not outlive borrowed content"),
             }
+            .add_to_diag(err),
             SubregionOrigin::RelateObjectBound(span) => {
-                RegionOriginNote::Plain { span, msg: fluent::trait_selection_relate_object_bound }
-                    .add_to_diag(err);
+                RegionOriginNote::Plain {
+                    span,
+                    msg: msg!("...so that it can be closed over into an object"),
+                }
+                .add_to_diag(err);
             }
             SubregionOrigin::ReferenceOutlivesReferent(ty, span) => {
                 RegionOriginNote::WithName {
                     span,
-                    msg: fluent::trait_selection_reference_outlives_referent,
+                    msg: msg!("...so that the reference type `{$name}` does not outlive the data it points at"),
                     name: &self.ty_to_string(ty),
                     continues: false,
                 }
@@ -248,7 +253,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             SubregionOrigin::RelateParamBound(span, ty, opt_span) => {
                 RegionOriginNote::WithName {
                     span,
-                    msg: fluent::trait_selection_relate_param_bound,
+                    msg: msg!(
+                        "...so that the type `{$name}` will meet its required lifetime bounds{$continues ->
+                            [true] ...
+                            *[false] {\"\"}
+                        }"
+                    ),
                     name: &self.ty_to_string(ty),
                     continues: opt_span.is_some(),
                 }
@@ -256,7 +266,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 if let Some(span) = opt_span {
                     RegionOriginNote::Plain {
                         span,
-                        msg: fluent::trait_selection_relate_param_bound_2,
+                        msg: msg!("...that is required by this bound"),
                     }
                     .add_to_diag(err);
                 }
@@ -264,14 +274,16 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             SubregionOrigin::RelateRegionParamBound(span, _) => {
                 RegionOriginNote::Plain {
                     span,
-                    msg: fluent::trait_selection_relate_region_param_bound,
+                    msg: msg!("...so that the declared lifetime parameter bounds are satisfied"),
                 }
                 .add_to_diag(err);
             }
             SubregionOrigin::CompareImplItemObligation { span, .. } => {
                 RegionOriginNote::Plain {
                     span,
-                    msg: fluent::trait_selection_compare_impl_item_obligation,
+                    msg: msg!(
+                        "...so that the definition in impl matches the definition from the trait"
+                    ),
                 }
                 .add_to_diag(err);
             }
@@ -279,9 +291,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 self.note_region_origin(err, parent);
             }
             SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
+                RegionOriginNote::Plain { span, msg: msg!("...so that the where clause holds") }
+                    .add_to_diag(err);
+            }
+            SubregionOrigin::SolverRegionConstraint(span) => {
                 RegionOriginNote::Plain {
                     span,
-                    msg: fluent::trait_selection_ascribe_user_type_prove_predicate,
+                    msg: msg!("...so that a higher-ranked lifetime bound can be satisfied"),
                 }
                 .add_to_diag(err);
             }
@@ -296,10 +312,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         sup: Region<'tcx>,
     ) -> Diag<'a> {
         let mut err = match origin {
-            SubregionOrigin::Subtype(box trace) => {
+            SubregionOrigin::Subtype(trace) => {
                 let terr = TypeError::RegionsDoesNotOutlive(sup, sub);
                 let mut err = self.report_and_explain_type_error(
-                    trace,
+                    *trace,
                     self.tcx.param_env(generic_param_scope),
                     terr,
                 );
@@ -434,9 +450,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     && let Some(def_id) = preds.principal_def_id()
                 {
                     for (clause, span) in
-                        self.tcx.predicates_of(def_id).instantiate_identity(self.tcx)
+                        self.tcx.clauses_of(def_id).instantiate_identity(self.tcx).into_iter()
                     {
-                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) =
+                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesClause(a, b)) =
                             clause.kind().skip_binder()
                             && let ty::Param(param) = a.kind()
                             && param.name == kw::SelfUpper
@@ -553,6 +569,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: instantiated.into_iter().chain(must_outlive).collect(),
                 })
             }
+            SubregionOrigin::SolverRegionConstraint(span) => self
+                .dcx()
+                .struct_span_err(span, "higher-ranked lifetime bound could not be satisfied"),
         };
         if sub.is_error() || sup.is_error() {
             err.downgrade_to_delayed_bug();
@@ -577,24 +596,26 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let trait_ref = self.tcx.impl_trait_ref(impl_def_id);
         let trait_args = trait_ref
             .instantiate_identity()
+            .skip_norm_wip()
             // Replace the explicit self type with `Self` for better suggestion rendering
             .with_replaced_self_ty(self.tcx, Ty::new_param(self.tcx, 0, kw::SelfUpper))
             .args;
         let trait_item_args = ty::GenericArgs::identity_for_item(self.tcx, impl_item_def_id)
             .rebase_onto(self.tcx, impl_def_id, trait_args);
 
-        let Ok(trait_predicates) =
-            self.tcx
-                .explicit_predicates_of(trait_item_def_id)
-                .instantiate_own(self.tcx, trait_item_args)
-                .map(|(pred, _)| {
-                    if pred.is_suggestable(self.tcx, false) {
-                        Ok(pred.to_string())
-                    } else {
-                        Err(())
-                    }
-                })
-                .collect::<Result<Vec<_>, ()>>()
+        let Ok(trait_predicates) = self
+            .tcx
+            .explicit_clauses_of(trait_item_def_id)
+            .instantiate_own(self.tcx, trait_item_args)
+            .map(|(clause, _)| {
+                let clause = clause.skip_norm_wip();
+                if clause.is_suggestable(self.tcx, false) {
+                    Ok(clause.to_string())
+                } else {
+                    Err(())
+                }
+            })
+            .collect::<Result<Vec<_>, ()>>()
         else {
             return;
         };
@@ -626,7 +647,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         // I can't think how to do better than this right now. -nikomatsakis
         debug!(?placeholder_origin, ?sub, ?sup, "report_placeholder_failure");
         match placeholder_origin {
-            SubregionOrigin::Subtype(box ref trace)
+            SubregionOrigin::Subtype(ref trace)
                 if matches!(
                     &trace.cause.code().peel_derives(),
                     ObligationCauseCode::WhereClause(..)
@@ -656,10 +677,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     )
                 }
             }
-            SubregionOrigin::Subtype(box trace) => {
+            SubregionOrigin::Subtype(trace) => {
                 let terr = TypeError::RegionsPlaceholderMismatch;
                 return self.report_and_explain_type_error(
-                    trace,
+                    *trace,
                     self.tcx.param_env(generic_param_scope),
                     terr,
                 );
@@ -712,12 +733,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let labeled_user_string = match bound_kind {
             GenericKind::Param(_) => format!("the parameter type `{bound_kind}`"),
             GenericKind::Placeholder(_) => format!("the placeholder type `{bound_kind}`"),
-            GenericKind::Alias(p) => match p.kind(self.tcx) {
-                ty::Projection | ty::Inherent => {
+            GenericKind::Alias(p) => match p.kind {
+                ty::Projection { .. } | ty::Inherent { .. } => {
                     format!("the associated type `{bound_kind}`")
                 }
-                ty::Free => format!("the type alias `{bound_kind}`"),
-                ty::Opaque => format!("the opaque type `{bound_kind}`"),
+                ty::Free { .. } => format!("the type alias `{bound_kind}`"),
+                ty::Opaque { .. } => format!("the opaque type `{bound_kind}`"),
             },
         };
 
@@ -813,7 +834,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         None => generic_param_scope,
                     },
                 };
-                match self.tcx.is_descendant_of(type_scope.into(), lifetime_scope.into()) {
+                match self.tcx.is_descendant_of(type_scope, lifetime_scope) {
                     true => type_scope,
                     false => lifetime_scope,
                 }
@@ -839,10 +860,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     LifetimeSuggestion::HasColon => suggs.push((sp, format!(" {lt_name}"))),
                 }
             } else if let GenericKind::Alias(ref p) = bound_kind
-                && let ty::Projection = p.kind(self.tcx)
-                && let DefKind::AssocTy = self.tcx.def_kind(p.def_id)
+                && let ty::Projection { def_id } = p.kind
+                && let DefKind::AssocTy = self.tcx.def_kind(def_id)
                 && let Some(ty::ImplTraitInTraitData::Trait { .. }) =
-                    self.tcx.opt_rpitit_info(p.def_id)
+                    self.tcx.opt_rpitit_info(def_id)
             {
                 // The lifetime found in the `impl` is longer than the one on the RPITIT.
                 // Do not suggest `<Type as Trait>::{opaque}: 'static`.
@@ -856,7 +877,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
 
             if !suggs.is_empty() {
-                err.multipart_suggestion_verbose(
+                err.multipart_suggestion(
                     msg,
                     suggs,
                     Applicability::MaybeIncorrect, // Issue #41966
@@ -980,7 +1001,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     fn report_sub_sup_conflict(
         &self,
         generic_param_scope: LocalDefId,
-        var_origin: RegionVariableOrigin,
+        var_origin: RegionVariableOrigin<'tcx>,
         sub_origin: SubregionOrigin<'tcx>,
         sub_region: Region<'tcx>,
         sup_origin: SubregionOrigin<'tcx>,
@@ -1009,7 +1030,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             && let Some((sup_expected, sup_found)) =
                 self.values_str(sup_trace.values, &sup_trace.cause, err.long_ty_path())
             && let Some((sub_expected, sub_found)) =
-                self.values_str(sub_trace.values, &sup_trace.cause, err.long_ty_path())
+                self.values_str(sub_trace.values, &sub_trace.cause, err.long_ty_path())
             && sub_expected == sup_expected
             && sub_found == sup_found
         {
@@ -1051,8 +1072,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         if sub_region.is_error() | sup_region.is_error() { err.delay_as_bug() } else { err.emit() }
     }
 
-    fn report_inference_failure(&self, var_origin: RegionVariableOrigin) -> Diag<'_> {
-        let br_string = |br: ty::BoundRegionKind| {
+    fn report_inference_failure(&self, var_origin: RegionVariableOrigin<'tcx>) -> Diag<'_> {
+        let br_string = |br: ty::BoundRegionKind<'tcx>| {
             let mut s = match br {
                 ty::BoundRegionKind::Named(def_id) => self.tcx.item_name(def_id).to_string(),
                 _ => String::new(),
@@ -1256,11 +1277,19 @@ pub fn unexpected_hidden_region_diagnostic<'a, 'tcx>(
     opaque_ty_key: ty::OpaqueTypeKey<'tcx>,
 ) -> Diag<'a> {
     let tcx = infcx.tcx;
-    let mut err = infcx.dcx().create_err(errors::OpaqueCapturesLifetime {
+    let mut err = infcx.dcx().create_err(diagnostics::OpaqueCapturesLifetime {
         span,
-        opaque_ty: Ty::new_opaque(tcx, opaque_ty_key.def_id.to_def_id(), opaque_ty_key.args),
+        opaque_ty: Ty::new_opaque(
+            tcx,
+            ty::IsRigid::No,
+            opaque_ty_key.def_id.to_def_id(),
+            opaque_ty_key.args,
+        ),
         opaque_ty_span: tcx.def_span(opaque_ty_key.def_id),
     });
+    let mut highlight = RegionHighlightMode::default();
+    highlight.keep_regions = true;
+    let hidden_ty = Highlighted { highlight, ns: Namespace::TypeNS, tcx, value: hidden_ty };
 
     // Explain the region we are capturing.
     match hidden_region.kind() {
@@ -1369,7 +1398,12 @@ fn suggest_precise_capturing<'tcx>(
             (span.with_hi(span.hi() - BytePos(1)).shrink_to_hi(), "", "")
         };
 
-        diag.subdiagnostic(errors::AddPreciseCapturing::Existing { span, new_lifetime, pre, post });
+        diag.subdiagnostic(diagnostics::AddPreciseCapturing::Existing {
+            span,
+            new_lifetime,
+            pre,
+            post,
+        });
     } else {
         let mut captured_lifetimes = FxIndexSet::default();
         let mut captured_non_lifetimes = FxIndexSet::default();
@@ -1417,16 +1451,16 @@ fn suggest_precise_capturing<'tcx>(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            diag.subdiagnostic(errors::AddPreciseCapturing::New {
+            diag.subdiagnostic(diagnostics::AddPreciseCapturing::New {
                 span: tcx.def_span(opaque_def_id).shrink_to_hi(),
                 new_lifetime,
                 concatenated_bounds,
             });
         } else {
             let mut next_fresh_param = || {
-                ["T", "U", "V", "W", "X", "Y", "A", "B", "C"]
+                ['T', 'U', 'V', 'W', 'X', 'Y', 'A', 'B', 'C']
                     .into_iter()
-                    .map(Symbol::intern)
+                    .map(sym::character)
                     .chain((0..).map(|i| Symbol::intern(&format!("T{i}"))))
                     .find(|s| captured_non_lifetimes.insert(*s))
                     .unwrap()
@@ -1484,7 +1518,7 @@ fn suggest_precise_capturing<'tcx>(
                 format!(" + use<{concatenated_bounds}>"),
             ));
 
-            diag.subdiagnostic(errors::AddPreciseCapturingAndParams {
+            diag.subdiagnostic(diagnostics::AddPreciseCapturingAndParams {
                 suggs,
                 new_lifetime,
                 apit_spans,

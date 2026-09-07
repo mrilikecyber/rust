@@ -1,61 +1,64 @@
 //! Meta-syntax validation logic of attributes for post-expansion.
 
+use std::convert::identity;
 use std::slice;
 
 use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::DelimSpan;
 use rustc_ast::{
-    self as ast, AttrArgs, Attribute, DelimArgs, MetaItem, MetaItemInner, MetaItemKind, NodeId,
-    Path, Safety,
+    self as ast, AttrArgs, AttrKind, Attribute, DelimArgs, MetaItem, MetaItemInner, MetaItemKind,
+    Safety,
 };
-use rustc_errors::{Applicability, DiagCtxtHandle, FatalError, PResult};
-use rustc_feature::{AttributeSafety, AttributeTemplate, BUILTIN_ATTRIBUTE_MAP, BuiltinAttribute};
+use rustc_attr_ir::AttrPath;
+use rustc_errors::{Applicability, Diagnostic, PResult};
+use rustc_feature::BUILTIN_ATTRIBUTE_SET;
+use rustc_lint_defs::builtin::ILL_FORMED_ATTRIBUTE_INPUT;
 use rustc_parse::parse_in;
-use rustc_session::errors::report_lit_error;
-use rustc_session::lint::BuiltinLintDiag;
-use rustc_session::lint::builtin::{ILL_FORMED_ATTRIBUTE_INPUT, UNSAFE_ATTR_OUTSIDE_UNSAFE};
+use rustc_session::diagnostics::report_lit_error;
 use rustc_session::parse::ParseSess;
 use rustc_span::{Span, Symbol, sym};
 
-use crate::{AttributeParser, Late, session_diagnostics as errors};
+use crate::{AttributeParser, AttributeTemplate, diagnostics as errors, template};
 
-pub fn check_attr(psess: &ParseSess, attr: &Attribute, id: NodeId) {
-    if attr.is_doc_comment() || attr.has_name(sym::cfg_trace) || attr.has_name(sym::cfg_attr_trace)
-    {
-        return;
+pub fn check_attr(psess: &ParseSess, attr: &Attribute) {
+    use ast::SyntheticAttr::*;
+    match &attr.kind {
+        AttrKind::Normal(_) => {}
+        AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace(_)) | AttrKind::DocComment(..) => return,
     }
 
-    let builtin_attr_info = attr.ident().and_then(|ident| BUILTIN_ATTRIBUTE_MAP.get(&ident.name));
-
-    let builtin_attr_safety = builtin_attr_info.map(|x| x.safety);
-    check_attribute_safety(psess, builtin_attr_safety, attr, id);
+    let builtin_attr_info = attr.name().and_then(|name| BUILTIN_ATTRIBUTE_SET.get(&name));
 
     // Check input tokens for built-in and key-value attributes.
-    match builtin_attr_info {
-        // `rustc_dummy` doesn't have any restrictions specific to built-in attributes.
-        Some(BuiltinAttribute { name, template, .. }) => {
-            if AttributeParser::<Late>::is_parsed_attribute(slice::from_ref(&name)) {
-                return;
+    if let Some(name) = builtin_attr_info {
+        if AttributeParser::is_parsed_attribute(slice::from_ref(name)) {
+            return;
+        }
+        match parse_meta(psess, attr) {
+            // Don't check safety again, we just did that
+            Ok(meta) => {
+                // FIXME The only unparsed builtin attributes that are left are the lint attributes, so we can hardcode the template here
+                let lint_attrs = [sym::forbid, sym::allow, sym::warn, sym::deny, sym::expect];
+                assert!(lint_attrs.contains(name));
+
+                let template = template!(
+                    List: &["lint1", "lint1, lint2, ...", r#"lint1, lint2, lint3, reason = "...""#],
+                    "https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-check-attributes"
+                );
+                check_builtin_meta_item(psess, &meta, attr.style, *name, template, false)
             }
-            match parse_meta(psess, attr) {
-                // Don't check safety again, we just did that
-                Ok(meta) => {
-                    check_builtin_meta_item(psess, &meta, attr.style, *name, *template, false)
-                }
-                Err(err) => {
-                    err.emit();
-                }
+            Err(err) => {
+                err.emit();
             }
         }
-        _ => {
-            let attr_item = attr.get_normal_item();
-            if let AttrArgs::Eq { .. } = attr_item.args {
-                // All key-value attributes are restricted to meta-item syntax.
-                match parse_meta(psess, attr) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        err.emit();
-                    }
+    } else {
+        let attr_item = attr.get_normal_item();
+        if let AttrArgs::Eq { .. } = attr_item.args {
+            // All key-value attributes are restricted to meta-item syntax.
+            match parse_meta(psess, attr) {
+                Ok(_) => {}
+                Err(err) => {
+                    err.emit();
                 }
             }
         }
@@ -79,7 +82,8 @@ pub fn parse_meta<'a>(psess: &'a ParseSess, attr: &Attribute) -> PResult<'a, Met
             AttrArgs::Eq { expr, .. } => {
                 if let ast::ExprKind::Lit(token_lit) = expr.kind {
                     let res = ast::MetaItemLit::from_token_lit(token_lit, expr.span);
-                    let res = match res {
+
+                    match res {
                         Ok(lit) => {
                             if token_lit.suffix.is_some() {
                                 let mut err = psess.dcx().struct_span_err(
@@ -91,9 +95,8 @@ pub fn parse_meta<'a>(psess: &'a ParseSess, attr: &Attribute) -> PResult<'a, Met
                                     use an unsuffixed version (`1`, `1.0`, etc.)",
                                 );
                                 return Err(err);
-                            } else {
-                                MetaItemKind::NameValue(lit)
                             }
+                            MetaItemKind::NameValue(lit)
                         }
                         Err(err) => {
                             let guar = report_lit_error(psess, err, token_lit, expr.span);
@@ -105,8 +108,7 @@ pub fn parse_meta<'a>(psess: &'a ParseSess, attr: &Attribute) -> PResult<'a, Met
                             };
                             MetaItemKind::NameValue(lit)
                         }
-                    };
-                    res
+                    }
                 } else {
                     // Example cases:
                     // - `#[foo = 1+1]`: results in `ast::ExprKind::Binary`.
@@ -150,101 +152,6 @@ fn is_attr_template_compatible(template: &AttributeTemplate, meta: &ast::MetaIte
     }
 }
 
-pub fn check_attribute_safety(
-    psess: &ParseSess,
-    builtin_attr_safety: Option<AttributeSafety>,
-    attr: &Attribute,
-    id: NodeId,
-) {
-    let attr_item = attr.get_normal_item();
-    match (builtin_attr_safety, attr_item.unsafety) {
-        // - Unsafe builtin attribute
-        // - User wrote `#[unsafe(..)]`, which is permitted on any edition
-        (Some(AttributeSafety::Unsafe { .. }), Safety::Unsafe(..)) => {
-            // OK
-        }
-
-        // - Unsafe builtin attribute
-        // - User did not write `#[unsafe(..)]`
-        (Some(AttributeSafety::Unsafe { unsafe_since }), Safety::Default) => {
-            let path_span = attr_item.path.span;
-
-            // If the `attr_item`'s span is not from a macro, then just suggest
-            // wrapping it in `unsafe(...)`. Otherwise, we suggest putting the
-            // `unsafe(`, `)` right after and right before the opening and closing
-            // square bracket respectively.
-            let diag_span = attr_item.span();
-
-            // Attributes can be safe in earlier editions, and become unsafe in later ones.
-            //
-            // Use the span of the attribute's name to determine the edition: the span of the
-            // attribute as a whole may be inaccurate if it was emitted by a macro.
-            //
-            // See https://github.com/rust-lang/rust/issues/142182.
-            let emit_error = match unsafe_since {
-                None => true,
-                Some(unsafe_since) => path_span.edition() >= unsafe_since,
-            };
-
-            if emit_error {
-                psess.dcx().emit_err(errors::UnsafeAttrOutsideUnsafe {
-                    span: path_span,
-                    suggestion: errors::UnsafeAttrOutsideUnsafeSuggestion {
-                        left: diag_span.shrink_to_lo(),
-                        right: diag_span.shrink_to_hi(),
-                    },
-                });
-            } else {
-                psess.buffer_lint(
-                    UNSAFE_ATTR_OUTSIDE_UNSAFE,
-                    path_span,
-                    id,
-                    BuiltinLintDiag::UnsafeAttrOutsideUnsafe {
-                        attribute_name_span: path_span,
-                        sugg_spans: (diag_span.shrink_to_lo(), diag_span.shrink_to_hi()),
-                    },
-                );
-            }
-        }
-
-        // - Normal builtin attribute
-        // - Writing `#[unsafe(..)]` is not permitted on normal builtin attributes
-        (None | Some(AttributeSafety::Normal), Safety::Unsafe(unsafe_span)) => {
-            psess.dcx().emit_err(errors::InvalidAttrUnsafe {
-                span: unsafe_span,
-                name: attr_item.path.clone(),
-            });
-        }
-
-        // - Normal builtin attribute
-        // - No explicit `#[unsafe(..)]` written.
-        (None | Some(AttributeSafety::Normal), Safety::Default) => {
-            // OK
-        }
-
-        (
-            Some(AttributeSafety::Unsafe { .. } | AttributeSafety::Normal) | None,
-            Safety::Safe(..),
-        ) => {
-            psess.dcx().span_delayed_bug(
-                attr_item.span(),
-                "`check_attribute_safety` does not expect `Safety::Safe` on attributes",
-            );
-        }
-    }
-}
-
-// Called by `check_builtin_meta_item` and code that manually denies
-// `unsafe(...)` in `cfg`
-pub fn deny_builtin_meta_unsafety(diag: DiagCtxtHandle<'_>, unsafety: Safety, name: &Path) {
-    // This only supports denying unsafety right now - making builtin attributes
-    // support unsafety will requite us to thread the actual `Attribute` through
-    // for the nice diagnostics.
-    if let Safety::Unsafe(unsafe_span) = unsafety {
-        diag.emit_err(errors::InvalidAttrUnsafe { span: unsafe_span, name: name.clone() });
-    }
-}
-
 pub fn check_builtin_meta_item(
     psess: &ParseSess,
     meta: &MetaItem,
@@ -258,12 +165,15 @@ pub fn check_builtin_meta_item(
         emit_malformed_attribute(psess, style, meta.span, name, template);
     }
 
-    if deny_unsafety {
-        deny_builtin_meta_unsafety(psess.dcx(), meta.unsafety, &meta.path);
+    if deny_unsafety && let Safety::Unsafe(unsafe_span) = meta.unsafety {
+        psess.dcx().emit_err(errors::InvalidAttrUnsafe {
+            span: unsafe_span,
+            name: AttrPath::from_ast(&meta.path, identity),
+        });
     }
 }
 
-fn emit_malformed_attribute(
+pub fn emit_malformed_attribute(
     psess: &ParseSess,
     style: ast::AttrStyle,
     span: Span,
@@ -291,14 +201,20 @@ fn emit_malformed_attribute(
             suggestions.push(format!("#{inner}[{name} = \"{descr}\"]"));
         }
     }
+    // If there are too many suggestions, better remove all of them as it's just noise at this
+    // point.
+    if suggestions.len() > 3 {
+        suggestions.clear();
+    }
     if should_warn(name) {
-        psess.buffer_lint(
+        let suggestions = suggestions.clone();
+        psess.dyn_buffer_lint(
             ILL_FORMED_ATTRIBUTE_INPUT,
             span,
             ast::CRATE_NODE_ID,
-            BuiltinLintDiag::IllFormedAttributeInput {
-                suggestions: suggestions.clone(),
-                docs: template.docs,
+            move |dcx, level| {
+                crate::diagnostics::IllFormedAttributeInput::new(&suggestions, template.docs, None)
+                    .into_diag(dcx, level)
             },
         );
     } else {
@@ -318,16 +234,4 @@ fn emit_malformed_attribute(
         }
         err.emit();
     }
-}
-
-pub fn emit_fatal_malformed_builtin_attribute(
-    psess: &ParseSess,
-    attr: &Attribute,
-    name: Symbol,
-) -> ! {
-    let template = BUILTIN_ATTRIBUTE_MAP.get(&name).expect("builtin attr defined").template;
-    emit_malformed_attribute(psess, attr.style, attr.span, name, template);
-    // This is fatal, otherwise it will likely cause a cascade of other errors
-    // (and an error here is expected to be very rare).
-    FatalError.raise()
 }

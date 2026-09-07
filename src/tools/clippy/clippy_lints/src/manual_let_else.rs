@@ -2,15 +2,17 @@ use crate::question_mark::{QUESTION_MARK, QuestionMark};
 use clippy_config::types::MatchLintBehaviour;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::IfLetOrMatch;
-use clippy_utils::res::{MaybeDef, MaybeQPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::{is_lint_allowed, is_never_expr, is_wild, msrvs, pat_and_expr_can_be_question_mark, peel_blocks};
 use rustc_ast::BindingMode;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
 use rustc_hir::def::{CtorOf, DefKind, Res};
-use rustc_hir::{Arm, Expr, ExprKind, MatchSource, Pat, PatExpr, PatExprKind, PatKind, QPath, Stmt, StmtKind};
-use rustc_lint::{LateContext, LintContext};
+use rustc_hir::{
+    Arm, BlockCheckMode, Expr, ExprKind, MatchSource, Pat, PatExpr, PatExprKind, PatKind, QPath, Stmt, StmtKind,
+};
+use rustc_lint::{LateContext, LintContext as _};
 use rustc_span::Span;
 use rustc_span::symbol::{Symbol, sym};
 use std::slice;
@@ -120,11 +122,7 @@ fn is_arms_disjointed(cx: &LateContext<'_>, arm1: &Arm<'_>, arm2: &Arm<'_>) -> b
         return false;
     }
 
-    if !is_enum_variant(cx, arm1.pat) || !is_enum_variant(cx, arm2.pat) {
-        return false;
-    }
-
-    true
+    is_enum_variant(cx, arm1.pat) && is_enum_variant(cx, arm2.pat)
 }
 
 /// Returns `true` if the given pattern is a variant of an enum.
@@ -177,7 +175,10 @@ fn emit_manual_let_else(
             let (sn_expr, _) = snippet_with_context(cx, expr.span, span.ctxt(), "", &mut app);
             let (sn_else, else_is_mac_call) = snippet_with_context(cx, else_body.span, span.ctxt(), "", &mut app);
 
-            let else_bl = if matches!(else_body.kind, ExprKind::Block(..)) && !else_is_mac_call {
+            let else_bl = if let ExprKind::Block(block, None) = else_body.kind
+                && matches!(block.rules, BlockCheckMode::DefaultBlock)
+                && !else_is_mac_call
+            {
                 sn_else.into_owned()
             } else {
                 format!("{{ {sn_else} }}")
@@ -301,7 +302,7 @@ fn replace_in_pattern(
                     .collect::<Vec<_>>();
                 let fields_string = fields.join(", ");
 
-                let dot_dot_str = if dot_dot.is_some() { " .." } else { "" };
+                let dot_dot_str = if dot_dot.is_some() { ", .." } else { "" };
                 let (sn_pth, _) = snippet_with_context(cx, path.span(), span.ctxt(), "", app);
                 return format!("{sn_pth} {{ {fields_string}{dot_dot_str} }}");
             },
@@ -374,7 +375,7 @@ fn pat_allowed_for_else(cx: &LateContext<'_>, pat: &'_ Pat<'_>, check_types: boo
         }
         let ty = typeck_results.pat_ty(pat);
         // Option and Result are allowed, everything else isn't.
-        if !(ty.is_diag_item(cx, sym::Option) || ty.is_diag_item(cx, sym::Result)) {
+        if !matches!(ty.opt_diag_name(cx), Some(sym::Option | sym::Result)) {
             has_disallowed = true;
         }
     });

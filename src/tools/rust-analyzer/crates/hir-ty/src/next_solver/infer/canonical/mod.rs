@@ -21,11 +21,16 @@
 //!
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
-use crate::next_solver::{
-    Canonical, CanonicalVarValues, Const, DbInterner, GenericArg, PlaceholderConst,
-    PlaceholderRegion, PlaceholderTy, Region, Ty, TyKind, infer::InferCtxt,
+use crate::{
+    Span,
+    next_solver::{
+        ArgOutlivesPredicate, Canonical, CanonicalVarValues, Const, DbInterner, GenericArg,
+        OpaqueTypeKey, PlaceholderConst, PlaceholderRegion, PlaceholderType, Region, Ty, TyKind,
+        infer::InferCtxt,
+    },
 };
 use instantiate::CanonicalExt;
+use macros::{TypeFoldable, TypeVisitable};
 use rustc_index::IndexVec;
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{CanonicalVarKind, InferTy, TypeFoldable, UniverseIndex, inherent::Ty as _};
@@ -48,6 +53,7 @@ impl<'db> InferCtxt<'db> {
     /// for each of the canonical inputs to your query.
     pub fn instantiate_canonical<T>(
         &self,
+        span: Span,
         canonical: &Canonical<'db, T>,
     ) -> (T, CanonicalVarValues<'db>)
     where
@@ -68,8 +74,10 @@ impl<'db> InferCtxt<'db> {
 
         let var_values = CanonicalVarValues::instantiate(
             self.interner,
-            canonical.variables,
-            |var_values, info| self.instantiate_canonical_var(info, var_values, |ui| universes[ui]),
+            canonical.var_kinds,
+            |var_values, info| {
+                self.instantiate_canonical_var(span, info, var_values, |ui| universes[ui])
+            },
         );
         let result = canonical.instantiate(self.interner, &var_values);
         (result, var_values)
@@ -85,13 +93,14 @@ impl<'db> InferCtxt<'db> {
     /// We should somehow deduplicate all of this.
     pub fn instantiate_canonical_var(
         &self,
+        span: Span,
         cv_info: CanonicalVarKind<DbInterner<'db>>,
         previous_var_values: &[GenericArg<'db>],
         universe_map: impl Fn(UniverseIndex) -> UniverseIndex,
     ) -> GenericArg<'db> {
         match cv_info {
             CanonicalVarKind::Ty { ui, sub_root } => {
-                let vid = self.next_ty_var_id_in_universe(universe_map(ui));
+                let vid = self.next_ty_var_id_in_universe(universe_map(ui), span);
                 // If this inference variable is related to an earlier variable
                 // via subtyping, we need to add that info to the inference context.
                 if let Some(prev) = previous_var_values.get(sub_root.as_usize()) {
@@ -108,30 +117,49 @@ impl<'db> InferCtxt<'db> {
 
             CanonicalVarKind::Float => self.next_float_var().into(),
 
-            CanonicalVarKind::PlaceholderTy(PlaceholderTy { universe, bound }) => {
+            CanonicalVarKind::PlaceholderTy(PlaceholderType { universe, bound, .. }) => {
                 let universe_mapped = universe_map(universe);
-                let placeholder_mapped = PlaceholderTy { universe: universe_mapped, bound };
+                let placeholder_mapped = PlaceholderType::new(universe_mapped, bound);
                 Ty::new_placeholder(self.interner, placeholder_mapped).into()
             }
 
             CanonicalVarKind::Region(ui) => {
-                self.next_region_var_in_universe(universe_map(ui)).into()
+                self.next_region_var_in_universe(universe_map(ui), span).into()
             }
 
-            CanonicalVarKind::PlaceholderRegion(PlaceholderRegion { universe, bound }) => {
+            CanonicalVarKind::PlaceholderRegion(PlaceholderRegion { universe, bound, .. }) => {
                 let universe_mapped = universe_map(universe);
-                let placeholder_mapped: crate::next_solver::Placeholder<
-                    crate::next_solver::BoundRegion,
-                > = PlaceholderRegion { universe: universe_mapped, bound };
+                let placeholder_mapped = PlaceholderRegion::new(universe_mapped, bound);
                 Region::new_placeholder(self.interner, placeholder_mapped).into()
             }
 
-            CanonicalVarKind::Const(ui) => self.next_const_var_in_universe(universe_map(ui)).into(),
-            CanonicalVarKind::PlaceholderConst(PlaceholderConst { universe, bound }) => {
+            CanonicalVarKind::Const(ui) => {
+                self.next_const_var_in_universe(universe_map(ui), span).into()
+            }
+            CanonicalVarKind::PlaceholderConst(PlaceholderConst { universe, bound, .. }) => {
                 let universe_mapped = universe_map(universe);
-                let placeholder_mapped = PlaceholderConst { universe: universe_mapped, bound };
+                let placeholder_mapped = PlaceholderConst::new(universe_mapped, bound);
                 Const::new_placeholder(self.interner, placeholder_mapped).into()
             }
         }
     }
 }
+
+/// After we execute a query with a canonicalized key, we get back a
+/// `Canonical<QueryResponse<..>>`. You can use
+/// `instantiate_query_result` to access the data in this result.
+#[derive(Clone, Debug, TypeVisitable, TypeFoldable)]
+pub struct QueryResponse<'db, R> {
+    pub var_values: CanonicalVarValues<'db>,
+    pub region_constraints: QueryRegionConstraints<'db>,
+    pub opaque_types: Vec<(OpaqueTypeKey<'db>, Ty<'db>)>,
+    pub value: R,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+pub struct QueryRegionConstraints<'db> {
+    pub outlives: Vec<QueryOutlivesConstraint<'db>>,
+    pub assumptions: Vec<ArgOutlivesPredicate<'db>>,
+}
+
+pub type QueryOutlivesConstraint<'tcx> = ArgOutlivesPredicate<'tcx>;

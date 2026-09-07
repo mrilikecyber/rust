@@ -86,7 +86,7 @@ fn inline_attr<'gcc, 'tcx>(
 /// attributes.
 pub fn from_fn_attrs<'gcc, 'tcx>(
     cx: &CodegenCx<'gcc, 'tcx>,
-    #[cfg_attr(not(feature = "master"), allow(unused_variables))] func: Function<'gcc>,
+    #[cfg_attr(not(feature = "master"), expect(unused_variables))] func: Function<'gcc>,
     instance: ty::Instance<'tcx>,
 ) {
     let codegen_fn_attrs = cx.tcx.codegen_instance_attrs(instance.def);
@@ -126,19 +126,19 @@ pub fn from_fn_attrs<'gcc, 'tcx>(
         .map(|features| features.name.as_str())
         .flat_map(|feat| to_gcc_features(cx.tcx.sess, feat).into_iter())
         .chain(codegen_fn_attrs.instruction_set.iter().map(|x| match *x {
-            InstructionSetAttr::ArmA32 => "-thumb-mode", // TODO(antoyo): support removing feature.
+            InstructionSetAttr::ArmA32 => "-thumb-mode", // FIXME(antoyo): support removing feature.
             InstructionSetAttr::ArmT32 => "thumb-mode",
         }))
         .collect::<Vec<_>>();
 
-    // TODO(antoyo): cg_llvm adds global features to each function so that LTO keep them.
+    // FIXME(antoyo): cg_llvm adds global features to each function so that LTO keep them.
     // Check if GCC requires the same.
     let mut global_features = cx.tcx.global_backend_features(()).iter().map(|s| s.as_str());
     function_features.extend(&mut global_features);
     let target_features = function_features
         .iter()
         .filter_map(|feature| {
-            // TODO(antoyo): support soft-float.
+            // FIXME(antoyo): support soft-float.
             if feature.contains("soft-float") {
                 return None;
             }

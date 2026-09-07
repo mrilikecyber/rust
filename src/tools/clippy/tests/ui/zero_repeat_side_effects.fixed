@@ -1,6 +1,13 @@
 #![warn(clippy::zero_repeat_side_effects)]
-#![expect(clippy::unnecessary_operation, clippy::useless_vec, clippy::needless_late_init)]
-#![allow(clippy::no_effect)] // only fires _after_ the fix
+#![expect(
+    clippy::needless_late_init,
+    clippy::single_match,
+    clippy::unnecessary_operation,
+    clippy::useless_vec
+)]
+#![allow(
+    clippy::no_effect // only fires _after_ the fix
+)]
 
 fn f() -> i32 {
     println!("side effect");
@@ -117,5 +124,36 @@ fn issue_14681() {
         Some(Some(S::new()));
         [] as [std::option::Option<std::option::Option<S>>; 0]
     });
+    //~^ zero_repeat_side_effects
+}
+
+fn issue_15824() {
+    fn f() {}
+
+    match 0 {
+        0 => {
+            f();
+            _ = [] as [(); 0]
+        },
+        //~^ zero_repeat_side_effects
+        _ => {},
+    }
+
+    let mut a = [(); 0];
+    match 0 {
+        0 => {
+            f();
+            a = [] as [(); 0]
+        },
+        //~^ zero_repeat_side_effects
+        _ => {},
+    }
+}
+
+#[allow(clippy::diverging_sub_expression)] // only fires *before* the fix
+fn diverging() {
+    // Used to not be fixable when `!` wasn't stable yet and thus not nameable
+    panic!();
+    let _data: [!; 0] = [];
     //~^ zero_repeat_side_effects
 }

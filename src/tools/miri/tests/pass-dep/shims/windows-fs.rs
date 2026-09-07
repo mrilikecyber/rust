@@ -19,9 +19,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, DeleteFileW,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_CURRENT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, SetFilePointerEx,
+    FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN,
+    FILE_CURRENT, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAllocationInfo, FileEndOfFileInfo,
+    FlushFileBuffers, GetFileInformationByHandle, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    SetFileInformationByHandle, SetFilePointerEx,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -37,7 +39,10 @@ fn main() {
         test_ntstatus_to_dos();
         test_file_read_write();
         test_file_seek();
+        test_set_file_info();
         test_dup_handle();
+        test_flush_buffers();
+        test_move_file();
     }
 }
 
@@ -275,6 +280,32 @@ unsafe fn test_file_read_write() {
     assert_eq!(GetLastError(), 1234);
 }
 
+unsafe fn test_set_file_info() {
+    let temp = utils::tmp().join("test_set_file.txt");
+    let mut file = fs::File::create(&temp).unwrap();
+    let handle = file.as_raw_handle();
+
+    let info = FILE_END_OF_FILE_INFO { EndOfFile: 20 };
+    let res = SetFileInformationByHandle(
+        handle,
+        FileEndOfFileInfo,
+        ptr::from_ref(&info).cast(),
+        size_of::<FILE_END_OF_FILE_INFO>().try_into().unwrap(),
+    );
+    assert!(res != 0);
+    assert_eq!(file.seek(SeekFrom::End(0)).unwrap(), 20);
+
+    let info = FILE_ALLOCATION_INFO { AllocationSize: 0 };
+    let res = SetFileInformationByHandle(
+        handle,
+        FileAllocationInfo,
+        ptr::from_ref(&info).cast(),
+        size_of::<FILE_ALLOCATION_INFO>().try_into().unwrap(),
+    );
+    assert!(res != 0);
+    assert_eq!(file.metadata().unwrap().len(), 0);
+}
+
 unsafe fn test_dup_handle() {
     let temp = utils::tmp().join("test_dup.txt");
 
@@ -331,6 +362,36 @@ unsafe fn test_file_seek() {
     file.read_exact(&mut buf).unwrap();
     assert_eq!(buf, b", ");
     assert_eq!(pos, 5);
+}
+
+unsafe fn test_flush_buffers() {
+    let temp = utils::tmp().join("test_flush_buffers.txt");
+    let file = fs::File::options().create(true).write(true).read(true).open(&temp).unwrap();
+    if FlushFileBuffers(file.as_raw_handle()) == 0 {
+        panic!("Failed to flush buffers");
+    }
+
+    let file = fs::File::options().read(true).open(&temp).unwrap();
+    if FlushFileBuffers(file.as_raw_handle()) != 0 {
+        panic!("Successfully flushed buffers on read-only file");
+    }
+}
+
+unsafe fn test_move_file() {
+    let tmp_dir = utils::tmp();
+
+    let temp = tmp_dir.join("test_move_file.txt");
+    let temp_new = tmp_dir.join("test_move_file_new.txt");
+    let mut file = fs::File::options().create(true).write(true).open(&temp).unwrap();
+    file.write_all(b"Hello, World!\n").unwrap();
+
+    let from = to_wide_cstr(&temp);
+    let to = to_wide_cstr(&temp_new);
+    if MoveFileExW(from.as_ptr(), to.as_ptr(), 1) == 0 {
+        panic!("Failed to rename file from {} to {}", temp.display(), temp_new.display());
+    }
+
+    assert_eq!(fs::read_to_string(temp_new).unwrap(), "Hello, World!\n");
 }
 
 fn to_wide_cstr(path: &Path) -> Vec<u16> {

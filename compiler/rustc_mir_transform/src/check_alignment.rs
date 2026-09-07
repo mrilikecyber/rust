@@ -1,19 +1,20 @@
 use rustc_abi::Align;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::PlaceContext;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_session::Session;
 
+use crate::PassPolicy;
 use crate::check_pointers::{BorrowedFieldProjectionMode, PointerCheck, check_pointers};
 
 pub(super) struct CheckAlignment;
 
 impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.ub_checks()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // When UB checks are enabled this is part of their semantics, not an optimization.
+        PassPolicy::optional(ctx.ub_checks())
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -30,10 +31,6 @@ impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
             insert_alignment_check,
             BorrowedFieldProjectionMode::FollowProjections,
         );
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -82,7 +79,6 @@ fn insert_alignment_check<'tcx>(
 
     // If this target does not have reliable alignment, further limit the mask by anding it with
     // the mask for the highest reliable alignment.
-    #[allow(irrefutable_let_patterns)]
     if let max_align = tcx.sess.target.max_reliable_alignment()
         && max_align < Align::MAX
     {

@@ -8,9 +8,9 @@
 //!
 //! # The Expansion Order Hierarchy
 //!
-//! `ExpnData` in rustc, rust-analyzer's version is [`MacroCallLoc`]. Traversing the hierarchy
-//! upwards can be achieved by walking up [`MacroCallLoc::kind`]'s contained file id, as
-//! [`MacroFile`]s are interned [`MacroCallLoc`]s.
+//! `ExpnData` in rustc, rust-analyzer's version is `MacroCallLoc`. Traversing the hierarchy
+//! upwards can be achieved by walking up `MacroCallLoc::kind`'s contained file id, as
+//! `MacroFile`s are interned `MacroCallLoc`s.
 //!
 //! # The Macro Definition Hierarchy
 //!
@@ -18,10 +18,11 @@
 //!
 //! # The Call-site Hierarchy
 //!
-//! `ExpnData::call_site` in rustc, [`MacroCallLoc::call_site`] in rust-analyzer.
-use std::fmt;
-
+//! `ExpnData::call_site` in rustc, `MacroCallLoc::call_site` in rust-analyzer.
+#[cfg(feature = "salsa")]
 use crate::Edition;
+
+use std::fmt;
 
 /// A syntax context describes a hierarchy tracking order of macro definitions.
 #[cfg(feature = "salsa")]
@@ -47,7 +48,7 @@ const _: () = {
         edition: Edition,
         parent: SyntaxContext,
         opaque: SyntaxContext,
-        opaque_and_semitransparent: SyntaxContext,
+        opaque_and_semiopaque: SyntaxContext,
     }
 
     impl PartialEq for SyntaxContextData {
@@ -82,28 +83,29 @@ const _: () = {
     #[derive(Hash)]
     struct StructKey<'db, T0, T1, T2, T3>(T0, T1, T2, T3, std::marker::PhantomData<&'db ()>);
 
-    impl<'db, T0, T1, T2, T3> zalsa_::interned::HashEqLike<StructKey<'db, T0, T1, T2, T3>>
-        for SyntaxContextData
+    impl<'db, T0, T1, T2, T3> zalsa_::HashEqLike<StructKey<'db, T0, T1, T2, T3>> for SyntaxContextData
     where
-        Option<MacroCallId>: zalsa_::interned::HashEqLike<T0>,
-        Transparency: zalsa_::interned::HashEqLike<T1>,
-        Edition: zalsa_::interned::HashEqLike<T2>,
-        SyntaxContext: zalsa_::interned::HashEqLike<T3>,
+        Option<MacroCallId>: zalsa_::HashEqLike<T0>,
+        Transparency: zalsa_::HashEqLike<T1>,
+        Edition: zalsa_::HashEqLike<T2>,
+        SyntaxContext: zalsa_::HashEqLike<T3>,
     {
         fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-            zalsa_::interned::HashEqLike::<T0>::hash(&self.outer_expn, &mut *h);
-            zalsa_::interned::HashEqLike::<T1>::hash(&self.outer_transparency, &mut *h);
-            zalsa_::interned::HashEqLike::<T2>::hash(&self.edition, &mut *h);
-            zalsa_::interned::HashEqLike::<T3>::hash(&self.parent, &mut *h);
+            zalsa_::HashEqLike::<T0>::hash(&self.outer_expn, &mut *h);
+            zalsa_::HashEqLike::<T1>::hash(&self.outer_transparency, &mut *h);
+            zalsa_::HashEqLike::<T2>::hash(&self.edition, &mut *h);
+            zalsa_::HashEqLike::<T3>::hash(&self.parent, &mut *h);
         }
         fn eq(&self, data: &StructKey<'db, T0, T1, T2, T3>) -> bool {
-            zalsa_::interned::HashEqLike::<T0>::eq(&self.outer_expn, &data.0)
-                && zalsa_::interned::HashEqLike::<T1>::eq(&self.outer_transparency, &data.1)
-                && zalsa_::interned::HashEqLike::<T2>::eq(&self.edition, &data.2)
-                && zalsa_::interned::HashEqLike::<T3>::eq(&self.parent, &data.3)
+            zalsa_::HashEqLike::<T0>::eq(&self.outer_expn, &data.0)
+                && zalsa_::HashEqLike::<T1>::eq(&self.outer_transparency, &data.1)
+                && zalsa_::HashEqLike::<T2>::eq(&self.edition, &data.2)
+                && zalsa_::HashEqLike::<T3>::eq(&self.parent, &data.3)
         }
     }
-    impl zalsa_struct_::Configuration for SyntaxContext {
+
+    // SAFETY: `Self::Fields`, i.e. `SyntaxContextData`, doesn't contain any lifetimes.
+    unsafe impl zalsa_struct_::Configuration for SyntaxContext {
         const LOCATION: salsa::plumbing::Location =
             salsa::plumbing::Location { file: file!(), line: line!() };
         const DEBUG_NAME: &'static str = "SyntaxContextData";
@@ -133,13 +135,9 @@ const _: () = {
             static CACHE: zalsa_::IngredientCache<zalsa_struct_::IngredientImpl<SyntaxContext>> =
                 zalsa_::IngredientCache::new();
 
-            // SAFETY: `lookup_jar_by_type` returns a valid ingredient index, and the only
-            // ingredient created by our jar is the struct ingredient.
-            unsafe {
-                CACHE.get_or_create(zalsa, || {
-                    zalsa.lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>()
-                })
-            }
+            // SAFETY: The ingredient at offset 0 in `JarImpl<SyntaxContext>` has type
+            // `IngredientImpl<SyntaxContext>`.
+            unsafe { CACHE.get_or_create::<zalsa_struct_::JarImpl<SyntaxContext>, 0>(zalsa) }
         }
     }
     impl zalsa_::AsId for SyntaxContext {
@@ -158,6 +156,8 @@ const _: () = {
 
     impl zalsa_::SalsaStructInDb for SyntaxContext {
         type MemoIngredientMap = salsa::plumbing::MemoIngredientSingletonIndex;
+        const LEAF_TYPE_IDS: &[salsa::plumbing::ConstTypeId] =
+            &[salsa::plumbing::ConstTypeId::of::<SyntaxContext>()];
 
         fn lookup_ingredient_index(aux: &zalsa_::Zalsa) -> salsa::plumbing::IngredientIndices {
             aux.lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>().into()
@@ -191,23 +191,14 @@ const _: () = {
         }
     }
 
-    unsafe impl salsa::plumbing::Update for SyntaxContext {
-        unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-            if unsafe { *old_pointer } != new_value {
-                unsafe { *old_pointer = new_value };
-                true
-            } else {
-                false
-            }
-        }
-    }
+    unsafe impl salsa::plumbing::SalsaValue for SyntaxContext {}
     impl<'db> SyntaxContext {
         pub fn new<
             Db,
-            T0: zalsa_::interned::Lookup<Option<MacroCallId>> + std::hash::Hash,
-            T1: zalsa_::interned::Lookup<Transparency> + std::hash::Hash,
-            T2: zalsa_::interned::Lookup<Edition> + std::hash::Hash,
-            T3: zalsa_::interned::Lookup<SyntaxContext> + std::hash::Hash,
+            T0: zalsa_::Lookup<Option<MacroCallId>> + std::hash::Hash,
+            T1: zalsa_::Lookup<Transparency> + std::hash::Hash,
+            T2: zalsa_::Lookup<Edition> + std::hash::Hash,
+            T3: zalsa_::Lookup<SyntaxContext> + std::hash::Hash,
         >(
             db: &'db Db,
             outer_expn: T0,
@@ -215,14 +206,14 @@ const _: () = {
             edition: T2,
             parent: T3,
             opaque: impl FnOnce(SyntaxContext) -> SyntaxContext,
-            opaque_and_semitransparent: impl FnOnce(SyntaxContext) -> SyntaxContext,
+            opaque_and_semiopaque: impl FnOnce(SyntaxContext) -> SyntaxContext,
         ) -> Self
         where
             Db: ?Sized + salsa::Database,
-            Option<MacroCallId>: zalsa_::interned::HashEqLike<T0>,
-            Transparency: zalsa_::interned::HashEqLike<T1>,
-            Edition: zalsa_::interned::HashEqLike<T2>,
-            SyntaxContext: zalsa_::interned::HashEqLike<T3>,
+            Option<MacroCallId>: zalsa_::HashEqLike<T0>,
+            Transparency: zalsa_::HashEqLike<T1>,
+            Edition: zalsa_::HashEqLike<T2>,
+            SyntaxContext: zalsa_::HashEqLike<T3>,
         {
             let (zalsa, zalsa_local) = db.zalsas();
 
@@ -237,19 +228,17 @@ const _: () = {
                     std::marker::PhantomData,
                 ),
                 |id, data| SyntaxContextData {
-                    outer_expn: zalsa_::interned::Lookup::into_owned(data.0),
-                    outer_transparency: zalsa_::interned::Lookup::into_owned(data.1),
-                    edition: zalsa_::interned::Lookup::into_owned(data.2),
-                    parent: zalsa_::interned::Lookup::into_owned(data.3),
+                    outer_expn: zalsa_::Lookup::into_owned(data.0),
+                    outer_transparency: zalsa_::Lookup::into_owned(data.1),
+                    edition: zalsa_::Lookup::into_owned(data.2),
+                    parent: zalsa_::Lookup::into_owned(data.3),
                     opaque: opaque(zalsa_::FromId::from_id(id)),
-                    opaque_and_semitransparent: opaque_and_semitransparent(
-                        zalsa_::FromId::from_id(id),
-                    ),
+                    opaque_and_semiopaque: opaque_and_semiopaque(zalsa_::FromId::from_id(id)),
                 },
             )
         }
 
-        /// Invariant: Only [`SyntaxContext::ROOT`] has a [`None`] outer expansion.
+        /// Invariant: Only the root [`SyntaxContext`] has a [`None`] outer expansion.
         // FIXME: The None case needs to encode the context crate id. We can encode that as the MSB of
         // MacroCallId is reserved anyways so we can do bit tagging here just fine.
         // The bigger issue is that this will cause interning to now create completely separate chains
@@ -284,7 +273,7 @@ const _: () = {
                     let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
                     fields.edition
                 }
-                None => Edition::from_u32(SyntaxContext::MAX_ID - self.into_u32()),
+                None => Edition::from_u32(SyntaxContext::MAX_ROOT_ID - self.into_u32()),
             }
         }
 
@@ -302,7 +291,7 @@ const _: () = {
             }
         }
 
-        /// This context, but with all transparent and semi-transparent expansions filtered away.
+        /// This context, but with all transparent and semi-opaque expansions filtered away.
         pub fn opaque<Db>(self, db: &'db Db) -> SyntaxContext
         where
             Db: ?Sized + zalsa_::Database,
@@ -318,7 +307,7 @@ const _: () = {
         }
 
         /// This context, but with all transparent expansions filtered away.
-        pub fn opaque_and_semitransparent<Db>(self, db: &'db Db) -> SyntaxContext
+        pub fn opaque_and_semiopaque<Db>(self, db: &'db Db) -> SyntaxContext
         where
             Db: ?Sized + zalsa_::Database,
         {
@@ -326,7 +315,7 @@ const _: () = {
                 Some(id) => {
                     let zalsa = db.zalsa();
                     let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
-                    fields.opaque_and_semitransparent
+                    fields.opaque_and_semiopaque
                 }
                 None => self,
             }
@@ -334,32 +323,9 @@ const _: () = {
     }
 };
 
-impl SyntaxContext {
-    #[inline]
-    pub fn is_root(self) -> bool {
-        (SyntaxContext::MAX_ID - Edition::LATEST as u32) <= self.into_u32()
-            && self.into_u32() <= (SyntaxContext::MAX_ID - Edition::Edition2015 as u32)
-    }
-
-    #[inline]
-    pub fn remove_root_edition(&mut self) {
-        if self.is_root() {
-            *self = Self::root(Edition::Edition2015);
-        }
-    }
-
-    /// The root context, which is the parent of all other contexts. All [`FileId`]s have this context.
-    #[inline]
-    pub const fn root(edition: Edition) -> Self {
-        let edition = edition as u32;
-        // SAFETY: Roots are valid `SyntaxContext`s
-        unsafe { SyntaxContext::from_u32(SyntaxContext::MAX_ID - edition) }
-    }
-}
-
 #[cfg(feature = "salsa")]
 impl<'db> SyntaxContext {
-    const MAX_ID: u32 = salsa::Id::MAX_U32 - 1;
+    const MAX_ROOT_ID: u32 = salsa::Id::MAX_U32 + Edition::LATEST as u32;
 
     #[inline]
     pub const fn into_u32(self) -> u32 {
@@ -380,7 +346,8 @@ impl<'db> SyntaxContext {
         if self.is_root() {
             None
         } else {
-            // SAFETY: By our invariant, this is either a root (which we verified it's not) or a valid `salsa::Id`.
+            // SAFETY: By our invariant, this is either a root (which we verified it's not) or a
+            // valid `salsa::Id` index.
             unsafe { Some(salsa::Id::from_index(self.0)) }
         }
     }
@@ -389,6 +356,27 @@ impl<'db> SyntaxContext {
     fn from_salsa_id(id: salsa::Id) -> Self {
         // SAFETY: This comes from a Salsa ID.
         unsafe { Self::from_u32(id.index()) }
+    }
+
+    #[inline]
+    pub fn is_root(self) -> bool {
+        (SyntaxContext::MAX_ROOT_ID - Edition::LATEST as u32) <= self.into_u32()
+            && self.into_u32() <= (SyntaxContext::MAX_ROOT_ID - Edition::Edition2015 as u32)
+    }
+
+    #[inline]
+    pub fn remove_root_edition(&mut self) {
+        if self.is_root() {
+            *self = Self::root(Edition::Edition2015);
+        }
+    }
+
+    /// The root context, which is the parent of all other contexts. All `FileId`s have this context.
+    #[inline]
+    pub const fn root(edition: Edition) -> Self {
+        let edition = edition as u32;
+        // SAFETY: Roots are valid `SyntaxContext`s
+        unsafe { SyntaxContext::from_u32(SyntaxContext::MAX_ROOT_ID - edition) }
     }
 
     #[inline]
@@ -406,7 +394,7 @@ impl<'db> SyntaxContext {
 
     #[inline]
     pub fn normalize_to_macro_rules(self, db: &'db dyn salsa::Database) -> SyntaxContext {
-        self.opaque_and_semitransparent(db)
+        self.opaque_and_semiopaque(db)
     }
 
     pub fn is_opaque(self, db: &'db dyn salsa::Database) -> bool {
@@ -449,15 +437,8 @@ impl<'db> SyntaxContext {
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct SyntaxContext(u32);
 
-#[allow(dead_code)]
-const SALSA_MAX_ID_MIRROR: u32 = u32::MAX - 0xFF;
-#[cfg(feature = "salsa")]
-const _: () = assert!(salsa::Id::MAX_U32 == SALSA_MAX_ID_MIRROR);
-
 #[cfg(not(feature = "salsa"))]
 impl SyntaxContext {
-    const MAX_ID: u32 = SALSA_MAX_ID_MIRROR - 1;
-
     pub const fn into_u32(self) -> u32 {
         self.0
     }
@@ -477,13 +458,13 @@ pub enum Transparency {
     /// Identifier produced by a transparent expansion is always resolved at call-site.
     /// Call-site spans in procedural macros, hygiene opt-out in `macro` should use this.
     Transparent,
-    /// Identifier produced by a semi-transparent expansion may be resolved
+    /// Identifier produced by a semi-opaque expansion may be resolved
     /// either at call-site or at definition-site.
     /// If it's a local variable, label or `$crate` then it's resolved at def-site.
     /// Otherwise it's resolved at call-site.
     /// `macro_rules` macros behave like this, built-in macros currently behave like this too,
     /// but that's an implementation detail.
-    SemiTransparent,
+    SemiOpaque,
     /// Identifier produced by an opaque expansion is always resolved at definition-site.
     /// Def-site spans in procedural macros, identifiers from `macro` by default use this.
     Opaque,
@@ -498,13 +479,25 @@ impl Transparency {
     }
 }
 
+#[cfg(feature = "salsa")]
 impl fmt::Display for SyntaxContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_root() {
-            write!(f, "ROOT{}", Edition::from_u32(SyntaxContext::MAX_ID - self.into_u32()).number())
+            write!(
+                f,
+                "ROOT{}",
+                Edition::from_u32(SyntaxContext::MAX_ROOT_ID - self.into_u32()).number()
+            )
         } else {
             write!(f, "{}", self.into_u32())
         }
+    }
+}
+
+#[cfg(not(feature = "salsa"))]
+impl fmt::Display for SyntaxContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.into_u32())
     }
 }
 
@@ -515,5 +508,71 @@ impl std::fmt::Debug for SyntaxContext {
         } else {
             f.debug_tuple("SyntaxContext").field(&self.0).finish()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_edition_is_root() {
+        for edition in Edition::iter() {
+            let ctx = SyntaxContext::root(edition);
+            assert!(ctx.is_root(), "{edition} root should be identified as root");
+        }
+    }
+
+    #[test]
+    fn test_root_edition_editions() {
+        let db = salsa::DatabaseImpl::new();
+        for edition in Edition::iter() {
+            let ctx = SyntaxContext::root(edition);
+            assert_eq!(edition, ctx.edition(&db), "{edition} root should have edition {edition}");
+        }
+    }
+
+    #[test]
+    fn test_roots_do_not_overlap_with_salsa_ids() {
+        for edition in Edition::iter() {
+            let root = SyntaxContext::root(edition);
+            let root_u32 = root.into_u32();
+            assert!(
+                root_u32 >= salsa::Id::MAX_U32,
+                "Root context for {:?} (value {}) must be >= salsa::Id::MAX_U32 ({}) to avoid collision",
+                edition,
+                root_u32,
+                salsa::Id::MAX_U32
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_root_value_is_not_root() {
+        for edition in Edition::iter() {
+            // SAFETY: This is just for testing purposes
+            let ctx = unsafe { SyntaxContext::from_u32(edition as u32 + 1) };
+            assert!(!ctx.is_root(), "{edition} root should be identified as root");
+        }
+    }
+
+    #[test]
+    fn test_interned_context_round_trips_through_u32() {
+        let db = salsa::DatabaseImpl::new();
+        let root = SyntaxContext::root(Edition::Edition2015);
+        let ctx = SyntaxContext::new(
+            &db,
+            None,
+            Transparency::Opaque,
+            Edition::Edition2021,
+            root,
+            |_| root,
+            |_| root,
+        );
+
+        // SAFETY: The value was produced by `SyntaxContext::into_u32` above.
+        let round_tripped = unsafe { SyntaxContext::from_u32(ctx.into_u32()) };
+        assert_eq!(round_tripped.edition(&db), Edition::Edition2021);
+        assert_eq!(round_tripped.parent(&db), root);
     }
 }

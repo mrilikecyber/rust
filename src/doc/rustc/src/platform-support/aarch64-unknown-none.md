@@ -15,7 +15,8 @@ Processors in this family include the [Arm Cortex-A35, 53, 76, etc][aarch64-cpus
 ## Target maintainers
 
 - [Rust Embedded Devices Working Group Arm Team]
-- [@rust-lang/arm-maintainers][arm_maintainers] ([rust@arm.com][arm_email])
+- [arm-maintainers][arm_maintainers] ([rust@arm.com][arm_email])
+    - Use `@rustbot ping arm-maintainers` to ping us
 
 [Rust Embedded Devices Working Group Arm Team]: https://github.com/rust-embedded/wg?tab=readme-ov-file#the-arm-team
 [arm_maintainers]: https://github.com/rust-lang/team/blob/master/teams/arm-maintainers.toml
@@ -29,14 +30,15 @@ You may prefer the `-softfloat` target when writing a kernel or interfacing with
 pre-compiled binaries that use the soft-float ABI.
 
 When using the hardfloat targets, the minimum floating-point features assumed
-are those of the `fp-armv8`, which excludes NEON SIMD support. If your
+are [`FEAT_AdvSIMD`][feat-advsimd], which means NEON SIMD support. If your
 processor supports a different set of floating-point features than the default
-expectations of `fp-armv8`, then these should also be enabled or disabled as
-needed with `-C target-feature=(+/-)`. It is also possible to tell Rust (or
+expectations of `FEAT_AdvSIMD`, then these should also be enabled or disabled
+as needed with `-C target-feature=(+/-)`. It is also possible to tell Rust (or
 LLVM) that you have a specific model of Arm processor, using the
 [`-Ctarget-cpu`][target-cpu] option. Doing so may change the default set of
 target-features enabled.
 
+[feat-advsimd]: https://developer.arm.com/documentation/109697/2025_12/Feature-descriptions/The-Armv8-0-architecture-extension?lang=en
 [target-cpu]: https://doc.rust-lang.org/rustc/codegen-options/index.html#target-cpu
 [target-feature]: https://doc.rust-lang.org/rustc/codegen-options/index.html#target-feature
 

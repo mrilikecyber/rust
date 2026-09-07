@@ -6,7 +6,6 @@
 //! [annotate_snippets]: https://docs.rs/crate/annotate-snippets/
 
 use std::borrow::Cow;
-use std::error::Report;
 use std::fmt::Debug;
 use std::io;
 use std::io::Write;
@@ -17,7 +16,7 @@ use annotate_snippets::{AnnotationKind, Group, Origin, Padding, Patch, Renderer,
 use anstream::ColorChoice;
 use derive_setters::Setters;
 use rustc_data_structures::sync::IntoDynSyncSend;
-use rustc_error_messages::{FluentArgs, SpanLabel};
+use rustc_error_messages::{DiagArgMap, SpanLabel};
 use rustc_lint_defs::pluralize;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{BytePos, FileName, Pos, SourceFile, Span};
@@ -27,8 +26,7 @@ use crate::emitter::{
     ConfusionType, Destination, MAX_SUGGESTIONS, OutputTheme, detect_confusion_type, is_different,
     normalize_whitespace, should_show_source_code,
 };
-use crate::registry::Registry;
-use crate::translation::{Translator, to_fluent_args};
+use crate::formatting::{format_diag_message, format_diag_messages};
 use crate::{
     CodeSuggestion, DiagInner, DiagMessage, Emitter, ErrCode, Level, MultiSpan, Style, Subdiag,
     SuggestionStyle, TerminalUrl,
@@ -40,13 +38,10 @@ pub struct AnnotateSnippetEmitter {
     #[setters(skip)]
     dst: IntoDynSyncSend<Destination>,
     sm: Option<Arc<SourceMap>>,
-    #[setters(skip)]
-    translator: Translator,
     short_message: bool,
     ui_testing: bool,
     ignored_directories_in_source_blocks: Vec<String>,
     diagnostic_width: Option<usize>,
-
     macro_backtrace: bool,
     track_diagnostics: bool,
     terminal_url: TerminalUrl,
@@ -55,33 +50,43 @@ pub struct AnnotateSnippetEmitter {
 
 impl Debug for AnnotateSnippetEmitter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let AnnotateSnippetEmitter {
+            dst,
+            sm,
+            short_message,
+            ui_testing,
+            ignored_directories_in_source_blocks,
+            diagnostic_width,
+            macro_backtrace,
+            track_diagnostics,
+            terminal_url,
+            theme,
+        } = self;
+
         f.debug_struct("AnnotateSnippetEmitter")
-            .field("short_message", &self.short_message)
-            .field("ui_testing", &self.ui_testing)
-            .field(
-                "ignored_directories_in_source_blocks",
-                &self.ignored_directories_in_source_blocks,
-            )
-            .field("diagnostic_width", &self.diagnostic_width)
-            .field("macro_backtrace", &self.macro_backtrace)
-            .field("track_diagnostics", &self.track_diagnostics)
-            .field("terminal_url", &self.terminal_url)
-            .field("theme", &self.theme)
+            .field("dst", &format_args!("<writer@{dst:p}>"))
+            .field("sm", sm)
+            .field("short_message", short_message)
+            .field("ui_testing", ui_testing)
+            .field("ignored_directories_in_source_blocks", ignored_directories_in_source_blocks)
+            .field("diagnostic_width", diagnostic_width)
+            .field("macro_backtrace", macro_backtrace)
+            .field("track_diagnostics", track_diagnostics)
+            .field("terminal_url", terminal_url)
+            .field("theme", theme)
             .finish()
     }
 }
 
 impl Emitter for AnnotateSnippetEmitter {
     /// The entry point for the diagnostics generation
-    fn emit_diagnostic(&mut self, mut diag: DiagInner, _registry: &Registry) {
-        let fluent_args = to_fluent_args(diag.args.iter());
-
+    fn emit_diagnostic(&mut self, mut diag: DiagInner) {
         if self.track_diagnostics && diag.span.has_primary_spans() && !diag.span.is_dummy() {
             diag.children.insert(0, diag.emitted_at_sub_diag());
         }
 
         let mut suggestions = diag.suggestions.unwrap_tag();
-        self.primary_span_formatted(&mut diag.span, &mut suggestions, &fluent_args);
+        self.primary_span_formatted(&mut diag.span, &mut suggestions, &diag.args);
 
         self.fix_multispans_in_extern_macros_and_render_macro_backtrace(
             &mut diag.span,
@@ -93,7 +98,7 @@ impl Emitter for AnnotateSnippetEmitter {
         self.emit_messages_default(
             &diag.level,
             &diag.messages,
-            &fluent_args,
+            &diag.args,
             &diag.code,
             &diag.span,
             &diag.children,
@@ -107,10 +112,6 @@ impl Emitter for AnnotateSnippetEmitter {
 
     fn should_show_explain(&self) -> bool {
         !self.short_message
-    }
-
-    fn translator(&self) -> &Translator {
-        &self.translator
     }
 
     fn supports_color(&self) -> bool {
@@ -134,11 +135,10 @@ fn annotation_level_for_level(level: Level) -> annotate_snippets::level::Level<'
 }
 
 impl AnnotateSnippetEmitter {
-    pub fn new(dst: Destination, translator: Translator) -> Self {
+    pub fn new(dst: Destination) -> Self {
         Self {
             dst: IntoDynSyncSend(dst),
             sm: None,
-            translator,
             short_message: false,
             ui_testing: false,
             ignored_directories_in_source_blocks: Vec::new(),
@@ -154,7 +154,7 @@ impl AnnotateSnippetEmitter {
         &mut self,
         level: &Level,
         msgs: &[(DiagMessage, Style)],
-        args: &FluentArgs<'_>,
+        args: &DiagArgMap,
         code: &Option<ErrCode>,
         msp: &MultiSpan,
         children: &[Subdiag],
@@ -170,7 +170,7 @@ impl AnnotateSnippetEmitter {
                 .clone()
                 .secondary_title(Cow::Owned(self.pre_style_msgs(msgs, *level, args)))
         } else {
-            annotation_level.clone().primary_title(self.translator.translate_messages(msgs, args))
+            annotation_level.clone().primary_title(format_diag_messages(msgs, args))
         };
 
         if let Some(c) = code {
@@ -186,7 +186,7 @@ impl AnnotateSnippetEmitter {
         // If we don't have span information, emit and exit
         let Some(sm) = self.sm.as_ref() else {
             group = group.elements(children.iter().map(|c| {
-                let msg = self.translator.translate_messages(&c.messages, args).to_string();
+                let msg = format_diag_messages(&c.messages, args).to_string();
                 let level = annotation_level_for_level(c.level);
                 level.message(msg)
             }));
@@ -203,7 +203,7 @@ impl AnnotateSnippetEmitter {
             return;
         };
 
-        let mut file_ann = collect_annotations(args, msp, sm, &self.translator);
+        let mut file_ann = collect_annotations(args, msp, sm);
 
         // Make sure our primary file comes first
         let primary_span = msp.primary_span().unwrap_or_default();
@@ -213,6 +213,7 @@ impl AnnotateSnippetEmitter {
                 file_ann.swap(0, pos);
             }
 
+            let file_ann_len = file_ann.len();
             for (file_idx, (file, annotations)) in file_ann.into_iter().enumerate() {
                 if should_show_source_code(&self.ignored_directories_in_source_blocks, sm, &file) {
                     if let Some(snippet) = self.annotated_snippet(annotations, &file.name, sm) {
@@ -240,6 +241,7 @@ impl AnnotateSnippetEmitter {
                     // ╰ warning: this was previously accepted
                     if let Some(c) = children.first()
                         && (!c.span.has_primary_spans() && !c.span.has_span_labels())
+                        && file_idx == file_ann_len - 1
                     {
                         group = group.element(Padding);
                     }
@@ -255,7 +257,7 @@ impl AnnotateSnippetEmitter {
             let msg = if c.messages.iter().any(|(_, style)| style != &crate::Style::NoStyle) {
                 Cow::Owned(self.pre_style_msgs(&c.messages, c.level, args))
             } else {
-                self.translator.translate_messages(&c.messages, args)
+                format_diag_messages(&c.messages, args)
             };
 
             // This is a secondary message with no span info
@@ -269,7 +271,7 @@ impl AnnotateSnippetEmitter {
                 Group::with_title(level.clone().secondary_title(msg)),
             ));
 
-            let mut file_ann = collect_annotations(args, &c.span, sm, &self.translator);
+            let mut file_ann = collect_annotations(args, &c.span, sm);
             let primary_span = c.span.primary_span().unwrap_or_default();
             if !primary_span.is_dummy() {
                 let primary_lo = sm.lookup_char_pos(primary_span.lo());
@@ -301,26 +303,16 @@ impl AnnotateSnippetEmitter {
             }
         }
 
-        let suggestions_expected = suggestions
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.style,
-                    SuggestionStyle::HideCodeInline
-                        | SuggestionStyle::ShowCode
-                        | SuggestionStyle::ShowAlways
-                )
-            })
-            .count();
         for suggestion in suggestions {
             match suggestion.style {
                 SuggestionStyle::CompletelyHidden => {
                     // do not display this suggestion, it is meant only for tools
                 }
                 SuggestionStyle::HideCodeAlways => {
-                    let msg = self
-                        .translator
-                        .translate_messages(&[(suggestion.msg.to_owned(), Style::HeaderMsg)], args);
+                    let msg = format_diag_messages(
+                        &[(suggestion.msg.to_owned(), Style::HeaderMsg)],
+                        args,
+                    );
                     group = group.element(annotate_snippets::Level::HELP.message(msg));
                 }
                 SuggestionStyle::HideCodeInline
@@ -377,12 +369,7 @@ impl AnnotateSnippetEmitter {
                     if substitutions.is_empty() {
                         continue;
                     }
-                    let mut msg = self
-                        .translator
-                        .translate_message(&suggestion.msg, args)
-                        .map_err(Report::new)
-                        .unwrap()
-                        .to_string();
+                    let mut msg = format_diag_message(&suggestion.msg, args).to_string();
 
                     let lo = substitutions
                         .iter()
@@ -524,12 +511,6 @@ impl AnnotateSnippetEmitter {
             }
         }
 
-        // FIXME: This hack should be removed once annotate_snippets is the
-        // default emitter.
-        if suggestions_expected > 0 && report.is_empty() {
-            group = group.element(Padding);
-        }
-
         if !group.is_empty() {
             report.push(group);
         }
@@ -567,11 +548,11 @@ impl AnnotateSnippetEmitter {
         &self,
         msgs: &[(DiagMessage, Style)],
         level: Level,
-        args: &FluentArgs<'_>,
+        args: &DiagArgMap,
     ) -> String {
         msgs.iter()
             .filter_map(|(m, style)| {
-                let text = self.translator.translate_message(m, args).map_err(Report::new).unwrap();
+                let text = format_diag_message(m, args);
                 let style = style.anstyle(level);
                 if text.is_empty() { None } else { Some(format!("{style}{text}{style:#}")) }
             })
@@ -631,7 +612,7 @@ impl AnnotateSnippetEmitter {
                     report.push(std::mem::replace(&mut group, Group::with_level(level.clone())));
                 }
 
-                if !line_tracker.contains(&lo.line) {
+                if !line_tracker.contains(&lo.line) && (i == 0 || hi.line <= lo.line) {
                     line_tracker.push(lo.line);
                     // ╭▸ $SRC_DIR/core/src/option.rs:594:0 (<- It adds *this*)
                     // ⸬  $SRC_DIR/core/src/option.rs:602:4
@@ -701,10 +682,9 @@ struct Annotation {
 }
 
 fn collect_annotations(
-    args: &FluentArgs<'_>,
+    args: &DiagArgMap,
     msp: &MultiSpan,
     sm: &Arc<SourceMap>,
-    translator: &Translator,
 ) -> Vec<(Arc<SourceFile>, Vec<Annotation>)> {
     let mut output: Vec<(Arc<SourceFile>, Vec<Annotation>)> = vec![];
 
@@ -719,11 +699,7 @@ fn collect_annotations(
 
         let kind = if is_primary { AnnotationKind::Primary } else { AnnotationKind::Context };
 
-        let label = label.as_ref().map(|m| {
-            normalize_whitespace(
-                &translator.translate_message(m, args).map_err(Report::new).unwrap(),
-            )
-        });
+        let label = label.as_ref().map(|m| normalize_whitespace(&format_diag_message(m, args)));
 
         let ann = Annotation { kind, span, label };
         if sm.is_valid_span(ann.span).is_ok() {
@@ -739,6 +715,14 @@ fn collect_annotations(
                 output.push((file, vec![ann]));
             }
         }
+    }
+
+    // Sort annotations within each file by line number
+    for (_, ann) in output.iter_mut() {
+        ann.sort_by_key(|a| {
+            let lo = sm.lookup_char_pos(a.span.lo());
+            lo.line
+        });
     }
     output
 }

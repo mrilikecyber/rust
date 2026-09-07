@@ -4,7 +4,7 @@ rust-analyzer is an ordinary Rust project, which is organized as a Cargo workspa
 So, just
 
 ```bash
-$ cargo test
+cargo test
 ```
 
 should be enough to get you started!
@@ -25,8 +25,6 @@ group](https://github.com/rust-lang/compiler-team/tree/6a769c13656c0a6959ebc09e7
 Discussion happens in this Zulip stream:
 
 <https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Frust-analyzer>
-
-<!-- toc -->
 
 # Issue Labels
 
@@ -205,14 +203,7 @@ It is enabled by `RA_COUNT=1`.
 To measure time for from-scratch analysis, use something like this:
 
 ```bash
-$ cargo run --release -p rust-analyzer -- analysis-stats ../chalk/
-```
-
-For measuring time of incremental analysis, use either of these:
-
-```bash
-$ cargo run --release -p rust-analyzer -- analysis-bench ../chalk/ --highlight ../chalk/chalk-engine/src/logic.rs
-$ cargo run --release -p rust-analyzer -- analysis-bench ../chalk/ --complete ../chalk/chalk-engine/src/logic.rs:94:0
+cargo run --release -p rust-analyzer -- analysis-stats ../chalk/
 ```
 
 Look for `fn benchmark_xxx` tests for a quick way to reproduce performance problems.
@@ -285,7 +276,8 @@ repository. We use the [rustc-josh-sync](https://github.com/rust-lang/josh-sync)
 repositories. You can find documentation of the tool [here](https://github.com/rust-lang/josh-sync).
 
 You can install the synchronization tool using the following commands:
-```
+
+```bash
 cargo install --locked --git https://github.com/rust-lang/josh-sync
 ```
 

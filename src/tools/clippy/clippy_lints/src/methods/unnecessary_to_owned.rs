@@ -2,21 +2,22 @@ use super::implicit_clone::is_clone_like;
 use super::unnecessary_iter_cloned::{self, is_into_iter};
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::MaybeDef;
-use clippy_utils::source::{SpanRangeExt, snippet};
+use clippy_utils::res::MaybeDef as _;
+use clippy_utils::source::{SpanExt as _, snippet, snippet_with_context};
 use clippy_utils::ty::{get_iterator_item_ty, implements_trait, is_copy, peel_and_count_ty_refs};
 use clippy_utils::visitors::find_all_ret_expressions;
 use clippy_utils::{fn_def_id, get_parent_expr, is_expr_temporary_value, return_ty, sym};
 use rustc_errors::Applicability;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{BorrowKind, Expr, ExprKind, ItemKind, LangItem, Node};
-use rustc_infer::infer::TyCtxtInferExt;
+use rustc_hir::{BorrowKind, Expr, ExprKind, ItemKind, Node};
+use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_lint::LateContext;
 use rustc_middle::mir::Mutability;
-use rustc_middle::ty::adjustment::{Adjust, Adjustment, OverloadedDeref};
+use rustc_middle::ty::adjustment::{Adjust, Adjustment, DerefAdjustKind, OverloadedDeref};
 use rustc_middle::ty::{
-    self, ClauseKind, GenericArg, GenericArgKind, GenericArgsRef, ParamTy, ProjectionPredicate, TraitPredicate, Ty,
+    self, ClauseKind, GenericArg, GenericArgKind, GenericArgsRef, ParamTy, ProjectionClause, TraitClause, Ty,
 };
 use rustc_span::Symbol;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
@@ -78,7 +79,7 @@ fn check_addr_of_expr(
             // For matching uses of `Cow::from`
             [
                 Adjustment {
-                    kind: Adjust::Deref(None),
+                    kind: Adjust::Deref(DerefAdjustKind::Builtin),
                     target: referent_ty,
                 },
                 Adjustment {
@@ -89,7 +90,7 @@ fn check_addr_of_expr(
             // For matching uses of arrays
             | [
                 Adjustment {
-                    kind: Adjust::Deref(None),
+                    kind: Adjust::Deref(DerefAdjustKind::Builtin),
                     target: referent_ty,
                 },
                 Adjustment {
@@ -104,11 +105,11 @@ fn check_addr_of_expr(
             // For matching everything else
             | [
                 Adjustment {
-                    kind: Adjust::Deref(None),
+                    kind: Adjust::Deref(DerefAdjustKind::Builtin),
                     target: referent_ty,
                 },
                 Adjustment {
-                    kind: Adjust::Deref(Some(OverloadedDeref { .. })),
+                    kind: Adjust::Deref(DerefAdjustKind::Overloaded(OverloadedDeref { .. })),
                     ..
                 },
                 Adjustment {
@@ -131,8 +132,10 @@ fn check_addr_of_expr(
         && (*referent_ty != receiver_ty
             || (matches!(referent_ty.kind(), ty::Array(..)) && is_copy(cx, *referent_ty))
             || is_cow_into_owned(cx, method_name, method_parent_id))
-        && let Some(receiver_snippet) = receiver.span.get_source_text(cx)
     {
+        let mut applicability = Applicability::MachineApplicable;
+        let (receiver_snippet, _) = snippet_with_context(cx, receiver.span, expr.span.ctxt(), "..", &mut applicability);
+
         if receiver_ty == target_ty && n_target_refs >= n_receiver_refs {
             span_lint_and_sugg(
                 cx,
@@ -145,7 +148,7 @@ fn check_addr_of_expr(
                     "",
                     width = n_target_refs - n_receiver_refs
                 ),
-                Applicability::MachineApplicable,
+                applicability,
             );
             return true;
         }
@@ -165,8 +168,8 @@ fn check_addr_of_expr(
                     parent.span,
                     format!("unnecessary use of `{method_name}`"),
                     "use",
-                    receiver_snippet.to_owned(),
-                    Applicability::MachineApplicable,
+                    receiver_snippet.to_string(),
+                    applicability,
                 );
             } else {
                 span_lint_and_sugg(
@@ -176,7 +179,7 @@ fn check_addr_of_expr(
                     format!("unnecessary use of `{method_name}`"),
                     "remove this",
                     String::new(),
-                    Applicability::MachineApplicable,
+                    applicability,
                 );
             }
             return true;
@@ -191,7 +194,7 @@ fn check_addr_of_expr(
                 format!("unnecessary use of `{method_name}`"),
                 "use",
                 format!("{receiver_snippet}.as_ref()"),
-                Applicability::MachineApplicable,
+                applicability,
             );
             return true;
         }
@@ -215,7 +218,7 @@ fn check_into_iter_call_arg(
         && let parent_ty = cx.typeck_results().expr_ty(parent)
         && implements_trait(cx, parent_ty, iterator_trait_id, &[])
         && let Some(item_ty) = get_iterator_item_ty(cx, parent_ty)
-        && let Some(receiver_snippet) = receiver.span.get_source_text(cx)
+        && let Some(receiver_snippet) = receiver.span.get_text(cx)
         // If the receiver is a `Cow`, we can't remove the `into_owned` generally, see https://github.com/rust-lang/rust-clippy/issues/13624.
         && !cx.typeck_results().expr_ty(receiver).is_diag_item(cx, sym::Cow)
         // Calling `iter()` on a temporary object can lead to false positives. #14242
@@ -311,8 +314,8 @@ fn check_string_from_utf8<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, 
 fn check_split_call_arg(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: Symbol, receiver: &Expr<'_>) -> bool {
     if let Some(parent) = get_parent_expr(cx, expr)
         && let Some((sym::split, argument_expr)) = get_fn_name_and_arg(cx, parent)
-        && let Some(receiver_snippet) = receiver.span.get_source_text(cx)
-        && let Some(arg_snippet) = argument_expr.span.get_source_text(cx)
+        && let Some(receiver_snippet) = receiver.span.get_text(cx)
+        && let Some(arg_snippet) = argument_expr.span.get_text(cx)
     {
         // We may end-up here because of an expression like `x.to_string().split(…)` where the type of `x`
         // implements `AsRef<str>` but does not implement `Deref<Target = str>`. In this case, we have to
@@ -380,7 +383,7 @@ fn check_other_call_arg<'tcx>(
 ) -> bool {
     if let Some((maybe_call, maybe_arg)) = skip_addr_of_ancestors(cx, expr)
         && let Some((callee_def_id, _, recv, call_args)) = get_callee_generic_args_and_args(cx, maybe_call)
-        && let fn_sig = cx.tcx.fn_sig(callee_def_id).instantiate_identity().skip_binder()
+        && let fn_sig = cx.tcx.fn_sig(callee_def_id).instantiate_identity().skip_norm_wip().skip_binder()
         && let Some(i) = recv.into_iter().chain(call_args).position(|arg| arg.hir_id == maybe_arg.hir_id)
         && let Some(input) = fn_sig.inputs().get(i)
         && let (input, n_refs, _) = peel_and_count_ty_refs(*input)
@@ -409,8 +412,10 @@ fn check_other_call_arg<'tcx>(
             None
         }
         && can_change_type(cx, maybe_arg, receiver_ty)
-        && let Some(receiver_snippet) = receiver.span.get_source_text(cx)
     {
+        let mut applicability = Applicability::MachineApplicable;
+        let (receiver_snippet, _) = snippet_with_context(cx, receiver.span, expr.span.ctxt(), "..", &mut applicability);
+
         span_lint_and_sugg(
             cx,
             UNNECESSARY_TO_OWNED,
@@ -418,7 +423,7 @@ fn check_other_call_arg<'tcx>(
             format!("unnecessary use of `{method_name}`"),
             "use",
             format!("{:&>n_refs$}{receiver_snippet}", ""),
-            Applicability::MachineApplicable,
+            applicability,
         );
         return true;
     }
@@ -468,25 +473,21 @@ fn get_callee_generic_args_and_args<'tcx>(
     None
 }
 
-/// Returns the `TraitPredicate`s and `ProjectionPredicate`s for a function's input type.
+/// Returns the `TraitClause`s and `ProjectionClause`s for a function's input type.
 fn get_input_traits_and_projections<'tcx>(
     cx: &LateContext<'tcx>,
     callee_def_id: DefId,
     input: Ty<'tcx>,
-) -> (Vec<TraitPredicate<'tcx>>, Vec<ProjectionPredicate<'tcx>>) {
+) -> (Vec<TraitClause<'tcx>>, Vec<ProjectionClause<'tcx>>) {
     let mut trait_predicates = Vec::new();
     let mut projection_predicates = Vec::new();
-    for predicate in cx.tcx.param_env(callee_def_id).caller_bounds() {
-        match predicate.kind().skip_binder() {
-            ClauseKind::Trait(trait_predicate) => {
-                if trait_predicate.trait_ref.self_ty() == input {
-                    trait_predicates.push(trait_predicate);
-                }
+    for clause in cx.tcx.param_env(callee_def_id).caller_bounds() {
+        match clause.kind().skip_binder() {
+            ClauseKind::Trait(trait_predicate) if trait_predicate.trait_ref.self_ty() == input => {
+                trait_predicates.push(trait_predicate);
             },
-            ClauseKind::Projection(projection_predicate) => {
-                if projection_predicate.projection_term.self_ty() == input {
-                    projection_predicates.push(projection_predicate);
-                }
+            ClauseKind::Projection(projection_predicate) if projection_predicate.projection_term.self_ty() == input => {
+                projection_predicates.push(projection_predicate);
             },
             _ => {},
         }
@@ -494,7 +495,6 @@ fn get_input_traits_and_projections<'tcx>(
     (trait_predicates, projection_predicates)
 }
 
-#[expect(clippy::too_many_lines)]
 fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<'a>) -> bool {
     for (_, node) in cx.tcx.hir_parent_iter(expr.hir_id) {
         match node {
@@ -543,20 +543,15 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                             return false;
                         }
 
-                        let mut trait_predicates =
-                            cx.tcx
-                                .param_env(callee_def_id)
-                                .caller_bounds()
-                                .iter()
-                                .filter(|predicate| {
-                                    if let ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
-                                        && trait_predicate.trait_ref.self_ty() == param_ty
-                                    {
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                });
+                        let mut trait_clauses = cx.tcx.param_env(callee_def_id).caller_bounds().filter(|clause| {
+                            if let ClauseKind::Trait(trait_predicate) = clause.kind().skip_binder()
+                                && trait_predicate.trait_ref.self_ty() == param_ty
+                            {
+                                true
+                            } else {
+                                false
+                            }
+                        });
 
                         let new_subst = cx
                             .tcx
@@ -568,9 +563,12 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                                 }
                             }));
 
-                        if trait_predicates.any(|predicate| {
-                            let predicate = bound_fn_sig.rebind(predicate).instantiate(cx.tcx, new_subst);
-                            let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
+                        if trait_clauses.any(|clause| {
+                            let clause = bound_fn_sig
+                                .rebind(clause)
+                                .instantiate(cx.tcx, new_subst)
+                                .skip_norm_wip();
+                            let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, clause);
                             !cx.tcx
                                 .infer_ctxt()
                                 .build(cx.typing_mode())
@@ -698,8 +696,7 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
             sym::to_vec => cx
                 .tcx
                 .impl_of_assoc(method_def_id)
-                .filter(|&impl_did| cx.tcx.type_of(impl_did).instantiate_identity().is_slice())
-                .is_some(),
+                .is_some_and(|impl_did| cx.tcx.type_of(impl_did).instantiate_identity().skip_norm_wip().is_slice()),
             _ => false,
         }
         && let original_arg_ty = cx.typeck_results().node_type(caller.hir_id).peel_refs()
@@ -710,7 +707,7 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
         && let arg_ty = arg_ty.peel_refs()
         // For now we limit this lint to `String` and `Vec`.
         && (is_str_and_string(cx, arg_ty, original_arg_ty) || is_slice_and_vec(cx, arg_ty, original_arg_ty))
-        && let Some(snippet) = caller.span.get_source_text(cx)
+        && let Some(snippet) = caller.span.get_text(cx)
     {
         span_lint_and_sugg(
             cx,
@@ -739,9 +736,9 @@ fn check_borrow_predicate<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) {
         && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
         && cx.tcx.trait_of_assoc(method_def_id).is_none()
         && let Some(borrow_id) = cx.tcx.get_diagnostic_item(sym::Borrow)
-        && cx.tcx.predicates_of(method_def_id).predicates.iter().any(|(pred, _)| {
-            if let ClauseKind::Trait(trait_pred) = pred.kind().skip_binder()
-                && trait_pred.polarity == ty::PredicatePolarity::Positive
+        && cx.tcx.clauses_of(method_def_id).clauses.iter().any(|(clause, _)| {
+            if let ClauseKind::Trait(trait_pred) = clause.kind().skip_binder()
+                && trait_pred.polarity == ty::ClausePolarity::Positive
                 && trait_pred.trait_ref.def_id == borrow_id
             {
                 true

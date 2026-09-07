@@ -16,11 +16,13 @@ use crate::core::build_steps::tool::{
     self, RustcPrivateCompilers, SourceType, Tool, prepare_tool_cargo,
 };
 use crate::core::builder::{
-    self, Builder, Compiler, Kind, RunConfig, ShouldRun, Step, StepMetadata, crate_description,
+    self, Builder, CommandLineStep, Kind, RunConfig, ShouldRun, Step, StepMetadata,
+    crate_description,
 };
+use crate::core::compiler::Compiler;
 use crate::core::config::{Config, TargetSelection};
-use crate::helpers::{submodule_path_of, symlink_dir, t, up_to_date};
-use crate::{FileType, Mode};
+use crate::core::session::{FileType, Mode};
+use crate::utils::helpers::{submodule_path_of, symlink_dir, t, up_to_date};
 
 macro_rules! book {
     ($($name:ident, $path:expr, $book_name:expr, $lang:expr ;)+) => {
@@ -30,13 +32,15 @@ macro_rules! book {
             target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
-            const DEFAULT: bool = true;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                let builder = run.builder;
-                run.path($path).default_condition(builder.config.docs)
+                run.path($path)
+            }
+
+            fn is_default_step(builder: &Builder<'_>) -> bool {
+                builder.config.docs
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -68,40 +72,56 @@ macro_rules! book {
 // adding a build step in `src/bootstrap/code/builder/mod.rs`!
 // NOTE: Make sure to add the corresponding submodule when adding a new book.
 book!(
-    CargoBook, "src/tools/cargo/src/doc", "cargo", &[];
+    CargoBook, "src/tools/cargo/doc/book", "cargo", &[];
     ClippyBook, "src/tools/clippy/book", "clippy", &[];
     EditionGuide, "src/doc/edition-guide", "edition-guide", &[];
     EmbeddedBook, "src/doc/embedded-book", "embedded-book", &[];
     Nomicon, "src/doc/nomicon", "nomicon", &[];
-    RustByExample, "src/doc/rust-by-example", "rust-by-example", &["es", "ja", "zh"];
+    RustByExample, "src/doc/rust-by-example", "rust-by-example", &["es", "ja", "zh", "ko"];
     RustdocBook, "src/doc/rustdoc", "rustdoc", &[];
     StyleGuide, "src/doc/style-guide", "style-guide", &[];
 );
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnstableBook {
+    build_compiler: Compiler,
     target: TargetSelection,
 }
 
-impl Step for UnstableBook {
+impl CommandLineStep for UnstableBook {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/doc/unstable-book").default_condition(builder.config.docs)
+        run.path("src/doc/unstable-book")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(UnstableBook { target: run.target });
+        // Bump the stage to 2, because the unstable book requires an in-tree compiler.
+        // At the same time, since this step is enabled by default, we don't want `x doc` to fail
+        // in stage 1.
+        let stage = if run.builder.config.is_explicit_stage() || run.builder.top_stage >= 2 {
+            run.builder.top_stage
+        } else {
+            2
+        };
+
+        run.builder.ensure(UnstableBook {
+            build_compiler: prepare_doc_compiler(run.builder, run.target, stage),
+            target: run.target,
+        });
     }
 
     fn run(self, builder: &Builder<'_>) {
-        builder.ensure(UnstableBookGen { target: self.target });
+        let unstable_book_md_dir = builder
+            .ensure(UnstableBookGen { build_compiler: self.build_compiler, target: self.target });
         builder.ensure(RustbookSrc {
             target: self.target,
             name: "unstable-book".to_owned(),
-            src: builder.md_doc_out(self.target).join("unstable-book"),
+            src: unstable_book_md_dir,
             parent: Some(self),
             languages: vec![],
             build_compiler: None,
@@ -110,7 +130,7 @@ impl Step for UnstableBook {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct RustbookSrc<P: Step> {
+struct RustbookSrc<P: CommandLineStep> {
     target: TargetSelection,
     name: String,
     src: PathBuf,
@@ -120,12 +140,8 @@ struct RustbookSrc<P: Step> {
     build_compiler: Option<Compiler>,
 }
 
-impl<P: Step> Step for RustbookSrc<P> {
+impl<P: CommandLineStep> Step for RustbookSrc<P> {
     type Output = ();
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     /// Invoke `rustbook` for `target` for the doc book `name` from the `src` path.
     ///
@@ -211,13 +227,15 @@ pub struct TheBook {
     target: TargetSelection,
 }
 
-impl Step for TheBook {
+impl CommandLineStep for TheBook {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/doc/book").default_condition(builder.config.docs)
+        run.path("src/doc/book")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -335,13 +353,15 @@ pub struct Standalone {
     target: TargetSelection,
 }
 
-impl Step for Standalone {
+impl CommandLineStep for Standalone {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/doc").alias("standalone").default_condition(builder.config.docs)
+        run.path("src/doc").alias("standalone")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -445,13 +465,15 @@ pub struct Releases {
     target: TargetSelection,
 }
 
-impl Step for Releases {
+impl CommandLineStep for Releases {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("RELEASES.md").alias("releases").default_condition(builder.config.docs)
+        run.path("RELEASES.md").alias("releases")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -552,12 +574,6 @@ pub struct SharedAssets {
 
 impl Step for SharedAssets {
     type Output = SharedAssetsPaths;
-    const DEFAULT: bool = false;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        // Other tasks depend on this, no need to execute it on its own
-        run.never()
-    }
 
     /// Generate shared resources used by other pieces of documentation.
     fn run(self, builder: &Builder<'_>) -> Self::Output {
@@ -627,19 +643,20 @@ impl Std {
     }
 }
 
-impl Step for Std {
+impl CommandLineStep for Std {
     /// Path to a directory with the built documentation.
     type Output = PathBuf;
 
-    const DEFAULT: bool = true;
-
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.crate_or_deps("sysroot").path("library").default_condition(builder.config.docs)
+        run.crate_or_deps("sysroot").path("library")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
-        let crates = compile::std_crates_for_run_make(&run);
+        let crates = compile::std_crates_for_make_run(&run);
         let target_is_no_std = run.builder.no_std(run.target).unwrap_or(false);
         if crates.is_empty() && target_is_no_std {
             return;
@@ -693,7 +710,7 @@ impl Step for Std {
             DocumentationFormat::Html => {
                 vec!["--markdown-css", "rust.css", "--markdown-no-toc", "--index-page", &index_page]
             }
-            DocumentationFormat::Json => vec!["--output-format", "json"],
+            DocumentationFormat::Json => vec![],
         };
 
         if !builder.config.docs_minification {
@@ -702,7 +719,47 @@ impl Step for Std {
         // For `--index-page` and `--output-format=json`.
         extra_args.push("-Zunstable-options");
 
-        doc_std(builder, self.format, self.build_compiler, target, &out, &extra_args, &crates);
+        let target_doc_dir_name =
+            if self.format == DocumentationFormat::Json { "json-doc" } else { "doc" };
+        let target_dir = builder
+            .stage_out(self.build_compiler, Mode::Std)
+            .join(target)
+            .join(target_doc_dir_name);
+
+        // This is directory where the compiler will place the output of the command.
+        // We will then copy the files from this directory into the final `out` directory, the specified
+        // as a function parameter.
+        let out_dir = target_dir.join(target).join("doc");
+
+        let mut cargo = doc_std(
+            builder,
+            self.format,
+            self.build_compiler,
+            target,
+            &target_dir,
+            &extra_args,
+            &crates,
+        );
+        match self.format {
+            DocumentationFormat::Html => {}
+            DocumentationFormat::Json => {
+                // We have to pass these directly to cargo, rather than through RUSTDOCFLAGS,
+                // otherwise Cargo will not detect freshness of the output correctly, and keep
+                // rebuilding the docs on every invocation.
+                cargo.args(["-Zunstable-options", "--output-format", "json"]);
+            }
+        }
+
+        let description =
+            format!("library{} in {} format", crate_description(&crates), self.format.as_str());
+
+        {
+            let _guard =
+                builder.msg(Kind::Doc, description, Mode::Std, self.build_compiler, target);
+
+            cargo.into_cmd().run(builder);
+            builder.cp_link_r(&out_dir, &out);
+        }
 
         // Open if the format is HTML
         if let DocumentationFormat::Html = self.format {
@@ -759,25 +816,16 @@ impl DocumentationFormat {
     }
 }
 
-/// Build the documentation for public standard library crates.
+/// Prepare a Cargo command for building the documentation for public standard library crates.
 fn doc_std(
     builder: &Builder<'_>,
     format: DocumentationFormat,
     build_compiler: Compiler,
     target: TargetSelection,
-    out: &Path,
+    target_dir: &Path,
     extra_args: &[&str],
     requested_crates: &[String],
-) {
-    let target_doc_dir_name = if format == DocumentationFormat::Json { "json-doc" } else { "doc" };
-    let target_dir =
-        builder.stage_out(build_compiler, Mode::Std).join(target).join(target_doc_dir_name);
-
-    // This is directory where the compiler will place the output of the command.
-    // We will then copy the files from this directory into the final `out` directory, the specified
-    // as a function parameter.
-    let out_dir = target_dir.join(target).join("doc");
-
+) -> builder::Cargo {
     let mut cargo = builder::Cargo::new(
         builder,
         build_compiler,
@@ -803,16 +851,12 @@ fn doc_std(
         cargo.rustdocflag(arg);
     }
 
-    if builder.config.library_docs_private_items {
+    // This is needed for cargo-semver-checks and potentially other downstream tools that consume
+    // the JSON data.
+    if format == DocumentationFormat::Json || builder.config.library_docs_private_items {
         cargo.rustdocflag("--document-private-items").rustdocflag("--document-hidden-items");
     }
-
-    let description =
-        format!("library{} in {} format", crate_description(requested_crates), format.as_str());
-    let _guard = builder.msg(Kind::Doc, description, Mode::Std, build_compiler, target);
-
-    cargo.into_cmd().run(builder);
-    builder.cp_link_r(&out_dir, out);
+    cargo
 }
 
 /// Prepare a compiler that will be able to document something for `target` at `stage`.
@@ -856,16 +900,16 @@ impl Rustc {
     }
 }
 
-impl Step for Rustc {
+impl CommandLineStep for Rustc {
     type Output = ();
-    const DEFAULT: bool = true;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.crate_or_deps("rustc-main")
-            .path("compiler")
-            .default_condition(builder.config.compiler_docs)
+        run.crate_or_deps("rustc-main").path("compiler")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.compiler_docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -918,6 +962,7 @@ impl Step for Rustc {
         // see https://github.com/rust-lang/rust/pull/122066#issuecomment-1983049222
         // If there is any bug, please comment out the next line.
         cargo.rustdocflag("--generate-link-to-definition");
+        cargo.rustdocflag("--generate-macro-expansion");
 
         compile::rustc_cargo(builder, &mut cargo, target, &build_compiler, &self.crates);
         cargo.arg("-Zskip-rustdoc-fingerprint");
@@ -1003,14 +1048,16 @@ macro_rules! tool_doc {
             target: TargetSelection,
         }
 
-        impl Step for $tool {
+        impl CommandLineStep for $tool {
             type Output = ();
-            const DEFAULT: bool = true;
             const IS_HOST: bool = true;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                let builder = run.builder;
-                run.path($path).default_condition(builder.config.compiler_docs)
+                run.path($path)
+            }
+
+            fn is_default_step(builder: &Builder<'_>) -> bool {
+                builder.config.compiler_docs
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -1204,14 +1251,16 @@ pub struct ErrorIndex {
     compilers: RustcPrivateCompilers,
 }
 
-impl Step for ErrorIndex {
+impl CommandLineStep for ErrorIndex {
     type Output = ();
-    const DEFAULT: bool = true;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/tools/error_index_generator").default_condition(builder.config.docs)
+        run.path("src/tools/error_index_generator")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1244,39 +1293,54 @@ impl Step for ErrorIndex {
     }
 }
 
+/// Runs the `unstable-book-gen` tool and returns a path to the generate unstable book markdown
+/// files.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnstableBookGen {
+    build_compiler: Compiler,
     target: TargetSelection,
 }
 
-impl Step for UnstableBookGen {
-    type Output = ();
-    const DEFAULT: bool = true;
+impl CommandLineStep for UnstableBookGen {
+    type Output = PathBuf;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/tools/unstable-book-gen").default_condition(builder.config.docs)
+        run.path("src/tools/unstable-book-gen")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(UnstableBookGen { target: run.target });
+        run.builder.ensure(UnstableBookGen {
+            build_compiler: prepare_doc_compiler(run.builder, run.target, run.builder.top_stage),
+            target: run.target,
+        });
     }
 
-    fn run(self, builder: &Builder<'_>) {
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
         let target = self.target;
+        let rustc_path = builder.rustc(self.build_compiler);
 
         builder.info(&format!("Generating unstable book md files ({target})"));
-        let out = builder.md_doc_out(target).join("unstable-book");
+        let out = builder.out.join(target).join("md-doc").join("unstable-book");
         builder.create_dir(&out);
         builder.remove_dir(&out);
         let mut cmd = builder.tool_cmd(Tool::UnstableBookGen);
         cmd.arg(builder.src.join("library"));
         cmd.arg(builder.src.join("compiler"));
         cmd.arg(builder.src.join("src"));
-        cmd.arg(out);
+        cmd.arg(rustc_path);
+        cmd.arg(&out);
+
+        // Running rustc requires the library path if rust.rpath = false
+        // or any other libraries are in a custom location.
+        builder.add_rustc_lib_path(self.build_compiler, &mut cmd);
 
         cmd.run(builder);
+        out
     }
 }
 
@@ -1316,14 +1380,16 @@ impl RustcBook {
     }
 }
 
-impl Step for RustcBook {
+impl CommandLineStep for RustcBook {
     type Output = ();
-    const DEFAULT: bool = true;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/doc/rustc").default_condition(builder.config.docs)
+        run.path("src/doc/rustc")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1349,7 +1415,14 @@ impl Step for RustcBook {
     /// in the "md-doc" directory in the build output directory. Then
     /// "rustbook" is used to convert it to HTML.
     fn run(self, builder: &Builder<'_>) {
-        let out_base = builder.md_doc_out(self.target).join("rustc");
+        // FIXME: Temporary workaround for https://github.com/rust-lang/rust/issues/158378
+        // Make sure this workaround doesn't break unit tests on the affected host.
+        if cfg!(not(test)) && self.target == "i686-pc-windows-msvc" {
+            eprintln!("WARNING: Skipping rustc book build to work around #158378");
+            return;
+        }
+
+        let out_base = builder.out.join(self.target).join("md-doc").join("rustc");
         t!(fs::create_dir_all(&out_base));
         let out_listing = out_base.join("src/lints");
         builder.cp_link_r(&builder.src.join("src/doc/rustc"), &out_base);
@@ -1413,13 +1486,15 @@ pub struct Reference {
     target: TargetSelection,
 }
 
-impl Step for Reference {
+impl CommandLineStep for Reference {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/doc/reference").default_condition(builder.config.docs)
+        run.path("src/doc/reference")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.docs
     }
 
     fn make_run(run: RunConfig<'_>) {

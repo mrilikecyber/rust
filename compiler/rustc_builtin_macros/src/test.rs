@@ -1,21 +1,19 @@
 //! The expansion from a test function to the appropriate test struct for libtest
 //! Ideally, this code would be in libtest but for efficiency and error messages it lives here.
 
-use std::assert_matches::assert_matches;
-use std::iter;
+use std::{assert_matches, iter};
 
-use rustc_ast::{self as ast, GenericParamKind, HasNodeId, attr, join_path_idents};
+use rustc_ast::{self as ast, GenericParamKind, attr, join_path_idents};
 use rustc_ast_pretty::pprust;
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::{Applicability, Diag, Level};
 use rustc_expand::base::*;
-use rustc_hir::Attribute;
-use rustc_hir::attrs::AttributeKind;
-use rustc_span::{ErrorGuaranteed, FileNameDisplayPreference, Ident, Span, Symbol, sym};
+use rustc_span::{ErrorGuaranteed, Ident, RemapPathScopeComponents, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{check_builtin_macro_attribute, warn_on_duplicate_attribute};
 
 /// #[test_case] is used by custom test authors to mark tests
@@ -34,10 +32,6 @@ pub(crate) fn expand_test_case(
     check_builtin_macro_attribute(ecx, meta_item, sym::test_case);
     warn_on_duplicate_attribute(ecx, &anno_item, sym::test_case);
 
-    if !ecx.ecfg.should_test {
-        return vec![];
-    }
-
     let sp = ecx.with_def_site_ctxt(attr_sp);
     let (mut item, is_stmt) = match anno_item {
         Annotatable::Item(item) => (item, false),
@@ -49,28 +43,28 @@ pub(crate) fn expand_test_case(
             }
         }
         _ => {
-            ecx.dcx().emit_err(errors::TestCaseNonItem { span: anno_item.span() });
+            ecx.dcx().emit_err(diagnostics::TestCaseNonItem { span: anno_item.span() });
             return vec![];
         }
     };
 
+    if !ecx.ecfg.should_test {
+        return vec![];
+    }
+
     // `#[test_case]` is valid on functions, consts, and statics. Only modify
     // the item in those cases.
     match &mut item.kind {
-        ast::ItemKind::Fn(box ast::Fn { ident, .. })
-        | ast::ItemKind::Const(box ast::ConstItem { ident, .. })
-        | ast::ItemKind::Static(box ast::StaticItem { ident, .. }) => {
+        ast::ItemKind::Fn(ast::Fn { ident, .. })
+        | ast::ItemKind::Const(ast::ConstItem { ident, .. })
+        | ast::ItemKind::Static(ast::StaticItem { ident, .. }) => {
             ident.span = ident.span.with_ctxt(sp.ctxt());
             let test_path_symbol = Symbol::intern(&item_path(
                 // skip the name of the root module
                 &ecx.current_expansion.module.mod_path[1..],
                 ident,
             ));
-            item.vis = ast::Visibility {
-                span: item.vis.span,
-                kind: ast::VisibilityKind::Public,
-                tokens: None,
-            };
+            item.vis = ast::Visibility { span: item.vis.span, kind: ast::VisibilityKind::Public };
             item.attrs.push(ecx.attr_name_value_str(sym::rustc_test_marker, test_path_symbol, sp));
         }
         _ => {}
@@ -98,13 +92,13 @@ pub(crate) fn expand_test(
 
 pub(crate) fn expand_bench(
     cx: &mut ExtCtxt<'_>,
-    attr_sp: Span,
+    attr_path_sp: Span,
     meta_item: &ast::MetaItem,
     item: Annotatable,
 ) -> Vec<Annotatable> {
     check_builtin_macro_attribute(cx, meta_item, sym::bench);
     warn_on_duplicate_attribute(cx, &item, sym::bench);
-    expand_test_or_bench(cx, attr_sp, item, true)
+    expand_test_or_bench(cx, attr_path_sp, item, true)
 }
 
 pub(crate) fn expand_test_or_bench(
@@ -113,22 +107,17 @@ pub(crate) fn expand_test_or_bench(
     item: Annotatable,
     is_bench: bool,
 ) -> Vec<Annotatable> {
-    // If we're not in test configuration, remove the annotated item
-    if !cx.ecfg.should_test {
-        return vec![];
-    }
-
     let (item, is_stmt) = match item {
         Annotatable::Item(i) => (i, false),
-        Annotatable::Stmt(box ast::Stmt { kind: ast::StmtKind::Item(i), .. }) => (i, true),
+        Annotatable::Stmt(ast::Stmt { kind: ast::StmtKind::Item(i), .. }) => (i, true),
         other => {
-            not_testable_error(cx, attr_sp, None);
+            not_testable_error(cx, is_bench, attr_sp, None);
             return vec![other];
         }
     };
 
     let ast::ItemKind::Fn(fn_) = &item.kind else {
-        not_testable_error(cx, attr_sp, Some(&item));
+        not_testable_error(cx, is_bench, attr_sp, Some(&item));
         return if is_stmt {
             vec![Annotatable::Stmt(Box::new(cx.stmt_item(item.span, item)))]
         } else {
@@ -136,8 +125,13 @@ pub(crate) fn expand_test_or_bench(
         };
     };
 
+    // If we're not in test configuration, remove the annotated item
+    if !cx.ecfg.should_test {
+        return vec![];
+    }
+
     if let Some(attr) = attr::find_by_name(&item.attrs, sym::naked) {
-        cx.dcx().emit_err(errors::NakedFunctionTestingAttribute {
+        cx.dcx().emit_err(diagnostics::NakedFunctionTestingAttribute {
             testing_span: attr_sp,
             naked_span: attr.span,
         });
@@ -267,7 +261,7 @@ pub(crate) fn expand_test_or_bench(
         &fn_.ident,
     ));
 
-    let location_info = get_location_info(cx, &fn_);
+    let location_info = get_location_info(cx, fn_);
 
     let mut test_const =
         cx.item(
@@ -283,13 +277,14 @@ pub(crate) fn expand_test_or_bench(
             // const $ident: test::TestDescAndFn =
             ast::ItemKind::Const(
                 ast::ConstItem {
-                    defaultness: ast::Defaultness::Final,
+                    defaultness: ast::Defaultness::Implicit,
                     ident: Ident::new(fn_.ident.name, sp),
                     generics: ast::Generics::default(),
                     ty: cx.ty(sp, ast::TyKind::Path(None, test_path("TestDescAndFn"))),
                     define_opaque: None,
+                    kind: ast::ConstItemKind::Body,
                     // test::TestDescAndFn {
-                    rhs: Some(ast::ConstItemRhs::Body(
+                    body: Some(
                         cx.expr_struct(
                             sp,
                             test_path("TestDescAndFn"),
@@ -371,7 +366,7 @@ pub(crate) fn expand_test_or_bench(
                         field("testfn", test_fn), // }
                     ],
                         ), // }
-                    )),
+                    ),
                 }
                 .into(),
             ),
@@ -405,9 +400,10 @@ pub(crate) fn expand_test_or_bench(
     }
 }
 
-fn not_testable_error(cx: &ExtCtxt<'_>, attr_sp: Span, item: Option<&ast::Item>) {
+fn not_testable_error(cx: &ExtCtxt<'_>, is_bench: bool, attr_sp: Span, item: Option<&ast::Item>) {
     let dcx = cx.dcx();
-    let msg = "the `#[test]` attribute may only be used on a non-associated function";
+    let name = if is_bench { "bench" } else { "test" };
+    let msg = format!("the `{name}` attribute may only be used on a free function");
     let level = match item.map(|i| &i.kind) {
         // These were a warning before #92959 and need to continue being that to avoid breaking
         // stable user code (#94508).
@@ -426,12 +422,16 @@ fn not_testable_error(cx: &ExtCtxt<'_>, attr_sp: Span, item: Option<&ast::Item>)
             ),
         );
     }
-    err.with_span_label(attr_sp, "the `#[test]` macro causes a function to be run as a test and has no effect on non-functions")
-        .with_span_suggestion(attr_sp,
+    err.span_label(attr_sp, format!("the `{name}` attribute causes a function to be run as a test and has no effect on non-functions"));
+
+    if !is_bench {
+        err.with_span_suggestion(attr_sp,
             "replace with conditional compilation to make the item only exist when tests are being run",
             "#[cfg(test)]",
-            Applicability::MaybeIncorrect)
-        .emit();
+            Applicability::MaybeIncorrect).emit();
+    } else {
+        err.emit();
+    }
 }
 
 fn get_location_info(cx: &ExtCtxt<'_>, fn_: &ast::Fn) -> (Symbol, usize, usize, usize, usize) {
@@ -440,7 +440,7 @@ fn get_location_info(cx: &ExtCtxt<'_>, fn_: &ast::Fn) -> (Symbol, usize, usize, 
         cx.sess.source_map().span_to_location_info(span);
 
     let file_name = match source_file {
-        Some(sf) => sf.name.display(FileNameDisplayPreference::Remapped).to_string(),
+        Some(sf) => sf.name.display(RemapPathScopeComponents::MACRO).to_string(),
         None => "no-location".to_string(),
     };
 
@@ -476,14 +476,7 @@ fn should_ignore_message(i: &ast::Item) -> Option<Symbol> {
 
 fn should_panic(cx: &ExtCtxt<'_>, i: &ast::Item) -> ShouldPanic {
     if let Some(Attribute::Parsed(AttributeKind::ShouldPanic { reason, .. })) =
-        AttributeParser::parse_limited(
-            cx.sess,
-            &i.attrs,
-            sym::should_panic,
-            i.span,
-            i.node_id(),
-            None,
-        )
+        AttributeParser::parse_limited_sym(cx.sess, &i.attrs, &[sym::should_panic])
     {
         ShouldPanic::Yes(reason)
     } else {
@@ -528,33 +521,19 @@ fn check_test_signature(
     let dcx = cx.dcx();
 
     if let ast::Safety::Unsafe(span) = f.sig.header.safety {
-        return Err(dcx.emit_err(errors::TestBadFn { span: i.span, cause: span, kind: "unsafe" }));
+        return Err(dcx.emit_err(diagnostics::TestBadFn {
+            span: i.span,
+            cause: span,
+            kind: "unsafe",
+        }));
     }
 
-    if let Some(coroutine_kind) = f.sig.header.coroutine_kind {
-        match coroutine_kind {
-            ast::CoroutineKind::Async { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "async",
-                }));
-            }
-            ast::CoroutineKind::Gen { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "gen",
-                }));
-            }
-            ast::CoroutineKind::AsyncGen { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "async gen",
-                }));
-            }
-        }
+    if let Some(coroutine_marker) = f.sig.header.coroutine_marker {
+        return Err(dcx.emit_err(diagnostics::TestBadFn {
+            span: i.span,
+            cause: coroutine_marker.span,
+            kind: coroutine_marker.kind.as_str(),
+        }));
     }
 
     // If the termination trait is active, the compiler will check that the output
@@ -591,7 +570,7 @@ fn check_bench_signature(
     // N.B., inadequate check, but we're running
     // well before resolve, can't get too deep.
     if f.sig.decl.inputs.len() != 1 {
-        return Err(cx.dcx().emit_err(errors::BenchSig { span: i.span }));
+        return Err(cx.dcx().emit_err(diagnostics::BenchSig { span: i.span }));
     }
     Ok(())
 }

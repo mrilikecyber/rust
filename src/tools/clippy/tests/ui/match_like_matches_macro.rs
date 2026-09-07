@@ -1,10 +1,6 @@
 #![warn(clippy::match_like_matches_macro)]
-#![allow(
-    unreachable_patterns,
-    clippy::equatable_if_let,
-    clippy::needless_borrowed_reference,
-    clippy::redundant_guards
-)]
+#![allow(irrefutable_let_patterns, clippy::redundant_guards)]
+#![expect(clippy::needless_borrowed_reference)]
 
 fn main() {
     let x = Some(5);
@@ -266,4 +262,38 @@ fn msrv_1_42() {
         _ => false,
     };
     //~^^^^ match_like_matches_macro
+}
+
+#[expect(clippy::option_option)]
+fn issue15841(opt: Option<Option<Option<i32>>>, value: i32) {
+    // Lint: no if-let _in the guard_
+    let _ = match opt {
+        Some(first) if (if let Some(second) = first { true } else { todo!() }) => true,
+        _ => false,
+    };
+    //~^^^^ match_like_matches_macro
+}
+
+fn issue16015<T: 'static, U: 'static>() -> bool {
+    use std::any::{TypeId, type_name};
+    pub struct GetTypeId<T>(T);
+
+    impl<T: 'static> GetTypeId<T> {
+        pub const VALUE: TypeId = TypeId::of::<T>();
+    }
+
+    macro_rules! typeid {
+        ($t:ty) => {
+            GetTypeId::<$t>::VALUE
+        };
+    }
+
+    match typeid!(T) {
+        _ => true,
+        _ => false,
+    };
+    //~^^^^ match_like_matches_macro
+
+    if let _ = typeid!(U) { true } else { false }
+    //~^ match_like_matches_macro
 }

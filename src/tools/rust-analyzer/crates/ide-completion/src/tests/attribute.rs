@@ -61,13 +61,78 @@ pub struct Foo(#[m$0] i32);
             at target_feature(enable = "…")
             at test
             at track_caller
+            at unsafe(…)
             at used
             at warn(…)
-            md mac
+            md mac::
             kw crate::
             kw self::
         "#]],
-    )
+    );
+    check(
+        r#"
+//- /mac.rs crate:mac
+#![crate_type = "proc-macro"]
+
+#[proc_macro_derive(MyDerive, attributes(my_cool_helper_attribute))]
+pub fn my_derive() {}
+
+//- /lib.rs crate:lib deps:mac
+#[rustc_builtin_macro]
+pub macro derive($item:item) {}
+
+#[derive(mac::MyDerive)]
+pub struct Foo(#[$0] i32);
+"#,
+        expect![[r#"
+            at allow(…)
+            at automatically_derived
+            at cfg(…)
+            at cfg_attr(…)
+            at cold
+            at deny(…)
+            at deprecated
+            at derive                                  macro derive
+            at derive(…)
+            at diagnostic::do_not_recommend
+            at diagnostic::on_unimplemented
+            at doc = "…"
+            at doc = include_str!("…")
+            at doc(alias = "…")
+            at doc(hidden)
+            at expect(…)
+            at export_name = "…"
+            at forbid(…)
+            at global_allocator
+            at ignore = "…"
+            at inline
+            at link
+            at link_name = "…"
+            at link_section = "…"
+            at macro_export
+            at macro_use
+            at must_use
+            at my_cool_helper_attribute derive helper of `MyDerive`
+            at no_mangle
+            at non_exhaustive
+            at panic_handler
+            at path = "…"
+            at proc_macro
+            at proc_macro_attribute
+            at proc_macro_derive(…)
+            at repr(…)
+            at should_panic
+            at target_feature(enable = "…")
+            at test
+            at track_caller
+            at unsafe(…)
+            at used
+            at warn(…)
+            md mac::
+            kw crate::
+            kw self::
+        "#]],
+    );
 }
 
 #[test]
@@ -95,8 +160,9 @@ struct Foo;
             at no_mangle
             at non_exhaustive
             at repr(…)
+            at unsafe(…)
             at warn(…)
-            md proc_macros
+            md proc_macros::
             kw crate::
             kw self::
         "#]],
@@ -173,6 +239,7 @@ fn attr_on_source_file() {
             at no_std
             at recursion_limit = "…"
             at type_length_limit = …
+            at unsafe(…)
             at warn(…)
             at windows_subsystem = "…"
             kw crate::
@@ -201,6 +268,7 @@ fn attr_on_module() {
             at must_use
             at no_mangle
             at path = "…"
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -224,6 +292,7 @@ fn attr_on_module() {
             at must_use
             at no_implicit_prelude
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -252,6 +321,7 @@ fn attr_on_macro_rules() {
             at macro_use
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -277,6 +347,7 @@ fn attr_on_macro_def() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -303,6 +374,7 @@ fn attr_on_extern_crate() {
             at macro_use
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -328,6 +400,7 @@ fn attr_on_use() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -353,6 +426,7 @@ fn attr_on_type_alias() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -387,8 +461,9 @@ struct Foo;
             at no_mangle
             at non_exhaustive
             at repr(…)
+            at unsafe(…)
             at warn(…)
-            md core
+            md core::
             kw crate::
             kw self::
         "#]],
@@ -416,6 +491,7 @@ fn attr_on_enum() {
             at no_mangle
             at non_exhaustive
             at repr(…)
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -441,6 +517,7 @@ fn attr_on_const() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -470,6 +547,7 @@ fn attr_on_static() {
             at link_section = "…"
             at must_use
             at no_mangle
+            at unsafe(…)
             at used
             at warn(…)
             kw crate::
@@ -497,6 +575,7 @@ fn attr_on_trait() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -524,6 +603,7 @@ fn attr_on_impl() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -545,6 +625,7 @@ fn attr_on_impl() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -572,6 +653,7 @@ fn attr_with_qualifier() {
             at forbid(…)
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
         "#]],
     );
@@ -592,7 +674,39 @@ fn attr_with_qualifier() {
             at must_use
             at no_mangle
             at on_unimplemented
+            at unsafe(…)
             at warn(…)
+        "#]],
+    );
+}
+
+#[test]
+fn attr_on_unsafe_attr() {
+    check(
+        r#"#[unsafe($0)] static FOO: () = ()"#,
+        expect![[r#"
+            at allow(…)
+            at cfg(…)
+            at cfg_attr(…)
+            at deny(…)
+            at deprecated
+            at doc = "…"
+            at doc = include_str!("…")
+            at doc(alias = "…")
+            at doc(hidden)
+            at expect(…)
+            at export_name = "…"
+            at forbid(…)
+            at global_allocator
+            at link_name = "…"
+            at link_section = "…"
+            at must_use
+            at no_mangle
+            at unsafe(…)
+            at used
+            at warn(…)
+            kw crate::
+            kw self::
         "#]],
     );
 }
@@ -643,6 +757,7 @@ fn attr_on_extern_block() {
             at link
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -665,6 +780,7 @@ fn attr_on_extern_block() {
             at link
             at must_use
             at no_mangle
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -723,6 +839,7 @@ fn attr_on_fn() {
             at target_feature(enable = "…")
             at test
             at track_caller
+            at unsafe(…)
             at warn(…)
             kw crate::
             kw self::
@@ -773,6 +890,7 @@ fn attr_in_source_file_end() {
             at target_feature(enable = "…")
             at test
             at track_caller
+            at unsafe(…)
             at used
             at warn(…)
             kw crate::
@@ -929,6 +1047,53 @@ mod cfg {
     }
 
     #[test]
+    fn inside_cfg_attr_gating_attr_macro() {
+        check(
+            r#"
+//- proc_macros: identity
+//- /main.rs cfg:feature=on
+#[cfg_attr(feat$0ure = "on", proc_macros::identity)]
+fn f() {}
+"#,
+            expect![[r#"
+                ba all
+                ba any
+                ba feature
+                ba not
+                ba true
+            "#]],
+        );
+    }
+
+    #[test]
+    fn complete_key_attr() {
+        check_edit(
+            "test",
+            r#"
+//- /main.rs cfg:test,dbg=false,opt_level=2
+#[cfg($0)]
+"#,
+            r#"
+#[cfg(test)]
+"#,
+        );
+    }
+
+    #[test]
+    fn complete_key_value_attr() {
+        check_edit(
+            "opt_level",
+            r#"
+//- /main.rs cfg:test,dbg=false,opt_level=2
+#[cfg($0)]
+"#,
+            r#"
+#[cfg(opt_level = $0)]
+"#,
+        );
+    }
+
+    #[test]
     fn cfg_target_endian() {
         check(
             r#"#[cfg(target_endian = $0"#,
@@ -991,7 +1156,8 @@ mod derive {
                 de PartialEq, Eq
                 de PartialEq, Eq, PartialOrd, Ord
                 de PartialEq, PartialOrd
-                md core
+                md core::
+                md panic::
                 kw crate::
                 kw self::
             "#]],
@@ -1013,7 +1179,8 @@ mod derive {
                 de Eq
                 de Eq, PartialOrd, Ord
                 de PartialOrd
-                md core
+                md core::
+                md panic::
                 kw crate::
                 kw self::
             "#]],
@@ -1035,7 +1202,8 @@ mod derive {
                 de Eq
                 de Eq, PartialOrd, Ord
                 de PartialOrd
-                md core
+                md core::
+                md panic::
                 kw crate::
                 kw self::
             "#]],
@@ -1056,7 +1224,8 @@ mod derive {
                 de Default macro Default
                 de PartialOrd
                 de PartialOrd, Ord
-                md core
+                md core::
+                md panic::
                 kw crate::
                 kw self::
             "#]],
@@ -1073,8 +1242,8 @@ mod derive {
 "#,
             expect![[r#"
                 de DeriveIdentity (use proc_macros::DeriveIdentity) proc_macro DeriveIdentity
-                md core
-                md proc_macros
+                md core::
+                md proc_macros::
                 kw crate::
                 kw self::
             "#]],
@@ -1088,8 +1257,8 @@ use proc_macros::DeriveIdentity;
 "#,
             expect![[r#"
                 de DeriveIdentity proc_macro DeriveIdentity
-                md core
-                md proc_macros
+                md core::
+                md proc_macros::
                 kw crate::
                 kw self::
             "#]],
@@ -1425,4 +1594,56 @@ extern crate dep;
             "#]],
         )
     }
+}
+
+#[test]
+fn builtin_macro_completed_only_as_its_kind() {
+    check(
+        r#"
+#[rustc_builtin_macro]
+pub macro define_opaque($($tt:tt)*) {
+    /* compiler built-in */
+}
+
+fn foo() {
+    def$0
+}
+    "#,
+        expect![[r#"
+            fn foo()  fn()
+            bt u32     u32
+            kw async
+            kw const
+            kw crate::
+            kw enum
+            kw extern
+            kw false
+            kw fn
+            kw for
+            kw if
+            kw if let
+            kw impl
+            kw impl for
+            kw let
+            kw letm
+            kw loop
+            kw match
+            kw mod
+            kw return
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw true
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            kw while
+            kw while let
+            sn macro_rules
+            sn pd
+            sn ppd
+        "#]],
+    );
 }

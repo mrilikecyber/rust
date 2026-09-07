@@ -9,7 +9,6 @@
 // errors that only occur once we get past the AST.
 
 #![feature(auto_traits)]
-#![feature(box_patterns)]
 #![feature(builtin_syntax)]
 #![feature(const_trait_impl)]
 #![feature(coroutines)]
@@ -19,7 +18,6 @@
 #![feature(gen_blocks)]
 #![feature(more_qualified_paths)]
 #![feature(never_patterns)]
-#![feature(never_type)]
 #![feature(pattern_types)]
 #![feature(pattern_type_macro)]
 #![feature(prelude_import)]
@@ -27,6 +25,7 @@
 #![feature(trace_macros)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(yeet_expr)]
 #![allow(incomplete_features)]
 
@@ -244,6 +243,8 @@ mod expressions {
     fn expr_try_block() {
         try {}
         try { return; }
+        try bikeshed Option<_> { }
+        try bikeshed Option<String> { None? }
     }
 
     /// ExprKind::Assign
@@ -540,7 +541,7 @@ mod items {
         impl () {}
         impl<T> () {}
         impl Default for () {}
-        impl<T> const Default for () {}
+        const impl<T> Default for () {}
     }
 
     /// ItemKind::MacCall
@@ -632,11 +633,6 @@ mod patterns {
         let ();
         let (true,);
         let (true, false);
-    }
-
-    /// PatKind::Box
-    fn pat_box() {
-        let box pat;
     }
 
     /// PatKind::Deref

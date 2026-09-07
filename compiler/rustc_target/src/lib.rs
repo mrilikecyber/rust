@@ -8,7 +8,6 @@
 //! LLVM.
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(debug_closure_helpers))]
 #![expect(internal_features)]
 #![feature(iter_intersperse)]
 #![feature(rustc_attrs)]
@@ -24,8 +23,6 @@ pub mod target_features;
 
 #[cfg(test)]
 mod tests;
-
-use rustc_abi::HashStableContext;
 
 /// The name of rustc's own place to organize libraries.
 ///
@@ -77,7 +74,7 @@ macro_rules! target_spec_enum {
         pub enum $Name:ident {
             $(
                 $( #[$variant_attr:meta] )*
-                $Variant:ident = $string:literal,
+                $Variant:ident = $string:literal $(,$alias:literal)* ,
             )*
         }
         parse_error_type = $parse_error_type:literal;
@@ -89,6 +86,7 @@ macro_rules! target_spec_enum {
             $(
                 $( #[$variant_attr] )*
                 #[serde(rename = $string)] // for JSON schema generation only
+                $( #[serde(alias = $alias)] )*
                 $Variant,
             )*
         }
@@ -98,7 +96,10 @@ macro_rules! target_spec_enum {
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 Ok(match s {
-                    $( $string => Self::$Variant, )*
+                    $(
+                        $string => Self::$Variant,
+                        $($alias => Self::$Variant,)*
+                    )*
                     _ => {
                         let all = [$( concat!("'", $string, "'") ),*].join(", ");
                         return Err(format!("invalid {}: '{s}'. allowed values: {all}", $parse_error_type));
@@ -124,7 +125,7 @@ macro_rules! target_spec_enum {
         pub enum $Name:ident {
             $(
                 $( #[$variant_attr:meta] )*
-                $Variant:ident = $string:literal,
+                $Variant:ident = $string:literal $(,$alias:literal)* ,
             )*
         }
         $( #[$other_variant_attr:meta] )*
@@ -135,6 +136,7 @@ macro_rules! target_spec_enum {
         pub enum $Name {
             $(
                 $( #[$variant_attr:meta] )*
+                 $( #[serde(alias = $alias)] )*
                 $Variant,
             )*
             /// The vast majority of the time, the compiler deals with a fixed
@@ -166,7 +168,10 @@ macro_rules! target_spec_enum {
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 Ok(match s {
-                    $( $string => Self::$Variant, )*
+                    $(
+                        $string => Self::$Variant,
+                        $($alias => Self::$Variant,)*
+                    )*
                     _ => Self::$OtherVariant(s.to_owned().into()),
                 })
             }

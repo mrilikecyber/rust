@@ -1,8 +1,8 @@
-use genmc_sys::AssumeType;
+use genmc_sys::{AssumeType, MutexLockOutcome};
 use rustc_middle::ty;
 use tracing::debug;
 
-use crate::concurrency::genmc::MAX_ACCESS_SIZE;
+use crate::concurrency::genmc::{MAX_ACCESS_SIZE, get_outcome};
 use crate::concurrency::thread::EvalContextExt as _;
 use crate::*;
 
@@ -16,7 +16,7 @@ impl GenmcCtx {
         assume_type: AssumeType,
     ) -> InterpResult<'tcx> {
         debug!("GenMC: assume statement, blocking active thread.");
-        self.handle
+        self.genmc
             .borrow_mut()
             .pin_mut()
             .handle_assume_block(self.active_thread_genmc_tid(machine), assume_type);
@@ -24,24 +24,22 @@ impl GenmcCtx {
     }
 }
 
+/// Small helper to get the arguments of an intercepted function call.
+fn get_fn_args<'tcx, const N: usize>(
+    instance: ty::Instance<'tcx>,
+    args: &[FnArg<'tcx>],
+) -> InterpResult<'tcx, [OpTy<'tcx>; N]> {
+    let args = MiriInterpCx::copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
+    if let Ok(ops) = args.try_into() {
+        return interp_ok(ops);
+    }
+    panic!("{} is a diagnostic item expected to have {} arguments", instance, N);
+}
+
 // Handling of code intercepted by Miri in GenMC mode, such as assume statement or `std::sync::Mutex`.
 
 impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Small helper to get the arguments of an intercepted function call.
-    fn get_fn_args<const N: usize>(
-        &self,
-        instance: ty::Instance<'tcx>,
-        args: &[FnArg<'tcx>],
-    ) -> InterpResult<'tcx, [OpTy<'tcx>; N]> {
-        let this = self.eval_context_ref();
-        let args = this.copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
-        if let Ok(ops) = args.try_into() {
-            return interp_ok(ops);
-        }
-        panic!("{} is a diagnostic item expected to have {} arguments", instance, N);
-    }
-
     /**** Blocking functionality ****/
 
     /// Handle a thread getting blocked by a user assume (not an automatically generated assume).
@@ -82,51 +80,53 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             size <= MAX_ACCESS_SIZE,
             "Mutex is larger than maximal size of a memory access supported by GenMC ({size} > {MAX_ACCESS_SIZE})"
         );
-        let result = genmc_ctx.handle.borrow_mut().pin_mut().handle_mutex_lock(
+        let result = genmc_ctx.genmc.borrow_mut().pin_mut().handle_mutex_lock(
             genmc_ctx.active_thread_genmc_tid(&this.machine),
             mutex.ptr().addr().bytes(),
             size,
         );
-        if let Some(error) = result.error.as_ref() {
-            // FIXME(genmc): improve error handling.
-            throw_ub_format!("{}", error.to_string_lossy());
-        }
-        if result.is_reset {
-            debug!("GenMC: Mutex::lock: Reset");
-            // GenMC informed us to reset and try the lock again later.
-            // We block the current thread until GenMC schedules it again.
-            this.block_thread(
-                crate::BlockReason::Genmc,
-                None,
-                crate::callback!(
-                    @capture<'tcx> {
-                        mutex: MPlaceTy<'tcx>,
-                    }
-                    |this, unblock: crate::UnblockKind| {
-                        debug!("GenMC: Mutex::lock: unblocking callback called, attempting to lock the Mutex again.");
-                        assert_eq!(unblock, crate::UnblockKind::Ready);
-                        this.intercept_mutex_lock(mutex)?;
-                        interp_ok(())
-                    }
-                ),
-            );
-        } else if result.is_lock_acquired {
-            debug!("GenMC: Mutex::lock successfully acquired the Mutex.");
-        } else {
-            debug!("GenMC: Mutex::lock failed to acquire the Mutex, permanently blocking thread.");
-            // NOTE: `handle_mutex_lock` already blocked the current thread on the GenMC side.
-            this.block_thread(
-                crate::BlockReason::Genmc,
-                None,
-                crate::callback!(
-                    @capture<'tcx> {
-                        mutex: MPlaceTy<'tcx>,
-                    }
-                    |_this, _unblock: crate::UnblockKind| {
-                        unreachable!("A thread blocked on `Mutex::lock` should not be unblocked again.");
-                    }
-                ),
-            );
+        match get_outcome(result.into_genmc_result())? {
+            MutexLockOutcome::Reset => {
+                debug!("GenMC: Mutex::lock: Reset");
+                // GenMC informed us to reset and try the lock again later.
+                // We block the current thread until GenMC schedules it again.
+                this.block_thread(
+                    crate::BlockReason::Genmc,
+                    None,
+                    crate::callback!(
+                        @capture<'tcx> {
+                            mutex: MPlaceTy<'tcx>,
+                        }
+                        |this, unblock: crate::UnblockKind| {
+                            debug!("GenMC: Mutex::lock: unblocking callback called, attempting to lock the Mutex again.");
+                            assert_eq!(unblock, crate::UnblockKind::Ready);
+                            this.intercept_mutex_lock(mutex)?;
+                            interp_ok(())
+                        }
+                    ),
+                );
+            }
+            MutexLockOutcome::Acquired => {
+                debug!("GenMC: Mutex::lock successfully acquired the Mutex.");
+            }
+            MutexLockOutcome::NotAcquired => {
+                debug!(
+                    "GenMC: Mutex::lock failed to acquire the Mutex, permanently blocking thread."
+                );
+                // NOTE: `handle_mutex_lock` already blocked the current thread on the GenMC side.
+                this.block_thread(
+                    crate::BlockReason::Genmc,
+                    None,
+                    crate::callback!(
+                        @capture<'tcx> {
+                            mutex: MPlaceTy<'tcx>,
+                        }
+                        |_this, _unblock: crate::UnblockKind| {
+                            unreachable!("A thread blocked on `Mutex::lock` should not be unblocked again.");
+                        }
+                    ),
+                );
+            }
         }
         // NOTE: We don't write anything back to Miri's memory where the Mutex is located, that state is handled only by GenMC.
         interp_ok(())
@@ -145,22 +145,19 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             size <= MAX_ACCESS_SIZE,
             "Mutex is larger than maximal size of a memory access supported by GenMC ({size} > {MAX_ACCESS_SIZE})"
         );
-        let result = genmc_ctx.handle.borrow_mut().pin_mut().handle_mutex_try_lock(
+        let result = genmc_ctx.genmc.borrow_mut().pin_mut().handle_mutex_try_lock(
             genmc_ctx.active_thread_genmc_tid(&this.machine),
             mutex.ptr().addr().bytes(),
             size,
         );
-        if let Some(error) = result.error.as_ref() {
-            // FIXME(genmc): improve error handling.
-            throw_ub_format!("{}", error.to_string_lossy());
-        }
-        debug!(
-            "GenMC: Mutex::try_lock(): is_reset: {}, is_lock_acquired: {}",
-            result.is_reset, result.is_lock_acquired
-        );
-        assert!(!result.is_reset, "GenMC returned 'reset' for a mutex try_lock.");
+        let is_acquired = match get_outcome(result.into_genmc_result())? {
+            MutexLockOutcome::Reset => panic!("GenMC returned 'reset' for a mutex try_lock."),
+            MutexLockOutcome::Acquired => true,
+            MutexLockOutcome::NotAcquired => false,
+        };
+        debug!("GenMC: Mutex::try_lock(): acquired: {is_acquired}");
         // Write the return value of try_lock, i.e., whether we acquired the mutex.
-        this.write_scalar(Scalar::from_bool(result.is_lock_acquired), dest)?;
+        this.write_scalar(Scalar::from_bool(is_acquired), dest)?;
         // NOTE: We don't write anything back to Miri's memory where the Mutex is located, that state is handled only by GenMC.
         interp_ok(())
     }
@@ -169,16 +166,13 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         debug!("GenMC: handling Mutex::unlock()");
         let this = self.eval_context_ref();
         let genmc_ctx = this.machine.data_race.as_genmc_ref().unwrap();
-        let result = genmc_ctx.handle.borrow_mut().pin_mut().handle_mutex_unlock(
+        let result = genmc_ctx.genmc.borrow_mut().pin_mut().handle_mutex_unlock(
             genmc_ctx.active_thread_genmc_tid(&this.machine),
             mutex.ptr().addr().bytes(),
             mutex.layout.size.bytes(),
         );
-        if let Some(error) = result.error.as_ref() {
-            // FIXME(genmc): improve error handling.
-            throw_ub_format!("{}", error.to_string_lossy());
-        }
-        // NOTE: We don't write anything back to Miri's memory where the Mutex is located, that state is handled only by GenMC.}
+        let _is_co_max = get_outcome(result.into_genmc_result())?;
+        // NOTE: We don't write anything back to Miri's memory where the Mutex is located, that state is handled only by GenMC.
         interp_ok(())
     }
 }
@@ -200,17 +194,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         );
 
         // NOTE: When adding new intercepted functions here, they must also be added to `fn get_function_kind` in `concurrency/genmc/scheduling.rs`.
-        use rustc_span::sym;
         if this.tcx.is_diagnostic_item(sym::sys_mutex_lock, instance.def_id()) {
-            let [mutex] = this.get_fn_args(instance, args)?;
+            let [mutex] = get_fn_args(instance, args)?;
             let mutex = this.deref_pointer(&mutex)?;
             this.intercept_mutex_lock(mutex)?;
         } else if this.tcx.is_diagnostic_item(sym::sys_mutex_try_lock, instance.def_id()) {
-            let [mutex] = this.get_fn_args(instance, args)?;
+            let [mutex] = get_fn_args(instance, args)?;
             let mutex = this.deref_pointer(&mutex)?;
             this.intercept_mutex_try_lock(mutex, dest)?;
         } else if this.tcx.is_diagnostic_item(sym::sys_mutex_unlock, instance.def_id()) {
-            let [mutex] = this.get_fn_args(instance, args)?;
+            let [mutex] = get_fn_args(instance, args)?;
             let mutex = this.deref_pointer(&mutex)?;
             this.intercept_mutex_unlock(mutex)?;
         } else {

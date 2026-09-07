@@ -1,14 +1,13 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::res::MaybeDef;
-use clippy_utils::source::{IntoSpan, SpanRangeExt};
+use clippy_utils::res::MaybeDef as _;
+use clippy_utils::source::{IntoSpan as _, SpanExt as _};
 use clippy_utils::visitors::for_each_expr_without_closures;
 use clippy_utils::{LimitStack, get_async_fn_body, sym};
 use core::ops::ControlFlow;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Attribute, Body, Expr, ExprKind, FnDecl};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 
@@ -40,6 +39,8 @@ declare_clippy_lint! {
     @eval_always = true
 }
 
+impl_lint_pass!(CognitiveComplexity => [COGNITIVE_COMPLEXITY]);
+
 pub struct CognitiveComplexity {
     limit: LimitStack,
 }
@@ -51,8 +52,6 @@ impl CognitiveComplexity {
         }
     }
 }
-
-impl_lint_pass!(CognitiveComplexity => [COGNITIVE_COMPLEXITY]);
 
 impl CognitiveComplexity {
     fn check<'tcx>(
@@ -81,10 +80,8 @@ impl CognitiveComplexity {
                     }
                     cc += arms.iter().filter(|arm| arm.guard.is_some()).count() as u64;
                 },
-                ExprKind::Ret(_) => {
-                    if !matches!(prev_expr, Some(ExprKind::Ret(_))) {
-                        returns += 1;
-                    }
+                ExprKind::Ret(_) if !matches!(prev_expr, Some(ExprKind::Ret(_))) => {
+                    returns += 1;
                 },
                 _ => {},
             }
@@ -146,7 +143,8 @@ impl<'tcx> LateLintPass<'tcx> for CognitiveComplexity {
         span: Span,
         def_id: LocalDefId,
     ) {
-        if !cx.tcx.has_attr(def_id, sym::test) {
+        #[allow(deprecated)]
+        if cx.tcx.get_attrs(def_id, sym::test).next().is_none() {
             let expr = if kind.asyncness().is_async() {
                 match get_async_fn_body(cx.tcx, body) {
                     Some(b) => b,

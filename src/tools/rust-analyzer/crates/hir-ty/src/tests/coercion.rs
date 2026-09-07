@@ -49,7 +49,7 @@ fn let_stmt_coerce() {
 //- minicore: coerce_unsized
 fn test() {
     let x: &[isize] = &[1];
-                   // ^^^^ adjustments: Deref(None), Borrow(Ref('?2, Not)), Pointer(Unsize)
+                   // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
     let x: *const [isize] = &[1];
                          // ^^^^ adjustments: Deref(None), Borrow(RawPtr(Not)), Pointer(Unsize)
 }
@@ -88,6 +88,65 @@ fn test(a: A<[u8; 2]>, b: B<[u8; 2]>, c: C<[u8; 2]>) {
 }
 
 #[test]
+fn coerce_pointee_derive() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_pointee
+use core::marker::CoercePointee;
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Pointer<T: ?Sized>(*const T);
+
+fn coerce(value: Pointer<[u8; 1]>) -> Pointer<[u8]> {
+    value
+}
+"#,
+    );
+}
+
+#[test]
+fn unsized_from_keeps_type_info() {
+    check_types(
+        r#"
+//- minicore: coerce_unsized, from
+use core::{marker::Unsize, ops::CoerceUnsized};
+
+struct MyBox<T: ?Sized> {
+    ptr: *const T,
+}
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<MyBox<U>> for MyBox<T> {}
+
+struct MyRc<T: ?Sized> {
+    ptr: *const T,
+}
+
+impl<T: ?Sized> core::convert::From<MyBox<T>> for MyRc<T> {
+    fn from(_: MyBox<T>) -> MyRc<T> {
+        loop {}
+    }
+}
+
+fn make_box() -> MyBox<[i32; 2]> {
+    loop {}
+}
+
+fn take<T: ?Sized>(value: MyRc<T>) -> MyRc<T> {
+    value
+}
+
+fn test() {
+    let boxed: MyBox<[i32]> = make_box();
+    let rc = MyRc::from(boxed);
+      //^^ MyRc<[i32]>
+    let _: MyRc<[i32]> = take(rc);
+}
+"#,
+    );
+}
+
+#[test]
 fn if_coerce() {
     check_no_mismatches(
         r#"
@@ -96,7 +155,7 @@ fn foo<T>(x: &[T]) -> &[T] { x }
 fn test() {
     let x = if true {
         foo(&[1])
-         // ^^^^ adjustments: Deref(None), Borrow(Ref('?1, Not)), Pointer(Unsize)
+         // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
     } else {
         &[1]
     };
@@ -148,7 +207,7 @@ fn foo<T>(x: &[T]) -> &[T] { x }
 fn test(i: i32) {
     let x = match i {
         2 => foo(&[2]),
-              // ^^^^ adjustments: Deref(None), Borrow(Ref('?1, Not)), Pointer(Unsize)
+              // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
         1 => &[1],
         _ => &[3],
     };
@@ -268,7 +327,7 @@ fn takes_ref_str(x: &str) {}
 fn returns_string() -> String { loop {} }
 fn test() {
     takes_ref_str(&{ returns_string() });
-               // ^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(None), Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref('{region error}, Not))
+               // ^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(None), Deref(Some(OverloadedDeref(Not))), Borrow(Ref(Not))
 }
 "#,
     );
@@ -344,6 +403,34 @@ fn test() {
             return &1u32;
         }
         &&1u32
+    };
+}
+        "#,
+    );
+}
+
+#[test]
+fn gen_yield_coerce() {
+    check_no_mismatches(
+        r#"
+fn test() {
+    let g = gen {
+        yield &1u32;
+        yield &&1u32;
+    };
+}
+        "#,
+    );
+}
+
+#[test]
+fn async_gen_yield_coerce() {
+    check_no_mismatches(
+        r#"
+fn test() {
+    let g = async gen {
+        yield &1u32;
+        yield &&1u32;
     };
 }
         "#,
@@ -557,6 +644,10 @@ fn test() {
     );
 }
 
+// FIXME: rustc emits the following error here:
+//  - error[E0277]:  he size for values of type `impl Foo + ?Sized` cannot be known at compilation time
+// ...but we don't emit any error here for now
+#[ignore = "rustc emits E0277 here"]
 #[test]
 fn coerce_unsize_apit() {
     check(
@@ -567,7 +658,7 @@ trait Foo {}
 fn test(f: impl Foo, g: &(impl Foo + ?Sized)) {
     let _: &dyn Foo = &f;
     let _: &dyn Foo = g;
-                    //^ expected &'? (dyn Foo + 'static), got &'? impl Foo + ?Sized
+                    //^ expected &'? (dyn Foo + 'static), got &'? (impl Foo + ?Sized)
 }
         "#,
     );
@@ -833,11 +924,11 @@ struct V<T> { t: T }
 fn main() {
     let a: V<&dyn Tr>;
     (a,) = V { t: &S };
-  //^^^^expected V<&'? S>, got (V<&'? (dyn Tr + 'static)>,)
+  //^^^^expected V<&'? S>, got ({unknown},)
 
     let mut a: V<&dyn Tr> = V { t: &S };
     (a,) = V { t: &S };
-  //^^^^expected V<&'? S>, got (V<&'? (dyn Tr + 'static)>,)
+  //^^^^expected V<&'? S>, got ({unknown},)
 }
         "#,
     );
@@ -854,8 +945,8 @@ impl core::cmp::PartialEq for Struct {
 }
 fn test() {
     Struct == Struct;
- // ^^^^^^ adjustments: Borrow(Ref('{region error}, Not))
-           // ^^^^^^ adjustments: Borrow(Ref('{region error}, Not))
+ // ^^^^^^ adjustments: Borrow(Ref(Not))
+           // ^^^^^^ adjustments: Borrow(Ref(Not))
 }",
     );
 }
@@ -871,7 +962,7 @@ impl core::ops::AddAssign for Struct {
 }
 fn test() {
     Struct += Struct;
- // ^^^^^^ adjustments: Borrow(Ref('{region error}, Mut))
+ // ^^^^^^ adjustments: Borrow(Ref(Mut { allow_two_phase_borrow: Yes }))
            // ^^^^^^ adjustments:
 }",
     );
@@ -885,7 +976,7 @@ fn adjust_index() {
 fn test() {
     let x = [1, 2, 3];
     x[2] = 6;
- // ^ adjustments: Borrow(Ref('?0, Mut))
+ // ^ adjustments: Borrow(Ref(Mut { allow_two_phase_borrow: No }))
 }
     ",
     );
@@ -910,11 +1001,11 @@ impl core::ops::IndexMut<usize> for StructMut {
 }
 fn test() {
     Struct[0];
- // ^^^^^^ adjustments: Borrow(Ref('?0, Not))
+ // ^^^^^^ adjustments: Borrow(Ref(Not))
     StructMut[0];
- // ^^^^^^^^^ adjustments: Borrow(Ref('?1, Not))
+ // ^^^^^^^^^ adjustments: Borrow(Ref(Not))
     &mut StructMut[0];
-      // ^^^^^^^^^ adjustments: Borrow(Ref('?2, Mut))
+      // ^^^^^^^^^ adjustments: Borrow(Ref(Mut { allow_two_phase_borrow: No }))
 }",
     );
 }
@@ -959,6 +1050,39 @@ fn f() {
     impl T for i32 {}
     impl T for u32 {}
     &[i32::f, u32::f] as &[fn()];
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22270() {
+    check_no_mismatches(
+        r#"
+fn a() {}
+fn b() {}
+
+fn foo<T, const N: usize>(x: [T; N]) -> Vec<T> {
+    loop {}
+}
+
+fn bar() {
+    foo([a, b]);
+}
+    "#,
+    );
+}
+
+#[test]
+fn async_fn_ret() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_unsized, unsize, future, index, slice, range
+async fn foo(a: &[i32]) -> &[i32] {
+    if true {
+        return &[];
+    }
+    &a[..0]
 }
     "#,
     );

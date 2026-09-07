@@ -54,7 +54,7 @@ fn parse_pat_ty<'a>(
 }
 
 fn ty_pat(kind: TyPatKind, span: Span) -> TyPat {
-    TyPat { id: DUMMY_NODE_ID, kind, span, tokens: None }
+    TyPat { id: DUMMY_NODE_ID, kind, span }
 }
 
 fn pat_to_ty_pat(cx: &mut ExtCtxt<'_>, pat: ast::Pat) -> TyPat {
@@ -68,6 +68,7 @@ fn pat_to_ty_pat(cx: &mut ExtCtxt<'_>, pat: ast::Pat) -> TyPat {
             TyPatKind::Or(variants.into_iter().map(|pat| pat_to_ty_pat(cx, pat)).collect())
         }
         ast::PatKind::Err(guar) => TyPatKind::Err(guar),
+        ast::PatKind::Paren(p) => pat_to_ty_pat(cx, *p).kind,
         _ => TyPatKind::Err(cx.dcx().span_err(pat.span, "pattern not supported in pattern types")),
     };
     ty_pat(kind, pat.span)

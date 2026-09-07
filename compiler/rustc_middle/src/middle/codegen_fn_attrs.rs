@@ -1,12 +1,16 @@
 use std::borrow::Cow;
 
 use rustc_abi::Align;
-use rustc_hir::attrs::{InlineAttr, InstructionSetAttr, Linkage, OptimizeAttr, RtsanSetting};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_attr_ir::{
+    InlineAttr, InstructionSetAttr, InstrumentFnAttr, Linkage, OptimizeAttr, RtsanSetting,
+};
+use rustc_hir::def_id::DefId;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_span::Symbol;
 use rustc_target::spec::SanitizerSet;
 
-use crate::ty::{InstanceKind, TyCtxt};
+use crate::mono::Visibility;
+use crate::ty::{InstanceKind, ShimKind, TyCtxt};
 
 impl<'tcx> TyCtxt<'tcx> {
     pub fn codegen_instance_attrs(
@@ -31,7 +35,7 @@ impl<'tcx> TyCtxt<'tcx> {
         //
         // A `ClosureOnceShim` with the track_caller attribute does not have a symbol,
         // and therefore can be skipped here.
-        if let InstanceKind::ReifyShim(_, _) = instance_kind
+        if let InstanceKind::Shim(ShimKind::Reify(_, _)) = instance_kind
             && attrs.flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
         {
             if attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) {
@@ -42,16 +46,31 @@ impl<'tcx> TyCtxt<'tcx> {
                 attrs.to_mut().flags.remove(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL);
             }
 
+            if attrs.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM) {
+                attrs.to_mut().flags.remove(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM);
+            }
+
             if attrs.symbol_name.is_some() {
                 attrs.to_mut().symbol_name = None;
             }
+        }
+
+        // Ensure closure shims have the optimization properties of their closure applied to them.
+        if let InstanceKind::Shim(ShimKind::ClosureOnce {
+            call_once: _,
+            closure,
+            track_caller: _,
+        }) = instance_kind
+        {
+            let closure_attrs = self.codegen_fn_attrs(closure);
+            attrs.to_mut().optimize = closure_attrs.optimize;
         }
 
         attrs
     }
 }
 
-#[derive(Clone, TyEncodable, TyDecodable, HashStable, Debug)]
+#[derive(Clone, TyEncodable, TyDecodable, StableHash, Debug)]
 pub struct CodegenFnAttrs {
     pub flags: CodegenFnAttrFlags,
     /// Parsed representation of the `#[inline]` attribute
@@ -62,6 +81,12 @@ pub struct CodegenFnAttrs {
     /// using the `#[export_name = "..."]` or `#[link_name = "..."]` attribute
     /// depending on if this is a function definition or foreign function.
     pub symbol_name: Option<Symbol>,
+    /// Defids of foreign items somewhere that this function should "satisfy".
+    /// i.e., if a foreign function has some symbol foo,
+    /// generate this function under its real name,
+    /// but *also* under the same name as this foreign function so that the foreign function has an implementation.
+    // FIXME: make "SymbolName<'tcx>"
+    pub foreign_item_symbol_aliases: Vec<(DefId, Linkage, Visibility)>,
     /// The `#[link_ordinal = "..."]` attribute, indicating an ordinal an
     /// imported function has in the dynamic library. Note that this must not
     /// be set when `link_name` is set. This is for foreign items with the
@@ -91,15 +116,17 @@ pub struct CodegenFnAttrs {
     // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
     pub alignment: Option<Align>,
     /// The `#[patchable_function_entry(...)]` attribute. Indicates how many nops should be around
-    /// the function entry.
+    /// the function entry, or override default section to record entry location.
     pub patchable_function_entry: Option<PatchableFunctionEntry>,
     /// The `#[rustc_objc_class = "..."]` attribute.
     pub objc_class: Option<Symbol>,
     /// The `#[rustc_objc_selector = "..."]` attribute.
     pub objc_selector: Option<Symbol>,
+    /// The `#[instrument_fn]` attribute.
+    pub instrument_fn: Option<InstrumentFnAttr>,
 }
 
-#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, StableHash, PartialEq, Eq)]
 pub enum TargetFeatureKind {
     /// The feature is implied by another feature, rather than explicitly added by the
     /// `#[target_feature]` attribute
@@ -110,7 +137,7 @@ pub enum TargetFeatureKind {
     Forced,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable, StableHash)]
 pub struct TargetFeature {
     /// The name of the target feature (e.g. "avx")
     pub name: Symbol,
@@ -118,30 +145,39 @@ pub struct TargetFeature {
     pub kind: TargetFeatureKind,
 }
 
-#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, StableHash)]
 pub struct PatchableFunctionEntry {
     /// Nops to prepend to the function
-    prefix: u8,
+    prefix: Option<u8>,
     /// Nops after entry, but before body
-    entry: u8,
+    entry: Option<u8>,
+    /// Optional, specific section to record entry location in
+    section: Option<Symbol>,
 }
 
 impl PatchableFunctionEntry {
-    pub fn from_config(config: rustc_session::config::PatchableFunctionEntry) -> Self {
-        Self { prefix: config.prefix(), entry: config.entry() }
+    pub fn from_prefix_entry_and_section(
+        prefix: Option<u8>,
+        entry: Option<u8>,
+        section: Option<Symbol>,
+    ) -> Self {
+        Self { prefix, entry, section }
     }
     pub fn from_prefix_and_entry(prefix: u8, entry: u8) -> Self {
-        Self { prefix, entry }
+        Self { prefix: Some(prefix), entry: Some(entry), section: None }
     }
-    pub fn prefix(&self) -> u8 {
+    pub fn prefix(&self) -> Option<u8> {
         self.prefix
     }
-    pub fn entry(&self) -> u8 {
+    pub fn entry(&self) -> Option<u8> {
         self.entry
+    }
+    pub fn section(&self) -> Option<Symbol> {
+        self.section
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
+#[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, StableHash)]
 pub struct CodegenFnAttrFlags(u32);
 bitflags::bitflags! {
     impl CodegenFnAttrFlags: u32 {
@@ -190,6 +226,14 @@ bitflags::bitflags! {
         const NO_BUILTINS               = 1 << 15;
         /// Marks foreign items, to make `contains_extern_indicator` cheaper.
         const FOREIGN_ITEM              = 1 << 16;
+        /// `#[rustc_offload_kernel]`: indicates that this is an offload kernel, an extra ptr arg will be added.
+        const OFFLOAD_KERNEL = 1 << 17;
+        /// Externally implementable item symbols act a little like `RUSTC_STD_INTERNAL_SYMBOL`.
+        /// When a crate declares an EII and dependencies expect the symbol to exist,
+        /// they will refer to this symbol name before a definition is given.
+        /// As such, we must make sure these symbols really do exist in the final binary/library.
+        /// This flag is put on both the implementations of EIIs and the foreign item they implement.
+        const EXTERNALLY_IMPLEMENTABLE_ITEM = 1 << 18;
     }
 }
 rustc_data_structures::external_bitflags_debug! { CodegenFnAttrFlags }
@@ -205,6 +249,7 @@ impl CodegenFnAttrs {
             symbol_name: None,
             link_ordinal: None,
             target_features: vec![],
+            foreign_item_symbol_aliases: vec![],
             safe_target_features: false,
             linkage: None,
             import_linkage: None,
@@ -215,6 +260,7 @@ impl CodegenFnAttrs {
             patchable_function_entry: None,
             objc_class: None,
             objc_selector: None,
+            instrument_fn: None,
         }
     }
 
@@ -232,6 +278,11 @@ impl CodegenFnAttrs {
 
         self.flags.contains(CodegenFnAttrFlags::NO_MANGLE)
             || self.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
+            // note: for these we do also set a symbol name so technically also handled by the
+            // condition below. However, I think that regardless these should be treated as extern.
+            || self.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM)
+            // `#[rustc_offload_kernel]`: this item is an externally-launched kernel entry point.
+            || self.flags.contains(CodegenFnAttrFlags::OFFLOAD_KERNEL)
             || self.symbol_name.is_some()
             || match self.linkage {
                 // These are private, so make sure we don't try to consider
@@ -242,13 +293,13 @@ impl CodegenFnAttrs {
     }
 }
 
-#[derive(Clone, Copy, Debug, HashStable, TyEncodable, TyDecodable, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, StableHash, TyEncodable, TyDecodable, Eq, PartialEq)]
 pub struct SanitizerFnAttrs {
     pub disabled: SanitizerSet,
     pub rtsan_setting: RtsanSetting,
 }
 
-impl const Default for SanitizerFnAttrs {
+const impl Default for SanitizerFnAttrs {
     fn default() -> Self {
         Self { disabled: SanitizerSet::empty(), rtsan_setting: RtsanSetting::default() }
     }

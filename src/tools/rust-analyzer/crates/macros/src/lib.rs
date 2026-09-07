@@ -5,7 +5,7 @@ use syn::parse_quote;
 use synstructure::decl_derive;
 
 decl_derive!(
-    [TypeFoldable, attributes(type_foldable)] =>
+    [TypeFoldable, attributes(type_foldable, type_visitable)] =>
     /// Derives `TypeFoldable` for the annotated `struct` or `enum` (`union` is not supported).
     ///
     /// The fold will produce a value of the same struct or enum variant as the input, with
@@ -24,6 +24,9 @@ decl_derive!(
     /// variant is annotated with `#[type_visitable(ignore)]` then that field will not be
     /// visited (and its type is not required to implement `TypeVisitable`).
     type_visitable_derive
+);
+decl_derive!(
+    [GenericTypeVisitable] => generic_type_visitable_derive
 );
 
 fn type_visitable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
@@ -99,8 +102,10 @@ fn type_foldable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::Toke
         vi.construct(|_, index| {
             let bind = &bindings[index];
 
-            // retain value of fields with #[type_foldable(identity)]
-            if has_ignore_attr(&bind.ast().attrs, "type_foldable", "identity") {
+            // retain value of fields with #[type_foldable(identity)] or #[type_visitable(ignore)]
+            if has_ignore_attr(&bind.ast().attrs, "type_foldable", "identity")
+                || has_ignore_attr(&bind.ast().attrs, "type_visitable", "ignore")
+            {
                 bind.to_token_stream()
             } else {
                 quote! {
@@ -115,8 +120,10 @@ fn type_foldable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::Toke
         vi.construct(|_, index| {
             let bind = &bindings[index];
 
-            // retain value of fields with #[type_foldable(identity)]
-            if has_ignore_attr(&bind.ast().attrs, "type_foldable", "identity") {
+            // retain value of fields with #[type_foldable(identity)] or #[type_visitable(ignore)]
+            if has_ignore_attr(&bind.ast().attrs, "type_foldable", "identity")
+                || has_ignore_attr(&bind.ast().attrs, "type_visitable", "ignore")
+            {
                 bind.to_token_stream()
             } else {
                 quote! {
@@ -161,6 +168,33 @@ fn has_ignore_attr(attrs: &[syn::Attribute], name: &'static str, meta: &'static 
     });
 
     ignored
+}
+
+fn generic_type_visitable_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
+    if let syn::Data::Union(_) = s.ast().data {
+        panic!("cannot derive on union")
+    }
+
+    s.add_bounds(synstructure::AddBounds::Fields);
+    s.bind_with(|_| synstructure::BindStyle::Move);
+    s.add_impl_generic(parse_quote!(__V: hir_ty::next_solver::interner::WorldExposer));
+    let body_visit = s.each(|bind| {
+        quote! {
+            ::rustc_type_ir::GenericTypeVisitable::<__V>::generic_visit_with(#bind, __visitor);
+        }
+    });
+
+    s.bound_impl(
+        quote!(::rustc_type_ir::GenericTypeVisitable<__V>),
+        quote! {
+            fn generic_visit_with(
+                &self,
+                __visitor: &mut __V
+            ) {
+                match self { #body_visit }
+            }
+        },
+    )
 }
 
 decl_derive!(

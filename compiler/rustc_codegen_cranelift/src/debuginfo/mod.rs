@@ -19,9 +19,10 @@ use indexmap::IndexSet;
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefIdMap;
+use rustc_middle::ty::Unnormalized;
 use rustc_session::Session;
 use rustc_session::config::DebugInfo;
-use rustc_span::{FileNameDisplayPreference, SourceFileHash, StableSourceFileId};
+use rustc_span::{RemapPathScopeComponents, SourceFileHash, StableSourceFileId};
 use rustc_target::callconv::FnAbi;
 
 pub(crate) use self::emit::{DebugReloc, DebugRelocName};
@@ -42,14 +43,13 @@ pub(crate) struct DebugContext {
     created_files: FxHashMap<(StableSourceFileId, SourceFileHash), FileId>,
     stack_pointer_register: Register,
     namespace_map: DefIdMap<UnitEntryId>,
-    array_size_type: UnitEntryId,
+    array_size_type: Option<UnitEntryId>,
 
-    filename_display_preference: FileNameDisplayPreference,
     embed_source: bool,
 }
 
 pub(crate) struct FunctionDebugContext {
-    entry_id: UnitEntryId,
+    entry_id: Option<UnitEntryId>,
     function_source_loc: (FileId, u64, u64),
     source_loc_set: IndexSet<(FileId, u64, u64)>,
 }
@@ -102,18 +102,18 @@ impl DebugContext {
 
         let mut dwarf = DwarfUnit::new(encoding);
 
-        use rustc_session::config::RemapPathScopeComponents;
-
-        let filename_display_preference =
-            tcx.sess.filename_display_preference(RemapPathScopeComponents::DEBUGINFO);
-
         let producer = producer(tcx.sess);
-        let comp_dir =
-            tcx.sess.opts.working_dir.to_string_lossy(filename_display_preference).to_string();
+        let comp_dir = tcx
+            .sess
+            .source_map()
+            .working_dir()
+            .path(RemapPathScopeComponents::DEBUGINFO)
+            .to_string_lossy();
 
         let (name, file_info) = match tcx.sess.local_crate_source_file() {
             Some(path) => {
-                let name = path.to_string_lossy(filename_display_preference).to_string();
+                let name =
+                    path.path(RemapPathScopeComponents::DEBUGINFO).to_string_lossy().into_owned();
                 (name, None)
             }
             None => (tcx.crate_name(LOCAL_CRATE).to_string(), None),
@@ -137,7 +137,7 @@ impl DebugContext {
 
         {
             let name = dwarf.strings.add(format!("{name}/@/{cgu_name}"));
-            let comp_dir = dwarf.strings.add(comp_dir);
+            let comp_dir = dwarf.strings.add(&*comp_dir);
 
             let root = dwarf.unit.root();
             let root = dwarf.unit.get_mut(root);
@@ -154,18 +154,23 @@ impl DebugContext {
             root.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
         }
 
-        let array_size_type = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_base_type);
-        let array_size_type_entry = dwarf.unit.get_mut(array_size_type);
-        array_size_type_entry.set(
-            gimli::DW_AT_name,
-            AttributeValue::StringRef(dwarf.strings.add("__ARRAY_SIZE_TYPE__")),
-        );
-        array_size_type_entry
-            .set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
-        array_size_type_entry.set(
-            gimli::DW_AT_byte_size,
-            AttributeValue::Udata(isa.frontend_config().pointer_bytes().into()),
-        );
+        let array_size_type = if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            None
+        } else {
+            let array_size_type = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_base_type);
+            let array_size_type_entry = dwarf.unit.get_mut(array_size_type);
+            array_size_type_entry.set(
+                gimli::DW_AT_name,
+                AttributeValue::StringRef(dwarf.strings.add("__ARRAY_SIZE_TYPE__")),
+            );
+            array_size_type_entry
+                .set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
+            array_size_type_entry.set(
+                gimli::DW_AT_byte_size,
+                AttributeValue::Udata(isa.frontend_config().pointer_bytes().into()),
+            );
+            Some(array_size_type)
+        };
 
         Some(DebugContext {
             endian,
@@ -175,7 +180,6 @@ impl DebugContext {
             stack_pointer_register,
             namespace_map: DefIdMap::default(),
             array_size_type,
-            filename_display_preference,
             embed_source,
         })
     }
@@ -217,6 +221,14 @@ impl DebugContext {
     ) -> FunctionDebugContext {
         let (file_id, line, column) = self.get_span_loc(tcx, function_span, function_span);
 
+        if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            return FunctionDebugContext {
+                entry_id: None,
+                function_source_loc: (file_id, line, column),
+                source_loc_set: IndexSet::new(),
+            };
+        }
+
         let scope = self.item_namespace(tcx, tcx.parent(instance.def_id()));
 
         let mut name = String::new();
@@ -231,9 +243,12 @@ impl DebugContext {
         let generics = tcx.generics_of(enclosing_fn_def_id);
         let args = instance.args.truncate_to(tcx, generics);
 
-        type_names::push_generic_params(
+        type_names::push_generic_args(
             tcx,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), args),
+            tcx.normalize_erasing_regions(
+                ty::TypingEnv::fully_monomorphized(),
+                Unnormalized::new_wip(args),
+            ),
             &mut name,
         );
 
@@ -274,7 +289,7 @@ impl DebugContext {
         }
 
         FunctionDebugContext {
-            entry_id,
+            entry_id: Some(entry_id),
             function_source_loc: (file_id, line, column),
             source_loc_set: IndexSet::new(),
         }
@@ -288,6 +303,10 @@ impl DebugContext {
         def_id: DefId,
         data_id: DataId,
     ) {
+        if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            return;
+        }
+
         let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else { bug!() };
         if nested {
             return;
@@ -353,10 +372,12 @@ impl FunctionDebugContext {
             .0
             .push(Range::StartLength { begin: address_for_func(func_id), length: u64::from(end) });
 
-        let func_entry = debug_context.dwarf.unit.get_mut(self.entry_id);
-        // Gdb requires both DW_AT_low_pc and DW_AT_high_pc. Otherwise the DW_TAG_subprogram is skipped.
-        func_entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
-        // Using Udata for DW_AT_high_pc requires at least DWARF4
-        func_entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(end)));
+        if let Some(entry_id) = self.entry_id {
+            let entry = debug_context.dwarf.unit.get_mut(entry_id);
+            // Gdb requires both DW_AT_low_pc and DW_AT_high_pc. Otherwise the DW_TAG_subprogram is skipped.
+            entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
+            // Using Udata for DW_AT_high_pc requires at least DWARF4
+            entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(end)));
+        }
     }
 }

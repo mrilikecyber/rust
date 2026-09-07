@@ -1,5 +1,10 @@
 //! cfg defines conditional compiling options, `cfg` attribute parser and evaluator
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 mod cfg_expr;
 mod dnf;
 #[cfg(test)]
@@ -217,7 +222,7 @@ impl fmt::Display for CfgDiff {
             for (i, atom) in self.disable.iter().enumerate() {
                 let sep = match i {
                     0 => "",
-                    _ if i == self.enable.len() - 1 => " and ",
+                    _ if i == self.disable.len() - 1 => " and ",
                     _ => ", ",
                 };
                 f.write_str(sep)?;

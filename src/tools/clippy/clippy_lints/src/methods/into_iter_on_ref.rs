@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::ty::has_iter_method;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -20,7 +20,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, method_span: Spa
             cx,
             INTO_ITER_ON_REF,
             method_span,
-            format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`",),
+            format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`"),
             "call directly",
             method_name.to_string(),
             Applicability::MachineApplicable,

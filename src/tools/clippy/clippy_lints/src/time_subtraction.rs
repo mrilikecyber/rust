@@ -1,15 +1,17 @@
+use std::time::Duration;
+
 use clippy_config::Conf;
-use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
+use clippy_utils::diagnostics::{span_lint_and_note, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::sugg::Sugg;
+use clippy_utils::sym;
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_hir::{BinOpKind, Expr, ExprKind, QPath};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::Ty;
-use rustc_session::impl_lint_pass;
-use rustc_span::source_map::Spanned;
-use rustc_span::sym;
+use rustc_span::SyntaxContext;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -70,76 +72,73 @@ declare_clippy_lint! {
     "finds unchecked subtraction involving 'Duration' or 'Instant'"
 }
 
+impl_lint_pass!(UncheckedTimeSubtraction => [
+    MANUAL_INSTANT_ELAPSED,
+    UNCHECKED_TIME_SUBTRACTION,
+]);
+
 pub struct UncheckedTimeSubtraction {
     msrv: Msrv,
 }
 
 impl UncheckedTimeSubtraction {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
-impl_lint_pass!(UncheckedTimeSubtraction => [MANUAL_INSTANT_ELAPSED, UNCHECKED_TIME_SUBTRACTION]);
-
 impl LateLintPass<'_> for UncheckedTimeSubtraction {
     fn check_expr(&mut self, cx: &LateContext<'_>, expr: &'_ Expr<'_>) {
-        if let ExprKind::Binary(
-            Spanned {
-                node: BinOpKind::Sub, ..
-            },
-            lhs,
-            rhs,
-        ) = expr.kind
-        {
-            let typeck = cx.typeck_results();
-            let lhs_ty = typeck.expr_ty(lhs);
-            let rhs_ty = typeck.expr_ty(rhs);
+        let (lhs, rhs) = match expr.kind {
+            ExprKind::Binary(op, lhs, rhs) if matches!(op.node, BinOpKind::Sub,) => (lhs, rhs),
+            ExprKind::MethodCall(_, lhs, [rhs], _) if cx.ty_based_def(expr).is_diag_item(cx, sym::sub) => (lhs, rhs),
+            _ => return,
+        };
+        let typeck = cx.typeck_results();
+        let lhs_name = typeck.expr_ty(lhs).opt_diag_name(cx);
+        let rhs_name = typeck.expr_ty(rhs).opt_diag_name(cx);
 
-            if lhs_ty.is_diag_item(cx, sym::Instant) {
-                // Instant::now() - instant
-                if is_instant_now_call(cx, lhs)
-                    && rhs_ty.is_diag_item(cx, sym::Instant)
-                    && let Some(sugg) = Sugg::hir_opt(cx, rhs)
-                {
-                    print_manual_instant_elapsed_sugg(cx, expr, sugg);
-                }
-                // instant - duration
-                else if rhs_ty.is_diag_item(cx, sym::Duration)
-                    && !expr.span.from_expansion()
-                    && self.msrv.meets(cx, msrvs::TRY_FROM)
-                {
-                    // For chained subtraction like (instant - dur1) - dur2, avoid suggestions
-                    if is_chained_time_subtraction(cx, lhs) {
-                        span_lint(
-                            cx,
-                            UNCHECKED_TIME_SUBTRACTION,
-                            expr.span,
-                            "unchecked subtraction of a 'Duration' from an 'Instant'",
-                        );
-                    } else {
-                        // instant - duration
-                        print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
-                    }
-                }
-            } else if lhs_ty.is_diag_item(cx, sym::Duration)
-                && rhs_ty.is_diag_item(cx, sym::Duration)
+        if lhs_name == Some(sym::Instant) {
+            // Instant::now() - instant
+            if is_instant_now_call(cx, lhs) && rhs_name == Some(sym::Instant) {
+                print_manual_instant_elapsed_sugg(cx, expr, rhs);
+            }
+            // instant - duration
+            else if rhs_name == Some(sym::Duration)
                 && !expr.span.from_expansion()
                 && self.msrv.meets(cx, msrvs::TRY_FROM)
             {
-                // For chained subtraction like (dur1 - dur2) - dur3, avoid suggestions
-                if is_chained_time_subtraction(cx, lhs) {
-                    span_lint(
-                        cx,
-                        UNCHECKED_TIME_SUBTRACTION,
-                        expr.span,
-                        "unchecked subtraction between 'Duration' values",
-                    );
-                } else {
-                    // duration - duration
-                    print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
-                }
+                print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
             }
+        }
+        // duration - duration
+        else if lhs_name == Some(sym::Duration)
+            && rhs_name == Some(sym::Duration)
+            && !expr.span.from_expansion()
+            && self.msrv.meets(cx, msrvs::TRY_FROM)
+        {
+            let const_eval = ConstEvalCtxt::new(cx);
+            let ctxt = expr.span.ctxt();
+            if let Some(lhs) = const_eval_duration(&const_eval, lhs, ctxt)
+                && let Some(rhs) = const_eval_duration(&const_eval, rhs, ctxt)
+            {
+                if lhs >= rhs {
+                    // If the duration subtraction can be proven to not underflow, then we don't lint
+                    return;
+                }
+
+                span_lint_and_note(
+                    cx,
+                    UNCHECKED_TIME_SUBTRACTION,
+                    expr.span,
+                    "unchecked subtraction of two `Duration` that will underflow",
+                    None,
+                    "if this is intentional, consider allowing the lint",
+                );
+                return;
+            }
+
+            print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
         }
     }
 }
@@ -170,10 +169,12 @@ fn is_chained_time_subtraction(cx: &LateContext<'_>, lhs: &Expr<'_>) -> bool {
 
 /// Returns true if the type is Duration or Instant
 fn is_time_type(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
-    ty.is_diag_item(cx, sym::Duration) || ty.is_diag_item(cx, sym::Instant)
+    matches!(ty.opt_diag_name(cx), Some(sym::Duration | sym::Instant))
 }
 
-fn print_manual_instant_elapsed_sugg(cx: &LateContext<'_>, expr: &Expr<'_>, sugg: Sugg<'_>) {
+fn print_manual_instant_elapsed_sugg(cx: &LateContext<'_>, expr: &Expr<'_>, rhs: &Expr<'_>) {
+    let mut applicability = Applicability::MachineApplicable;
+    let sugg = Sugg::hir_with_context(cx, rhs, expr.span.ctxt(), "<instant>", &mut applicability);
     span_lint_and_sugg(
         cx,
         MANUAL_INSTANT_ELAPSED,
@@ -181,7 +182,7 @@ fn print_manual_instant_elapsed_sugg(cx: &LateContext<'_>, expr: &Expr<'_>, sugg
         "manual implementation of `Instant::elapsed`",
         "try",
         format!("{}.elapsed()", sugg.maybe_paren()),
-        Applicability::MachineApplicable,
+        applicability,
     );
 }
 
@@ -191,26 +192,68 @@ fn print_unchecked_duration_subtraction_sugg(
     right_expr: &Expr<'_>,
     expr: &Expr<'_>,
 ) {
-    let typeck = cx.typeck_results();
-    let left_ty = typeck.expr_ty(left_expr);
-
-    let lint_msg = if left_ty.is_diag_item(cx, sym::Instant) {
-        "unchecked subtraction of a 'Duration' from an 'Instant'"
-    } else {
-        "unchecked subtraction between 'Duration' values"
-    };
-
-    let mut applicability = Applicability::MachineApplicable;
-    let left_sugg = Sugg::hir_with_applicability(cx, left_expr, "<left>", &mut applicability);
-    let right_sugg = Sugg::hir_with_applicability(cx, right_expr, "<right>", &mut applicability);
-
-    span_lint_and_sugg(
+    span_lint_and_then(
         cx,
         UNCHECKED_TIME_SUBTRACTION,
         expr.span,
-        lint_msg,
-        "try",
-        format!("{}.checked_sub({}).unwrap()", left_sugg.maybe_paren(), right_sugg),
-        applicability,
+        "unchecked subtraction of a `Duration`",
+        |diag| {
+            // For chained subtraction, like `(dur1 - dur2) - dur3` or `(instant - dur1) - dur2`,
+            // avoid suggestions
+            if !is_chained_time_subtraction(cx, left_expr) {
+                let mut applicability = Applicability::MachineApplicable;
+                let left_sugg = Sugg::hir_with_context(cx, left_expr, expr.span.ctxt(), "<left>", &mut applicability);
+                let right_sugg =
+                    Sugg::hir_with_context(cx, right_expr, expr.span.ctxt(), "<right>", &mut applicability);
+
+                diag.span_suggestion(
+                    expr.span,
+                    "try",
+                    format!("{}.checked_sub({}).unwrap()", left_sugg.maybe_paren(), right_sugg),
+                    applicability,
+                );
+            }
+        },
     );
+}
+
+fn const_eval_duration(const_eval: &ConstEvalCtxt<'_>, expr: &Expr<'_>, ctxt: SyntaxContext) -> Option<Duration> {
+    if let ExprKind::Call(func, args) = expr.kind
+        && let ExprKind::Path(QPath::TypeRelative(_, func_name)) = func.kind
+    {
+        macro_rules! try_parse_duration {
+            (($( $name:ident : $var:ident ( $ty:ty ) ),+ $(,)?) -> $ctor:ident ( $($args:tt)* )) => {{
+                let [$( $name ),+] = args else { return None };
+                $(
+                    let Some(Constant::$var(v)) = const_eval.eval_local($name, ctxt) else { return None };
+                    let $name = <$ty>::try_from(v).ok()?;
+                )+
+                Some(Duration::$ctor($($args)*))
+            }};
+        }
+
+        return match func_name.ident.name {
+            sym::new => try_parse_duration! { (secs: Int(u64), nanos: Int(u32)) -> new(secs, nanos) },
+            sym::from_nanos => try_parse_duration! { (nanos: Int(u64)) -> from_nanos(nanos) },
+            sym::from_nanos_u128 => try_parse_duration! { (nanos: Int(u128)) -> from_nanos_u128(nanos) },
+            sym::from_micros => try_parse_duration! { (micros: Int(u64)) -> from_micros(micros) },
+            sym::from_millis => try_parse_duration! { (millis: Int(u64)) -> from_millis(millis) },
+            sym::from_secs => try_parse_duration! { (secs: Int(u64)) -> from_secs(secs) },
+            sym::from_secs_f32 => try_parse_duration! { (secs: F32(f32)) -> from_secs_f32(secs) },
+            sym::from_secs_f64 => try_parse_duration! { (secs: F64(f64)) -> from_secs_f64(secs) },
+            sym::from_mins => try_parse_duration! { (mins: Int(u64)) -> from_mins(mins) },
+            sym::from_hours => {
+                try_parse_duration! { (hours: Int(u64)) -> from_hours(hours) }
+            },
+            sym::from_days => {
+                try_parse_duration! { (days: Int(u64)) -> from_hours(days * 24) }
+            },
+            sym::from_weeks => {
+                try_parse_duration! { (weeks: Int(u64)) -> from_hours(weeks * 24 * 7) }
+            },
+            _ => None,
+        };
+    }
+
+    None
 }

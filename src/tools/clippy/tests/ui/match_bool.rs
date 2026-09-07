@@ -1,5 +1,5 @@
-#![deny(clippy::match_bool)]
-#![allow(clippy::nonminimal_bool, clippy::eq_op)]
+#![warn(clippy::match_bool)]
+#![expect(clippy::eq_op, clippy::nonminimal_bool)]
 
 fn match_bool() {
     let test: bool = true;
@@ -124,6 +124,21 @@ fn issue15351() {
         false => println!("foo"),
         e => println!("{e}"),
     }
+}
+
+fn wrongly_unmangled_macros() {
+    macro_rules! test_expr {
+        ($val:expr) => {
+            ($val + 1) > 0
+        };
+    }
+
+    let x = 5;
+    match test_expr!(x) {
+        //~^ match_bool
+        true => 1,
+        false => 0,
+    };
 }
 
 fn main() {}

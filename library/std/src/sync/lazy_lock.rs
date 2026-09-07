@@ -105,15 +105,6 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
         LazyLock { once: Once::new(), data: UnsafeCell::new(Data { f: ManuallyDrop::new(f) }) }
     }
 
-    /// Creates a new lazy value that is already initialized.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn preinit(value: T) -> LazyLock<T, F> {
-        let once = Once::new();
-        once.call_once(|| {});
-        LazyLock { once, data: UnsafeCell::new(Data { value: ManuallyDrop::new(value) }) }
-    }
-
     /// Consumes this `LazyLock` returning the stored value.
     ///
     /// Returns `Ok(value)` if `Lazy` is initialized and `Err(f)` otherwise.
@@ -172,7 +163,6 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
     /// use std::sync::LazyLock;
     ///
     /// let mut lazy = LazyLock::new(|| 92);
@@ -183,7 +173,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn force_mut(this: &mut LazyLock<T, F>) -> &mut T {
         #[cold]
         /// # Safety
@@ -247,6 +237,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn force(this: &LazyLock<T, F>) -> &T {
         this.once.call_once_force(|state| {
             if state.is_poisoned() {
@@ -267,7 +258,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
         // * the closure was not called, but a previous call initialized `value`.
         // * the closure was not called because the Once is poisoned, which we handled above.
         // So `value` has definitely been initialized and will not be modified again.
-        unsafe { &*(*this.data.get()).value }
+        unsafe { &(*this.data.get()).value }
     }
 }
 
@@ -278,8 +269,6 @@ impl<T, F> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::sync::LazyLock;
     ///
     /// let mut lazy = LazyLock::new(|| 92);
@@ -290,7 +279,7 @@ impl<T, F> LazyLock<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn get_mut(this: &mut LazyLock<T, F>) -> Option<&mut T> {
         // `state()` does not perform an atomic load, so prefer it over `is_complete()`.
         let state = this.once.state();
@@ -308,8 +297,6 @@ impl<T, F> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::sync::LazyLock;
     ///
     /// let lazy = LazyLock::new(|| 92);
@@ -319,7 +306,8 @@ impl<T, F> LazyLock<T, F> {
     /// assert_eq!(LazyLock::get(&lazy), Some(&92));
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn get(this: &LazyLock<T, F>) -> Option<&T> {
         if this.once.is_completed() {
             // SAFETY:
@@ -387,7 +375,8 @@ impl<T, F: FnOnce() -> T> DerefMut for LazyLock<T, F> {
 }
 
 #[stable(feature = "lazy_cell", since = "1.80.0")]
-impl<T: Default> Default for LazyLock<T> {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl<T: Default> Default for LazyLock<T> {
     /// Creates a new lazy value using `Default` as the initializing function.
     #[inline]
     fn default() -> LazyLock<T> {
@@ -404,6 +393,19 @@ impl<T: fmt::Debug, F> fmt::Debug for LazyLock<T, F> {
             None => d.field(&format_args!("<uninit>")),
         };
         d.finish()
+    }
+}
+
+#[stable(feature = "from_wrapper_impls", since = "1.96.0")]
+impl<T, F> From<T> for LazyLock<T, F> {
+    /// Constructs a `LazyLock` that starts already initialized
+    /// with the provided value.
+    #[inline]
+    fn from(value: T) -> Self {
+        LazyLock {
+            once: Once::new_complete(),
+            data: UnsafeCell::new(Data { value: ManuallyDrop::new(value) }),
+        }
     }
 }
 

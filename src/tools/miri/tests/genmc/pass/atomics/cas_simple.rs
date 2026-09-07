@@ -1,5 +1,3 @@
-//@compile-flags: -Zmiri-genmc -Zmiri-disable-stacked-borrows
-
 // Test the basic functionality of compare_exchange.
 
 #![no_main]
@@ -30,5 +28,10 @@ fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     if 2 != VALUE.load(SeqCst) {
         std::process::abort()
     }
+
+    // Check that we emit warnings for cases that are not fully supported.
+    let _ = VALUE.compare_exchange(99, 99, SeqCst, Relaxed);
+    let _ = VALUE.compare_exchange_weak(99, 99, Relaxed, SeqCst);
+
     0
 }

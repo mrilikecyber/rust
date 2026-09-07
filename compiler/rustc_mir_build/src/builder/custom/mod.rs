@@ -60,8 +60,8 @@ pub(super) fn build_custom_mir<'tcx>(
         tainted_by_errors: None,
         injection_phase: None,
         pass_count: 0,
-        coverage_info_hi: None,
-        function_coverage_info: None,
+        coverage_early_info: None,
+        coverage_mir_info: None,
     };
 
     body.local_decls.push(LocalDecl::new(return_ty, return_ty_span));
@@ -85,7 +85,7 @@ pub(super) fn build_custom_mir<'tcx>(
         block_map: FxHashMap::default(),
     };
 
-    let res: PResult<_> = try {
+    let res = try {
         pctxt.parse_args(params)?;
         pctxt.parse_body(expr)?;
     };

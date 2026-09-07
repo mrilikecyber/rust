@@ -7,16 +7,16 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{InferKind, Visitor, VisitorExt, walk_ty};
+use rustc_hir::intravisit::{InferKind, Visitor, VisitorExt as _, walk_ty};
 use rustc_hir::{
     self as hir, AmbigArg, Expr, ExprKind, FnRetTy, FnSig, GenericArgsParentheses, GenericParamKind, HirId, Impl,
-    ImplItemImplKind, ImplItemKind, Item, ItemKind, Pat, PatExpr, PatExprKind, PatKind, Path, QPath, Ty, TyKind,
+    ImplItemImplKind, ImplItemKind, Item, ItemKind, Node, Pat, PatExpr, PatExprKind, PatKind, Path, QPath, Ty, TyKind,
 };
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::Ty as MiddleTy;
-use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use std::iter;
+use std::ops::ControlFlow;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -55,6 +55,8 @@ declare_clippy_lint! {
     "unnecessary structure name repetition whereas `Self` is applicable"
 }
 
+impl_lint_pass!(UseSelf => [USE_SELF]);
+
 pub struct UseSelf {
     msrv: Msrv,
     stack: Vec<StackItem>,
@@ -64,7 +66,7 @@ pub struct UseSelf {
 impl UseSelf {
     pub fn new(conf: &'static Conf) -> Self {
         Self {
-            msrv: conf.msrv,
+            msrv: conf.msrv.into(),
             stack: Vec::new(),
             recursive_self_in_type_definitions: conf.recursive_self_in_type_definitions,
         }
@@ -79,8 +81,6 @@ enum StackItem {
     },
     NoCheck,
 }
-
-impl_lint_pass!(UseSelf => [USE_SELF]);
 
 const SEGMENTS_MSG: &str = "segments should be composed of at least 1 element";
 
@@ -152,7 +152,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
             let impl_trait_ref = cx.tcx.impl_trait_ref(impl_id);
             // `self_ty` is the semantic self type of `impl <trait> for <type>`. This cannot be
             // `Self`.
-            let self_ty = impl_trait_ref.instantiate_identity().self_ty();
+            let self_ty = impl_trait_ref.instantiate_identity().skip_norm_wip().self_ty();
 
             // `trait_method_sig` is the signature of the function, how it is declared in the
             // trait, not in the impl of the trait.
@@ -160,7 +160,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
                 .tcx
                 .trait_item_of(impl_item.owner_id)
                 .expect("impl method matches a trait method");
-            let trait_method_sig = cx.tcx.fn_sig(trait_method).instantiate_identity();
+            let trait_method_sig = cx.tcx.fn_sig(trait_method).instantiate_identity().skip_norm_wip();
             let trait_method_sig = cx.tcx.instantiate_bound_regions_with_erased(trait_method_sig);
 
             // `impl_inputs_outputs` is an iterator over the types (`hir::Ty`) declared in the
@@ -213,9 +213,10 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
                 path.res,
                 Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } | Res::Def(DefKind::TyParam, _)
             )
+            && !ty_is_in_generic_args(cx, hir_ty)
             && !types_to_skip.contains(&hir_ty.hir_id)
             && let ty = ty_from_hir_ty(cx, hir_ty.as_unambig_ty())
-            && let impl_ty = cx.tcx.type_of(impl_id).instantiate_identity()
+            && let impl_ty = cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip()
             && same_type_modulo_regions(ty, impl_ty)
             // Ensure the type we encounter and the one from the impl have the same lifetime parameters. It may be that
             // the lifetime parameters of `ty` are elided (`impl<'a> Foo<'a> { fn new() -> Self { Foo{..} } }`), in
@@ -230,7 +231,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
     fn check_expr(&mut self, cx: &LateContext<'_>, expr: &Expr<'_>) {
         if !expr.span.from_expansion()
             && let Some(&StackItem::Check { impl_id, .. }) = self.stack.last()
-            && cx.typeck_results().expr_ty(expr) == cx.tcx.type_of(impl_id).instantiate_identity()
+            && cx.typeck_results().expr_ty(expr) == cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip()
             && self.msrv.meets(cx, msrvs::TYPE_ALIAS_ENUM_VARIANTS)
         {
             match expr.kind {
@@ -253,7 +254,7 @@ impl<'tcx> LateLintPass<'tcx> for UseSelf {
             && let PatKind::Expr(&PatExpr { kind: PatExprKind::Path(QPath::Resolved(_, path)), .. })
                  | PatKind::TupleStruct(QPath::Resolved(_, path), _, _)
                  | PatKind::Struct(QPath::Resolved(_, path), _, _) = pat.kind
-            && cx.typeck_results().pat_ty(pat) == cx.tcx.type_of(impl_id).instantiate_identity()
+            && cx.typeck_results().pat_ty(pat) == cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip()
             && self.msrv.meets(cx, msrvs::TYPE_ALIAS_ENUM_VARIANTS)
         {
             check_path(cx, path);
@@ -310,6 +311,38 @@ fn lint_path_to_variant(cx: &LateContext<'_>, path: &Path<'_>) {
             .with_hi(self_seg.args().span_ext().unwrap_or(self_seg.ident.span).hi());
         span_lint(cx, span);
     }
+}
+
+fn ty_is_in_generic_args<'tcx>(cx: &LateContext<'tcx>, hir_ty: &Ty<'tcx, AmbigArg>) -> bool {
+    cx.tcx.hir_parent_iter(hir_ty.hir_id).any(|(_, parent)| {
+        matches!(parent, Node::ImplItem(impl_item) if impl_item.generics.params.iter().any(|param| {
+            let GenericParamKind::Const { ty: const_ty, .. } = &param.kind else {
+                return false;
+            };
+            ty_contains_ty(const_ty, hir_ty)
+        }))
+    })
+}
+
+fn ty_contains_ty<'tcx>(outer: &Ty<'tcx>, inner: &Ty<'tcx, AmbigArg>) -> bool {
+    struct ContainsVisitor<'tcx> {
+        inner: &'tcx Ty<'tcx, AmbigArg>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for ContainsVisitor<'tcx> {
+        type Result = ControlFlow<()>;
+
+        fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) -> Self::Result {
+            if t.hir_id == self.inner.hir_id {
+                return ControlFlow::Break(());
+            }
+
+            walk_ty(self, t)
+        }
+    }
+
+    let mut visitor = ContainsVisitor { inner };
+    visitor.visit_ty_unambig(outer).is_break()
 }
 
 /// Checks whether types `a` and `b` have the same lifetime parameters.

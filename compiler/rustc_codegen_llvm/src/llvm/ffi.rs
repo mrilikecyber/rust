@@ -22,9 +22,8 @@ use libc::{c_char, c_int, c_uchar, c_uint, c_ulonglong, c_void, size_t};
 
 use super::RustString;
 use super::debuginfo::{
-    DIArray, DIBuilder, DIDerivedType, DIDescriptor, DIEnumerator, DIFile, DIFlags, DILocation,
-    DISPFlags, DIScope, DISubprogram, DITemplateTypeParameter, DIType, DebugEmissionKind,
-    DebugNameTableKind,
+    DIArray, DIBuilder, DIDerivedType, DIDescriptor, DIFile, DIFlags, DILocation, DISPFlags,
+    DIScope, DISubprogram, DITemplateTypeParameter, DIType, DebugEmissionKind, DebugNameTableKind,
 };
 use crate::llvm::MetadataKindId;
 use crate::{TryFromU32, llvm};
@@ -166,7 +165,9 @@ pub(crate) enum CallConv {
     ColdCallConv = 9,
     PreserveMost = 14,
     PreserveAll = 15,
+    SwiftCallConv = 16,
     Tail = 18,
+    PreserveNone = 21,
     X86StdcallCallConv = 64,
     X86FastcallCallConv = 65,
     ArmAapcsCallConv = 67,
@@ -238,6 +239,30 @@ pub(crate) enum DLLStorageClass {
     DllExport = 2, // Function to be accessible from DLL.
 }
 
+/// Must match the layout of `llvm::UWTableKind`.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub(crate) enum UWTableKind {
+    /// No unwind table requested
+    None = 0,
+    /// "Synchronous" unwind tables
+    Sync = 1,
+    /// "Asynchronous" unwind tables (instr precise)
+    Async = 2,
+}
+
+/// Must match the layout of `llvm::FramePointerKind`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "Some variants are unused, but are kept to match LLVM")]
+pub(crate) enum FramePointerKind {
+    None = 0,
+    NonLeaf = 1,
+    All = 2,
+    Reserved = 3,
+    NonLeafNoReserve = 4,
+}
+
 /// Must match the layout of `LLVMRustAttributeKind`.
 /// Semantically a subset of the C++ enum llvm::Attribute::AttrKind,
 /// though it is not ABI compatible (since it's a C++ enum)
@@ -292,6 +317,8 @@ pub(crate) enum AttributeKind {
     CapturesNone = 46,
     SanitizeRealtimeNonblocking = 47,
     SanitizeRealtimeBlocking = 48,
+    Convergent = 49,
+    NoFree = 50,
 }
 
 /// LLVMIntPredicate
@@ -361,33 +388,6 @@ pub(crate) enum TypeKind {
     ScalableVector = 17,
     BFloat = 18,
     X86_AMX = 19,
-}
-
-impl TypeKind {
-    pub(crate) fn to_generic(self) -> rustc_codegen_ssa::common::TypeKind {
-        use rustc_codegen_ssa::common::TypeKind as Common;
-        match self {
-            Self::Void => Common::Void,
-            Self::Half => Common::Half,
-            Self::Float => Common::Float,
-            Self::Double => Common::Double,
-            Self::X86_FP80 => Common::X86_FP80,
-            Self::FP128 => Common::FP128,
-            Self::PPC_FP128 => Common::PPC_FP128,
-            Self::Label => Common::Label,
-            Self::Integer => Common::Integer,
-            Self::Function => Common::Function,
-            Self::Struct => Common::Struct,
-            Self::Array => Common::Array,
-            Self::Pointer => Common::Pointer,
-            Self::Vector => Common::Vector,
-            Self::Metadata => Common::Metadata,
-            Self::Token => Common::Token,
-            Self::ScalableVector => Common::ScalableVector,
-            Self::BFloat => Common::BFloat,
-            Self::X86_AMX => Common::X86_AMX,
-        }
-    }
 }
 
 /// LLVMAtomicRmwBinOp
@@ -490,6 +490,8 @@ pub(crate) struct SanitizerOptions {
     pub sanitize_hwaddress_recover: bool,
     pub sanitize_kernel_address: bool,
     pub sanitize_kernel_address_recover: bool,
+    pub sanitize_kernel_hwaddress: bool,
+    pub sanitize_kernel_hwaddress_recover: bool,
 }
 
 /// LLVMRustRelocModel
@@ -562,9 +564,6 @@ pub(crate) enum DiagnosticLevel {
 unsafe extern "C" {
     // LLVMRustThinLTOData
     pub(crate) type ThinLTOData;
-
-    // LLVMRustThinLTOBuffer
-    pub(crate) type ThinLTOBuffer;
 }
 
 /// LLVMRustThinLTOModule
@@ -738,12 +737,9 @@ unsafe extern "C" {
 pub(crate) type DiagnosticHandlerTy = unsafe extern "C" fn(&DiagnosticInfo, *mut c_void);
 
 pub(crate) mod debuginfo {
-    use std::ptr;
-
     use bitflags::bitflags;
 
     use super::{InvariantOpaque, Metadata};
-    use crate::llvm::{self, Module};
 
     /// Opaque target type for references to an LLVM debuginfo builder.
     ///
@@ -755,33 +751,6 @@ pub(crate) mod debuginfo {
     /// session (`'ll`) that it participates in.
     #[repr(C)]
     pub(crate) struct DIBuilder<'ll>(InvariantOpaque<'ll>);
-
-    /// Owning pointer to a `DIBuilder<'ll>` that will dispose of the builder
-    /// when dropped. Use `.as_ref()` to get the underlying `&DIBuilder`
-    /// needed for debuginfo FFI calls.
-    pub(crate) struct DIBuilderBox<'ll> {
-        raw: ptr::NonNull<DIBuilder<'ll>>,
-    }
-
-    impl<'ll> DIBuilderBox<'ll> {
-        pub(crate) fn new(llmod: &'ll Module) -> Self {
-            let raw = unsafe { llvm::LLVMCreateDIBuilder(llmod) };
-            let raw = ptr::NonNull::new(raw).unwrap();
-            Self { raw }
-        }
-
-        pub(crate) fn as_ref(&self) -> &DIBuilder<'ll> {
-            // SAFETY: This is an owning pointer, so `&DIBuilder` is valid
-            // for as long as `&self` is.
-            unsafe { self.raw.as_ref() }
-        }
-    }
-
-    impl<'ll> Drop for DIBuilderBox<'ll> {
-        fn drop(&mut self) {
-            unsafe { llvm::LLVMDisposeDIBuilder(self.raw) };
-        }
-    }
 
     pub(crate) type DIDescriptor = Metadata;
     pub(crate) type DILocation = Metadata;
@@ -795,7 +764,6 @@ pub(crate) mod debuginfo {
     pub(crate) type DICompositeType = DIDerivedType;
     pub(crate) type DIVariable = DIDescriptor;
     pub(crate) type DIArray = DIDescriptor;
-    pub(crate) type DIEnumerator = DIDescriptor;
     pub(crate) type DITemplateTypeParameter = DIDescriptor;
 
     bitflags! {
@@ -904,7 +872,7 @@ bitflags! {
 }
 
 unsafe extern "C" {
-    pub(crate) type ModuleBuffer;
+    pub(crate) type Buffer;
 }
 
 pub(crate) type SelfProfileBeforePassCallback =
@@ -926,6 +894,8 @@ unsafe extern "C" {
         SLen: c_uint,
     ) -> MetadataKindId;
 
+    pub(crate) fn LLVMGetVersion(major: &mut c_uint, minor: &mut c_uint, patch: &mut c_uint);
+
     pub(crate) fn LLVMDisposeTargetMachine(T: ptr::NonNull<TargetMachine>);
 
     // Create modules.
@@ -938,13 +908,6 @@ unsafe extern "C" {
     /// Data layout. See Module::getDataLayout.
     pub(crate) fn LLVMGetDataLayoutStr(M: &Module) -> *const c_char;
     pub(crate) fn LLVMSetDataLayout(M: &Module, Triple: *const c_char);
-
-    /// Append inline assembly to a module. See `Module::appendModuleInlineAsm`.
-    pub(crate) fn LLVMAppendModuleInlineAsm(
-        M: &Module,
-        Asm: *const c_uchar, // See "PTR_LEN_STR".
-        Len: size_t,
-    );
 
     /// Create the specified uniqued inline asm string. See `InlineAsm::get()`.
     pub(crate) fn LLVMGetInlineAsm<'ll>(
@@ -977,6 +940,9 @@ unsafe extern "C" {
     pub(crate) fn LLVMDoubleTypeInContext(C: &Context) -> &Type;
     pub(crate) fn LLVMFP128TypeInContext(C: &Context) -> &Type;
 
+    // Operations on non-IEEE real types
+    pub(crate) fn LLVMBFloatTypeInContext(C: &Context) -> &Type;
+
     // Operations on function types
     pub(crate) fn LLVMFunctionType<'a>(
         ReturnType: &'a Type,
@@ -986,6 +952,8 @@ unsafe extern "C" {
     ) -> &'a Type;
     pub(crate) fn LLVMCountParamTypes(FunctionTy: &Type) -> c_uint;
     pub(crate) fn LLVMGetParamTypes<'a>(FunctionTy: &'a Type, Dest: *mut &'a Type);
+    pub(crate) fn LLVMGetReturnType(FunctionTy: &Type) -> &Type;
+    pub(crate) fn LLVMIsFunctionVarArg(FunctionTy: &Type) -> Bool;
 
     // Operations on struct types
     pub(crate) fn LLVMStructTypeInContext<'a>(
@@ -998,6 +966,7 @@ unsafe extern "C" {
     // Operations on array, pointer, and vector types (sequence types)
     pub(crate) safe fn LLVMPointerTypeInContext(C: &Context, AddressSpace: c_uint) -> &Type;
     pub(crate) fn LLVMVectorType(ElementType: &Type, ElementCount: c_uint) -> &Type;
+    pub(crate) fn LLVMScalableVectorType(ElementType: &Type, ElementCount: c_uint) -> &Type;
 
     pub(crate) fn LLVMGetElementType(Ty: &Type) -> &Type;
     pub(crate) fn LLVMGetVectorSize(VectorTy: &Type) -> c_uint;
@@ -1010,6 +979,10 @@ unsafe extern "C" {
     pub(crate) fn LLVMGetValueName2(Val: &Value, Length: *mut size_t) -> *const c_char;
     pub(crate) fn LLVMSetValueName2(Val: &Value, Name: *const c_char, NameLen: size_t);
     pub(crate) fn LLVMReplaceAllUsesWith<'a>(OldVal: &'a Value, NewVal: &'a Value);
+    pub(crate) safe fn LLVMGetMetadata<'a>(
+        Val: &'a Value,
+        KindID: MetadataKindId,
+    ) -> Option<&'a Value>;
     pub(crate) safe fn LLVMSetMetadata<'a>(Val: &'a Value, KindID: MetadataKindId, Node: &'a Value);
     pub(crate) fn LLVMGlobalSetMetadata<'a>(
         Val: &'a Value,
@@ -1039,6 +1012,7 @@ unsafe extern "C" {
         Name: *const c_char,
         Val: &'a Value,
     );
+    pub(crate) fn LLVMReplaceMDNodeOperandWith(Val: &Value, index: u32, replacement: &Metadata);
 
     // Operations on scalar constants
     pub(crate) fn LLVMConstInt(IntTy: &Type, N: c_ulonglong, SignExtend: Bool) -> &Value;
@@ -1119,6 +1093,17 @@ unsafe extern "C" {
     pub(crate) safe fn LLVMSetTailCallKind(CallInst: &Value, kind: TailCallKind);
     pub(crate) safe fn LLVMSetExternallyInitialized(GlobalVar: &Value, IsExtInit: Bool);
 
+    // Operations on global aliases
+    pub(crate) fn LLVMAddAlias2<'ll>(
+        M: &'ll Module,
+        ValueTy: &Type,
+        AddressSpace: c_uint,
+        Aliasee: &Value,
+        Name: *const c_char,
+    ) -> &'ll Value;
+    pub(crate) fn LLVMGetFirstGlobalAlias(M: &Module) -> Option<&Value>;
+    pub(crate) fn LLVMGetNextGlobalAlias(GlobalAlias: &Value) -> Option<&Value>;
+
     // Operations on attributes
     pub(crate) fn LLVMCreateStringAttribute(
         C: &Context,
@@ -1139,12 +1124,18 @@ unsafe extern "C" {
 
     // Operations about llvm intrinsics
     pub(crate) fn LLVMLookupIntrinsicID(Name: *const c_char, NameLen: size_t) -> c_uint;
+    pub(crate) fn LLVMIntrinsicIsOverloaded(ID: NonZero<c_uint>) -> Bool;
     pub(crate) fn LLVMGetIntrinsicDeclaration<'a>(
         Mod: &'a Module,
         ID: NonZero<c_uint>,
         ParamTypes: *const &'a Type,
         ParamCount: size_t,
     ) -> &'a Value;
+    pub(crate) fn LLVMRustUpgradeIntrinsicFunction<'a>(
+        Fn: &'a Value,
+        NewFn: &mut Option<&'a Value>,
+    ) -> bool;
+    pub(crate) fn LLVMRustIsTargetIntrinsic(ID: NonZero<c_uint>) -> bool;
 
     // Operations on parameters
     pub(crate) fn LLVMIsAArgument(Val: &Value) -> Option<&Value>;
@@ -1160,13 +1151,9 @@ unsafe extern "C" {
     ) -> &'a BasicBlock;
 
     // Operations on instructions
-    pub(crate) fn LLVMGetInstructionParent(Inst: &Value) -> &BasicBlock;
-    pub(crate) fn LLVMGetCalledValue(CallInst: &Value) -> Option<&Value>;
     pub(crate) fn LLVMIsAInstruction(Val: &Value) -> Option<&Value>;
     pub(crate) fn LLVMGetFirstBasicBlock(Fn: &Value) -> &BasicBlock;
     pub(crate) fn LLVMGetOperand(Val: &Value, Index: c_uint) -> Option<&Value>;
-    pub(crate) fn LLVMGetNextInstruction(Val: &Value) -> Option<&Value>;
-    pub(crate) fn LLVMInstructionEraseFromParent(Val: &Value);
 
     // Operations on call sites
     pub(crate) fn LLVMSetInstructionCallConv(Instr: &Value, CC: c_uint);
@@ -1664,6 +1651,9 @@ unsafe extern "C" {
         Packed: Bool,
     );
 
+    pub(crate) fn LLVMCountStructElementTypes(StructTy: &Type) -> c_uint;
+    pub(crate) fn LLVMGetStructElementTypes<'a>(StructTy: &'a Type, Dest: *mut &'a Type);
+
     pub(crate) safe fn LLVMMetadataAsValue<'a>(C: &'a Context, MD: &'a Metadata) -> &'a Value;
 
     pub(crate) safe fn LLVMSetUnnamedAddress(Global: &Value, UnnamedAddr: UnnamedAddr);
@@ -1767,6 +1757,15 @@ unsafe extern "C" {
         ParameterTypes: *const Option<&'ll Metadata>,
         NumParameterTypes: c_uint,
         Flags: DIFlags, // (default is `DIFlags::DIFlagZero`)
+    ) -> &'ll Metadata;
+
+    pub(crate) fn LLVMDIBuilderCreateEnumeratorOfArbitraryPrecision<'ll>(
+        Builder: &DIBuilder<'ll>,
+        Name: *const c_uchar, // See "PTR_LEN_STR".
+        NameLen: size_t,
+        SizeInBits: u64,
+        Words: *const u64, // LLVM computes `NumWords = (SizeInBits + 63) / 64`.
+        IsUnsigned: llvm::Bool,
     ) -> &'ll Metadata;
 
     pub(crate) fn LLVMDIBuilderCreateUnionType<'ll>(
@@ -1964,12 +1963,14 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustDisableSystemDialogsOnCrash();
 
     // Operations on all values
+    /// FIXME: After dropping LLVM 21, migrate to LLVM-C's `LLVMGlobalAddMetadata`.
     pub(crate) fn LLVMRustGlobalAddMetadata<'a>(
         Val: &'a Value,
         KindID: MetadataKindId,
         Metadata: &'a Metadata,
     );
     pub(crate) fn LLVMRustIsNonGVFunctionPointerTy(Val: &Value) -> bool;
+    pub(crate) fn LLVMRustStripPointerCasts<'a>(Val: &'a Value) -> &'a Value;
 
     // Operations on scalar constants
     pub(crate) fn LLVMRustConstIntGetZExtValue(ConstantVal: &ConstantInt, Value: &mut u64) -> bool;
@@ -1989,6 +1990,13 @@ unsafe extern "C" {
         Name: *const c_char,
         NameLen: size_t,
         T: &'a Type,
+    ) -> &'a Value;
+    pub(crate) fn LLVMRustGetOrInsertGlobalInAddrspace<'a>(
+        M: &'a Module,
+        Name: *const c_char,
+        NameLen: size_t,
+        T: &'a Type,
+        AddressSpace: c_uint,
     ) -> &'a Value;
     pub(crate) fn LLVMRustGetNamedValue(
         M: &Module,
@@ -2025,7 +2033,7 @@ unsafe extern "C" {
     ) -> &Attribute;
 
     // Operations on functions
-    pub(crate) fn LLVMRustOffloadMapper<'a>(Fn: &'a Value, Fn: &'a Value);
+    /// FIXME: After dropping LLVM 21, migrate to LLVM-C's `LLVMGetOrInsertFunction`.
     pub(crate) fn LLVMRustGetOrInsertFunction<'a>(
         M: &'a Module,
         Name: *const c_char,
@@ -2050,6 +2058,7 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetFastMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAlgebraicMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAllowReassoc(Instr: &Value);
+    pub(crate) fn LLVMRustSetNoSignedZeros(Instr: &Value);
 
     // Miscellaneous instructions
     pub(crate) fn LLVMRustBuildMemCpy<'a>(
@@ -2079,6 +2088,8 @@ unsafe extern "C" {
         IsVolatile: bool,
     ) -> &'a Value;
 
+    pub(crate) fn LLVMRustBuildVScale<'a>(B: &Builder<'a>, Ty: &'a Type) -> &'a Value;
+
     pub(crate) fn LLVMRustTimeTraceProfilerInitialize();
 
     pub(crate) fn LLVMRustTimeTraceProfilerFinishThread();
@@ -2094,11 +2105,25 @@ unsafe extern "C" {
     /// Prints the statistics collected by `-Zprint-codegen-stats`.
     pub(crate) fn LLVMRustPrintStatistics(OutStr: &RustString);
 
+    /// Save the statistics collected by `-Zprint-codegen-stats-json`
+    pub(crate) fn LLVMRustPrintStatisticsJSON(OutStr: &RustString);
+
     pub(crate) fn LLVMRustInlineAsmVerify(
         Ty: &Type,
         Constraints: *const c_uchar, // See "PTR_LEN_STR".
         ConstraintsLen: size_t,
     ) -> bool;
+
+    /// Append inline assembly to a module. See `Module::appendModuleInlineAsm`.
+    pub(crate) fn LLVMRustAppendModuleInlineAsm(
+        M: &Module,
+        Asm: *const c_uchar, // See "PTR_LEN_STR".
+        AsmLen: size_t,
+        TargetFeatures: *const c_uchar, // See "PTR_LEN_STR".
+        TargetFeaturesLen: size_t,
+        TargetCpu: *const c_uchar, // See "PTR_LEN_STR".
+        TargetCpuLen: size_t,
+    );
 
     /// A list of pointer-length strings is passed as two pointer-length slices,
     /// one slice containing pointers and one slice containing their corresponding
@@ -2147,9 +2172,13 @@ unsafe extern "C" {
 
     pub(crate) safe fn LLVMRustCoverageMappingVersion() -> u32;
     pub(crate) fn LLVMRustDebugMetadataVersion() -> u32;
+
+    /// Returns the LLVM major version that the compiler was built with.
+    ///
+    /// Note that this is hard-coded as `LLVM_VERSION_MAJOR` when `RustWrapper.cpp` is built. This
+    /// could be different than what the runtime LLVM library reports in `LLVMGetVersion`, so we
+    /// assert their equality in `configure_llvm`.
     pub(crate) fn LLVMRustVersionMajor() -> u32;
-    pub(crate) fn LLVMRustVersionMinor() -> u32;
-    pub(crate) fn LLVMRustVersionPatch() -> u32;
 
     /// Add LLVM module flags.
     ///
@@ -2172,6 +2201,9 @@ unsafe extern "C" {
         ValueLen: size_t,
     );
 
+    /// We can't use LLVM-C's `LLVMDIBuilderCreateCompileUnit` because it hardcodes
+    /// `DICompileUnit::DebugNameTableKind::Default`, but we want to be able to
+    /// pass other values.
     pub(crate) fn LLVMRustDIBuilderCreateCompileUnit<'a>(
         Builder: &DIBuilder<'a>,
         Lang: c_uint,
@@ -2189,6 +2221,8 @@ unsafe extern "C" {
         DebugNameTableKind: DebugNameTableKind,
     ) -> &'a DIDescriptor;
 
+    /// We can't use LLVM-C's `LLVMDIBuilderCreateFileWithChecksum` because it
+    /// _requires_ a checksum, but we sometimes don't provide one.
     pub(crate) fn LLVMRustDIBuilderCreateFile<'a>(
         Builder: &DIBuilder<'a>,
         Filename: *const c_char,
@@ -2202,6 +2236,8 @@ unsafe extern "C" {
         SourceLen: size_t,
     ) -> &'a DIFile;
 
+    /// We can't use LLVM-C's `LLVMDIBuilderCreateFunction` because it only
+    /// supports a subset of `DISubprogram::DISPFlags`.
     pub(crate) fn LLVMRustDIBuilderCreateFunction<'a>(
         Builder: &DIBuilder<'a>,
         Scope: &'a DIDescriptor,
@@ -2220,6 +2256,7 @@ unsafe extern "C" {
         Decl: Option<&'a DIDescriptor>,
     ) -> &'a DISubprogram;
 
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDIBuilderCreateMethod<'a>(
         Builder: &DIBuilder<'a>,
         Scope: &'a DIDescriptor,
@@ -2235,6 +2272,7 @@ unsafe extern "C" {
         TParam: &'a DIArray,
     ) -> &'a DISubprogram;
 
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDIBuilderCreateVariantMemberType<'a>(
         Builder: &DIBuilder<'a>,
         Scope: &'a DIScope,
@@ -2250,15 +2288,7 @@ unsafe extern "C" {
         Ty: &'a DIType,
     ) -> &'a DIType;
 
-    pub(crate) fn LLVMRustDIBuilderCreateEnumerator<'a>(
-        Builder: &DIBuilder<'a>,
-        Name: *const c_char,
-        NameLen: size_t,
-        Value: *const u64,
-        SizeInBits: c_uint,
-        IsUnsigned: bool,
-    ) -> &'a DIEnumerator;
-
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDIBuilderCreateEnumerationType<'a>(
         Builder: &DIBuilder<'a>,
         Scope: &'a DIScope,
@@ -2273,6 +2303,7 @@ unsafe extern "C" {
         IsScoped: bool,
     ) -> &'a DIType;
 
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDIBuilderCreateVariantPart<'a>(
         Builder: &DIBuilder<'a>,
         Scope: &'a DIScope,
@@ -2289,6 +2320,7 @@ unsafe extern "C" {
         UniqueIdLen: size_t,
     ) -> &'a DIDerivedType;
 
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDIBuilderCreateTemplateTypeParameter<'a>(
         Builder: &DIBuilder<'a>,
         Scope: Option<&'a DIScope>,
@@ -2297,6 +2329,8 @@ unsafe extern "C" {
         Ty: &'a DIType,
     ) -> &'a DITemplateTypeParameter;
 
+    /// We can't use LLVM-C's `LLVMReplaceArrays` because it doesn't take a
+    /// `Params` argument.
     pub(crate) fn LLVMRustDICompositeTypeReplaceArrays<'a>(
         Builder: &DIBuilder<'a>,
         CompositeType: &'a DIType,
@@ -2304,6 +2338,28 @@ unsafe extern "C" {
         Params: Option<&'a DIArray>,
     );
 
+    /// We can't use LLVM-C's `LLVMDIBuilderGetOrCreateSubrange` because it doesn't
+    /// call the overload that takes a `Metadata` upper bound.
+    pub(crate) fn LLVMRustDIGetOrCreateSubrange<'a>(
+        Builder: &DIBuilder<'a>,
+        CountNode: Option<&'a Metadata>,
+        LB: &'a Metadata,
+        UB: &'a Metadata,
+        Stride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
+
+    /// We can't use LLVM-C's `LLVMDIBuilderCreateVectorType` because it doesn't
+    /// take a `BitStride` argument.
+    pub(crate) fn LLVMRustDICreateVectorType<'a>(
+        Builder: &DIBuilder<'a>,
+        Size: u64,
+        AlignInBits: u32,
+        Type: &'a DIType,
+        Subscripts: &'a DIArray,
+        BitStride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
+
+    /// As of LLVM 22 there is no corresponding LLVM-C function.
     pub(crate) fn LLVMRustDILocationCloneWithBaseDiscriminator<'a>(
         Location: &'a DILocation,
         BD: c_uint,
@@ -2313,6 +2369,7 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustWriteValueToString(value_ref: &Value, s: &RustString);
 
     pub(crate) fn LLVMRustHasFeature(T: &TargetMachine, s: *const c_char) -> bool;
+    pub(crate) fn LLVMRustTargetHasMnemonic(T: &TargetMachine, s: *const c_char) -> bool;
 
     pub(crate) fn LLVMRustPrintTargetCPUs(TM: &TargetMachine, OutStr: &RustString);
     pub(crate) fn LLVMRustGetTargetFeaturesCount(T: &TargetMachine) -> size_t;
@@ -2350,9 +2407,11 @@ unsafe extern "C" {
         DebugInfoCompression: CompressionKind,
         UseEmulatedTls: bool,
         UseWasmEH: bool,
+        LargeDataThreshold: u64,
     ) -> *mut TargetMachine;
 
     pub(crate) fn LLVMRustAddLibraryInfo<'a>(
+        T: &TargetMachine,
         PM: &PassManager<'a>,
         M: &'a Module,
         DisableSimplifyLibCalls: bool,
@@ -2375,16 +2434,15 @@ unsafe extern "C" {
         NoPrepopulatePasses: bool,
         VerifyIR: bool,
         LintIR: bool,
-        ThinLTOBuffer: Option<&mut *mut ThinLTOBuffer>,
-        EmitThinLTO: bool,
-        EmitThinLTOSummary: bool,
+        ThinLTOBuffer: Option<&mut Option<crate::back::lto::Buffer>>,
+        ThinLTOSummaryBuffer: Option<&mut Option<crate::back::lto::Buffer>>,
         MergeFunctions: bool,
         UnrollLoops: bool,
         SLPVectorize: bool,
         LoopVectorize: bool,
         DisableSimplifyLibCalls: bool,
         EmitLifetimeMarkers: bool,
-        RunEnzyme: bool,
+        RunEnzyme: *const c_void,
         PrintBeforeEnzyme: bool,
         PrintAfterEnzyme: bool,
         PrintPasses: bool,
@@ -2398,6 +2456,8 @@ unsafe extern "C" {
         llvm_selfprofiler: *mut c_void,
         begin_callback: SelfProfileBeforePassCallback,
         end_callback: SelfProfileAfterPassCallback,
+        PostEnzymePasses: *const c_char,
+        PostEnzymePassesLen: size_t,
         ExtraPasses: *const c_char,
         ExtraPassesLen: size_t,
         LLVMPlugins: *const c_char,
@@ -2458,22 +2518,14 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetModulePICLevel(M: &Module);
     pub(crate) fn LLVMRustSetModulePIELevel(M: &Module);
     pub(crate) fn LLVMRustSetModuleCodeModel(M: &Module, Model: CodeModel);
-    pub(crate) fn LLVMRustModuleBufferCreate(M: &Module) -> &'static mut ModuleBuffer;
-    pub(crate) fn LLVMRustModuleBufferPtr(p: &ModuleBuffer) -> *const u8;
-    pub(crate) fn LLVMRustModuleBufferLen(p: &ModuleBuffer) -> usize;
-    pub(crate) fn LLVMRustModuleBufferFree(p: &'static mut ModuleBuffer);
+    pub(crate) fn LLVMRustSetModuleLargeDataThreshold(M: &Module, Threshold: u64);
+    pub(crate) fn LLVMRustBufferPtr(p: &Buffer) -> *const u8;
+    pub(crate) fn LLVMRustBufferLen(p: &Buffer) -> usize;
+    pub(crate) fn LLVMRustBufferFree(p: &'static mut Buffer);
     pub(crate) fn LLVMRustModuleCost(M: &Module) -> u64;
-    pub(crate) fn LLVMRustModuleInstructionStats(M: &Module, Str: &RustString);
+    pub(crate) fn LLVMRustModuleInstructionStats(M: &Module) -> u64;
 
-    pub(crate) fn LLVMRustThinLTOBufferCreate(
-        M: &Module,
-        is_thin: bool,
-    ) -> &'static mut ThinLTOBuffer;
-    pub(crate) fn LLVMRustThinLTOBufferFree(M: &'static mut ThinLTOBuffer);
-    pub(crate) fn LLVMRustThinLTOBufferPtr(M: &ThinLTOBuffer) -> *const c_char;
-    pub(crate) fn LLVMRustThinLTOBufferLen(M: &ThinLTOBuffer) -> size_t;
-    pub(crate) fn LLVMRustThinLTOBufferThinLinkDataPtr(M: &ThinLTOBuffer) -> *const c_char;
-    pub(crate) fn LLVMRustThinLTOBufferThinLinkDataLen(M: &ThinLTOBuffer) -> size_t;
+    pub(crate) fn LLVMRustModuleSerialize(M: &Module, is_thin: bool) -> &'static mut Buffer;
     pub(crate) fn LLVMRustCreateThinLTOData(
         Modules: *const ThinLTOModule,
         NumModules: size_t,
@@ -2554,4 +2606,12 @@ unsafe extern "C" {
 
     pub(crate) fn LLVMRustSetNoSanitizeAddress(Global: &Value);
     pub(crate) fn LLVMRustSetNoSanitizeHWAddress(Global: &Value);
+
+    pub(crate) fn LLVMRustConstPtrAuth(
+        ptr: *const Value,
+        key: u32,
+        disc: u64,
+        addr_diversity: *const Value,
+        deactivation_symbol: *const Value,
+    ) -> *const Value;
 }

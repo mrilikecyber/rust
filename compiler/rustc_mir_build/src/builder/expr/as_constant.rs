@@ -1,14 +1,15 @@
-//! See docs in build/expr/mod.rs
+//! See docs in builder/expr/mod.rs
 
 use rustc_abi::Size;
 use rustc_ast as ast;
-use rustc_hir::LangItem;
-use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, LitToConstInput, Scalar};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::def::DefKind;
+use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{
-    self, CanonicalUserType, CanonicalUserTypeAnnotation, Ty, TyCtxt, TypeVisitableExt as _,
-    UserTypeAnnotationIndex,
+    self, CanonicalUserType, CanonicalUserTypeAnnotation, LitToConstInput, Ty, TyCtxt,
+    TypeVisitableExt as _, UserTypeAnnotationIndex,
 };
 use rustc_middle::{bug, mir, span_bug};
 use tracing::{instrument, trace};
@@ -23,7 +24,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let tcx = this.tcx;
         let Expr { ty, temp_scope_id: _, span, ref kind } = *expr;
         match kind {
-            ExprKind::Scope { region_scope: _, lint_level: _, value } => {
+            ExprKind::Scope { region_scope: _, hir_id: _, value } => {
                 this.as_constant(&this.thir[*value])
             }
             _ => as_constant_inner(
@@ -47,9 +48,11 @@ pub(crate) fn as_constant_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> ConstOperand<'tcx> {
     let Expr { ty, temp_scope_id: _, span, ref kind } = *expr;
+
     match *kind {
         ExprKind::Literal { lit, neg } => {
-            let const_ = lit_to_mir_constant(tcx, LitToConstInput { lit: lit.node, ty, neg });
+            let const_ =
+                lit_to_mir_constant(tcx, LitToConstInput { lit: lit.node, ty: Some(ty), neg });
 
             ConstOperand { span, user_ty: None, const_ }
         }
@@ -69,6 +72,31 @@ pub(crate) fn as_constant_inner<'tcx>(
         }
         ExprKind::NamedConst { def_id, args, ref user_ty } => {
             let user_ty = user_ty.as_ref().and_then(push_cuta);
+            // Under generic_const_args, `def_id` might be a regular const declared in a trait, but
+            // is `impl`d as a directly represented const. We do not know whether it is here, so we
+            // must use type system normalization for all consts under generic_const_args.
+            // FIXME(generic_const_args): there's a lot to consider here! `Const::Ty` uses valtrees
+            // and `Const::Unevaluated` does not, we should revisit this before stabilization.
+            if tcx.features().generic_const_args()
+                || matches!(
+                    tcx.def_kind(def_id),
+                    DefKind::Const { .. } | DefKind::AssocConst { .. }
+                ) && tcx.is_direct_const(def_id)
+            {
+                let uneval = ty::AliasConst::new(
+                    tcx,
+                    ty::AliasConstKind::new_from_def_id(
+                        tcx,
+                        def_id,
+                        ty::AliasConstInherentArgsKind::Impl,
+                    ),
+                    args,
+                );
+                let ct = ty::Const::new_alias(tcx, ty::IsRigid::No, uneval);
+
+                let const_ = Const::Ty(ty, ct);
+                return ConstOperand { span, user_ty, const_ };
+            }
 
             let uneval = mir::UnevaluatedConst::new(def_id, args);
             let const_ = Const::Unevaluated(uneval, ty);
@@ -100,6 +128,8 @@ pub(crate) fn as_constant_inner<'tcx>(
 #[instrument(skip(tcx, lit_input))]
 fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>) -> Const<'tcx> {
     let LitToConstInput { lit, ty, neg } = lit_input;
+
+    let ty = ty.expect("type of literal must be known at this point");
 
     if let Err(guar) = ty.error_reported() {
         return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
@@ -149,7 +179,9 @@ fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>
         }
         (ast::LitKind::Int(n, _), ty::Uint(_)) if !neg => trunc(n.get()),
         (ast::LitKind::Int(n, _), ty::Int(_)) => {
-            trunc(if neg { (n.get() as i128).overflowing_neg().0 as u128 } else { n.get() })
+            // Unsigned "negation" has the same bitwise effect as signed negation,
+            // which gets the result we want without additional casts.
+            trunc(if neg { u128::wrapping_neg(n.get()) } else { n.get() })
         }
         (ast::LitKind::Float(n, _), ty::Float(fty)) => {
             parse_float_into_constval(n, *fty, neg).unwrap()

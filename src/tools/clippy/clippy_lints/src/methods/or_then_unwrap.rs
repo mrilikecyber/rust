@@ -1,8 +1,8 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::{MaybeDef, MaybeQPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _};
 use clippy_utils::source::snippet_with_applicability;
 use rustc_errors::Applicability;
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_span::{Span, sym};
@@ -20,24 +20,28 @@ pub(super) fn check<'tcx>(
     let title;
     let or_arg_content: Span;
 
-    if ty.is_diag_item(cx, sym::Option) {
-        title = "found `.or(Some(…)).unwrap()`";
-        if let Some(content) = get_content_if_ctor_matches(cx, or_arg, LangItem::OptionSome) {
-            or_arg_content = content;
-        } else {
+    match ty.opt_diag_name(cx) {
+        Some(sym::Option) => {
+            title = "found `.or(Some(…)).unwrap()`";
+            if let Some(content) = get_content_if_ctor_matches(cx, or_arg, LangItem::OptionSome) {
+                or_arg_content = content;
+            } else {
+                return;
+            }
+        },
+        Some(sym::Result) => {
+            title = "found `.or(Ok(…)).unwrap()`";
+            if let Some(content) = get_content_if_ctor_matches(cx, or_arg, LangItem::ResultOk) {
+                or_arg_content = content;
+            } else {
+                return;
+            }
+        },
+        _ => {
+            // Someone has implemented a struct with .or(...).unwrap() chaining,
+            // but it's not an Option or a Result, so bail
             return;
-        }
-    } else if ty.is_diag_item(cx, sym::Result) {
-        title = "found `.or(Ok(…)).unwrap()`";
-        if let Some(content) = get_content_if_ctor_matches(cx, or_arg, LangItem::ResultOk) {
-            or_arg_content = content;
-        } else {
-            return;
-        }
-    } else {
-        // Someone has implemented a struct with .or(...).unwrap() chaining,
-        // but it's not an Option or a Result, so bail
-        return;
+        },
     }
 
     let mut applicability = Applicability::MachineApplicable;

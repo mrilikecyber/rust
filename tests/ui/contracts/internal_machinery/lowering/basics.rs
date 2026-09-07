@@ -1,6 +1,6 @@
 //@ run-pass
-#![feature(contracts, cfg_contract_checks, contracts_internals, core_intrinsics)]
-//~^ WARN the feature `contracts` is incomplete and may not be safe to use and/or cause compiler crashes [incomplete_features]
+#![expect(incomplete_features)]
+#![feature(contracts, contracts_internals, core_intrinsics)]
 
 extern crate core;
 

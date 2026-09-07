@@ -4,18 +4,19 @@
 
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{AttrStyle, token};
-use rustc_attr_parsing as attr;
-use rustc_attr_parsing::parser::MetaItemOrLitParser;
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{AttrPath, CfgEntry};
+use rustc_attr_parsing::parser::{AllowExprMetavar, MetaItemOrLitParser};
 use rustc_attr_parsing::{
-    AttributeParser, CFG_TEMPLATE, ParsedDescription, ShouldEmit, parse_cfg_entry,
+    self as attr, AttributeParser, AttributeSafety, CFG_TEMPLATE, ParsedDescription, ShouldEmit,
+    parse_cfg_entry,
 };
 use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
-use rustc_hir::AttrPath;
-use rustc_hir::attrs::CfgEntry;
 use rustc_parse::exp;
-use rustc_span::{ErrorGuaranteed, Ident, Span};
+use rustc_parse::parser::Recovery;
+use rustc_span::{ErrorGuaranteed, Span, sym};
 
-use crate::errors;
+use crate::diagnostics;
 
 pub(crate) fn expand_cfg(
     cx: &mut ExtCtxt<'_>,
@@ -26,13 +27,7 @@ pub(crate) fn expand_cfg(
 
     ExpandResult::Ready(match parse_cfg(cx, sp, tts) {
         Ok(cfg) => {
-            let matches_cfg = attr::eval_config_entry(
-                cx.sess,
-                &cfg,
-                cx.current_expansion.lint_node_id,
-                ShouldEmit::ErrorsAndLints,
-            )
-            .as_bool();
+            let matches_cfg = attr::eval_config_entry(cx.sess, &cfg).as_bool();
 
             MacEager::expr(cx.expr_bool(sp, matches_cfg))
         }
@@ -43,22 +38,30 @@ pub(crate) fn expand_cfg(
 fn parse_cfg(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream) -> Result<CfgEntry, ErrorGuaranteed> {
     let mut parser = cx.new_parser_from_tts(tts);
     if parser.token == token::Eof {
-        return Err(cx.dcx().emit_err(errors::RequiresCfgPattern { span }));
+        return Err(cx.dcx().emit_err(diagnostics::RequiresCfgPattern { span }));
     }
 
-    let meta = MetaItemOrLitParser::parse_single(&mut parser, ShouldEmit::ErrorsAndLints)
-        .map_err(|diag| diag.emit())?;
+    let meta = MetaItemOrLitParser::parse_single(
+        &mut parser,
+        ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed },
+        AllowExprMetavar::Yes,
+    )
+    .map_err(|diag| diag.emit())?;
     let cfg = AttributeParser::parse_single_args(
         cx.sess,
         span,
         span,
         AttrStyle::Inner,
-        AttrPath { segments: vec![Ident::from_str("cfg")].into_boxed_slice(), span },
+        AttrPath { segments: vec![sym::cfg].into_boxed_slice(), span },
+        None,
+        AttributeSafety::Normal,
         ParsedDescription::Macro,
         span,
         cx.current_expansion.lint_node_id,
+        // Doesn't matter what the target actually is here.
+        Target::Crate,
         Some(cx.ecfg.features),
-        ShouldEmit::ErrorsAndLints,
+        ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed },
         &meta,
         parse_cfg_entry,
         &CFG_TEMPLATE,
@@ -67,7 +70,7 @@ fn parse_cfg(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream) -> Result<CfgEntry,
     let _ = parser.eat(exp!(Comma));
 
     if !parser.eat(exp!(Eof)) {
-        return Err(cx.dcx().emit_err(errors::OneCfgPattern { span }));
+        return Err(cx.dcx().emit_err(diagnostics::OneCfgPattern { span }));
     }
 
     Ok(cfg)

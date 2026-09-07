@@ -14,11 +14,11 @@ use crate::versions::{PkgType, Versions};
 
 include!(concat!(env!("OUT_DIR"), "/targets.rs"));
 
-/// This allows the manifest to contain rust-docs for hosts that don't build
-/// docs.
+/// This allows the manifest to contain rust-docs and rustc-docs for hosts
+/// that don't build certain docs.
 ///
 /// Tuples of `(host_partial, host_instead)`. If the host does not have the
-/// rust-docs component available, then if the host name contains
+/// corresponding docs component available, then if the host name contains
 /// `host_partial`, it will use the docs from `host_instead` instead.
 ///
 /// The order here matters, more specific entries should be first.
@@ -26,23 +26,39 @@ static DOCS_FALLBACK: &[(&str, &str)] = &[
     ("-apple-", "aarch64-apple-darwin"),
     ("aarch64", "aarch64-unknown-linux-gnu"),
     ("arm-", "aarch64-unknown-linux-gnu"),
+    ("i686-pc-windows", "x86_64-pc-windows-msvc"),
     ("", "x86_64-unknown-linux-gnu"),
-];
-
-static MSI_INSTALLERS: &[&str] = &[
-    "aarch64-pc-windows-msvc",
-    "i686-pc-windows-gnu",
-    "i686-pc-windows-msvc",
-    "x86_64-pc-windows-gnu",
-    "x86_64-pc-windows-msvc",
 ];
 
 static PKG_INSTALLERS: &[&str] = &["x86_64-apple-darwin", "aarch64-apple-darwin"];
 
-static MINGW: &[&str] = &["i686-pc-windows-gnu", "x86_64-pc-windows-gnu"];
-
-static NIGHTLY_ONLY_COMPONENTS: &[PkgType] =
-    &[PkgType::Miri, PkgType::JsonDocs, PkgType::RustcCodegenCranelift];
+fn is_nightly_only(pkg: &PkgType) -> bool {
+    match pkg {
+        PkgType::Miri
+        | PkgType::JsonDocs
+        | PkgType::RustcCodegenCranelift
+        | PkgType::RustcCodegenGcc
+        | PkgType::Gcc { .. }
+        | PkgType::Enzyme
+        | PkgType::Offload => true,
+        PkgType::Rust
+        | PkgType::RustSrc
+        | PkgType::Rustc
+        | PkgType::RustcDev
+        | PkgType::RustcDocs
+        | PkgType::ReproducibleArtifacts
+        | PkgType::RustMingw
+        | PkgType::RustStd
+        | PkgType::Cargo
+        | PkgType::HtmlDocs
+        | PkgType::RustAnalysis
+        | PkgType::RustAnalyzer
+        | PkgType::Clippy
+        | PkgType::Rustfmt
+        | PkgType::LlvmTools
+        | PkgType::LlvmBitcodeLinker => false,
+    }
+}
 
 macro_rules! t {
     ($e:expr) => {
@@ -168,7 +184,7 @@ impl Builder {
     }
 
     fn add_packages_to(&mut self, manifest: &mut Manifest) {
-        for pkg in PkgType::all() {
+        for pkg in &PkgType::all() {
             self.package(pkg, &mut manifest.pkg);
         }
     }
@@ -237,7 +253,7 @@ impl Builder {
         };
         for pkg in PkgType::all() {
             if pkg.is_preview() {
-                rename(pkg.tarball_component_name(), &pkg.manifest_component_name());
+                rename(&pkg.tarball_component_name(), &pkg.manifest_component_name());
             }
         }
     }
@@ -273,7 +289,7 @@ impl Builder {
 
         let host_component = |pkg: &_| Component::from_pkg(pkg, host);
 
-        for pkg in PkgType::all() {
+        for pkg in &PkgType::all() {
             match pkg {
                 // rustc/rust-std/cargo/docs are all required
                 PkgType::Rustc | PkgType::Cargo | PkgType::HtmlDocs => {
@@ -290,8 +306,16 @@ impl Builder {
                 }
                 // so is rust-mingw if it's available for the target
                 PkgType::RustMingw => {
-                    if host.ends_with("pc-windows-gnu") {
+                    if host.contains("pc-windows-gnu") {
                         components.push(host_component(pkg));
+                        extensions.extend(
+                            TARGETS
+                                .iter()
+                                .filter(|&&target| {
+                                    target.contains("pc-windows-gnu") && target != host
+                                })
+                                .map(|target| Component::from_pkg(pkg, target)),
+                        );
                     }
                 }
                 // Tools are always present in the manifest,
@@ -303,11 +327,16 @@ impl Builder {
                 | PkgType::LlvmTools
                 | PkgType::RustAnalysis
                 | PkgType::JsonDocs
+                | PkgType::RustcDocs
                 | PkgType::RustcCodegenCranelift
-                | PkgType::LlvmBitcodeLinker => {
+                | PkgType::RustcCodegenGcc
+                | PkgType::Gcc { .. }
+                | PkgType::LlvmBitcodeLinker
+                | PkgType::Enzyme
+                | PkgType::Offload => {
                     extensions.push(host_component(pkg));
                 }
-                PkgType::RustcDev | PkgType::RustcDocs => {
+                PkgType::RustcDev => {
                     extensions.extend(HOSTS.iter().map(|target| Component::from_pkg(pkg, target)));
                 }
                 PkgType::RustSrc => {
@@ -375,7 +404,7 @@ impl Builder {
         let mut is_present = version_info.present;
 
         // Never ship nightly-only components for other trains.
-        if self.versions.channel() != "nightly" && NIGHTLY_ONLY_COMPONENTS.contains(&pkg) {
+        if self.versions.channel() != "nightly" && is_nightly_only(&pkg) {
             is_present = false; // Pretend the component is entirely missing.
         }
 
@@ -394,9 +423,9 @@ impl Builder {
                     let t = Target::from_compressed_tar(self, &tarball_name!(fallback_target));
                     // Fallbacks should typically be available on 'production' builds
                     // but may not be available for try builds, which only build one target by
-                    // default. Ideally we'd gate this being a hard error on whether we're in a
-                    // production build or not, but it's not information that's readily available
-                    // here.
+                    // default. It is also possible that `rust-docs` and `rustc-docs` differ in
+                    // availability per target. Thus, we take the first available fallback we can
+                    // find.
                     if !t.available {
                         eprintln!(
                             "{:?} not available for fallback",

@@ -5,6 +5,8 @@
 
 #![macro_use(my_macro)]
 //~^ ERROR arguments to `macro_use` are not allowed here
+//~| WARN cannot be used on
+//~| WARN previously accepted
 
 #[macro_use(my_macro)]
 //~^ ERROR arguments to `macro_use` are not allowed here
@@ -13,7 +15,7 @@ mod macro_escape {
     //~^ ERROR arguments to `macro_use` are not allowed here
 
     #[macro_use = "2700"] struct S;
-    //~^ ERROR valid forms for the attribute are `#[macro_use(name1, name2, ...)]` and `#[macro_use]`
+    //~^ ERROR malformed
     //~| WARN cannot be used on
     //~| WARN previously accepted
 

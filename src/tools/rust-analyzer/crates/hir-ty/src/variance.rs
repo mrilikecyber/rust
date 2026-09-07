@@ -13,75 +13,73 @@
 //! by the next salsa version. If not, we will likely have to adapt and go with the rustc approach
 //! while installing firewall per item queries to prevent invalidation issues.
 
-use hir_def::{AdtId, GenericDefId, GenericParamId, VariantId, signatures::StructFlags};
-use rustc_ast_ir::Mutability;
-use rustc_type_ir::{
-    Variance,
-    inherent::{AdtDef, IntoKind, SliceLike},
+use hir_def::{
+    AdtId, GenericDefId, GenericParamId, VariantId,
+    signatures::{StructFlags, StructSignature},
 };
+use rustc_ast_ir::Mutability;
+use rustc_type_ir::{Variance, inherent::IntoKind};
 use stdx::never;
 
 use crate::{
     db::HirDatabase,
     generics::{Generics, generics},
     next_solver::{
-        Const, ConstKind, DbInterner, ExistentialPredicate, GenericArg, GenericArgs, Region,
-        RegionKind, Term, Ty, TyKind, VariancesOf,
+        Const, ConstKind, DbInterner, ExistentialPredicate, GenericArgKind, GenericArgs, Pattern,
+        PatternKind, Region, RegionKind, StoredVariancesOf, TermKind, Ty, TyKind, VariancesOf,
     },
 };
 
 pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> VariancesOf<'_> {
+    variances_of_query(db, def).as_ref()
+}
+
+#[salsa::tracked(
+    returns(ref),
+    cycle_fn = crate::variance::variances_of_cycle_fn,
+    cycle_initial = crate::variance::variances_of_cycle_initial,
+)]
+fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariancesOf {
     tracing::debug!("variances_of(def={:?})", def);
-    let interner = DbInterner::new_with(db, None, None);
     match def {
         GenericDefId::FunctionId(_) => (),
         GenericDefId::AdtId(adt) => {
             if let AdtId::StructId(id) = adt {
-                let flags = &db.struct_signature(id).flags;
+                let flags = &StructSignature::of(db, id).flags;
+                let types = || crate::next_solver::default_types(db);
                 if flags.contains(StructFlags::IS_UNSAFE_CELL) {
-                    return VariancesOf::new_from_iter(interner, [Variance::Invariant]);
-                } else if flags.contains(StructFlags::IS_PHANTOM_DATA) {
-                    return VariancesOf::new_from_iter(interner, [Variance::Covariant]);
+                    return types().one_invariant.store();
+                } else if flags.intersects(
+                    StructFlags::IS_PHANTOM_DATA | StructFlags::IS_COVARIANT_UNSAFE_CELL,
+                ) {
+                    return types().one_covariant.store();
                 }
             }
         }
-        _ => return VariancesOf::new_from_iter(interner, []),
+        _ => return VariancesOf::empty(DbInterner::new_no_crate(db)).store(),
     }
 
     let generics = generics(db, def);
-    let count = generics.len();
+    let count = generics.len(true);
     if count == 0 {
-        return VariancesOf::new_from_iter(interner, []);
+        return VariancesOf::empty(DbInterner::new_no_crate(db)).store();
     }
-    let mut variances =
-        Context { generics, variances: vec![Variance::Bivariant; count], db }.solve();
+    let variances =
+        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db }
+            .solve();
 
-    // FIXME(next-solver): This is *not* the correct behavior. I don't know if it has an actual effect,
-    // since bivariance is prohibited in Rust, but rustc definitely does not fallback bivariance.
-    // So why do we do this? Because, with the new solver, the effects of bivariance are catastrophic:
-    // it leads to not relating types properly, and to very, very hard to debug bugs (speaking from experience).
-    // Furthermore, our variance infra is known to not handle cycles properly. Therefore, at least until we fix
-    // cycles, and perhaps forever at least for out tests, not allowing bivariance makes sense.
-    // Why specifically invariance? I don't have a strong reason, mainly that invariance is a stronger relationship
-    // (therefore, less room for mistakes) and that IMO incorrect covariance can be more problematic that incorrect
-    // bivariance, at least while we don't handle lifetimes anyway.
-    for variance in &mut variances {
-        if *variance == Variance::Bivariant {
-            *variance = Variance::Invariant;
-        }
-    }
-
-    VariancesOf::new_from_iter(interner, variances)
+    VariancesOf::new_from_slice(&variances).store()
 }
 
-// pub(crate) fn variances_of_cycle_fn(
-//     _db: &dyn HirDatabase,
-//     _result: &Option<Arc<[Variance]>>,
-//     _count: u32,
-//     _def: GenericDefId,
-// ) -> salsa::CycleRecoveryAction<Option<Arc<[Variance]>>> {
-//     salsa::CycleRecoveryAction::Iterate
-// }
+pub(crate) fn variances_of_cycle_fn(
+    _db: &dyn HirDatabase,
+    _: &salsa::Cycle<'_>,
+    _last_provisional_value: &StoredVariancesOf,
+    value: StoredVariancesOf,
+    _def: GenericDefId,
+) -> StoredVariancesOf {
+    value
+}
 
 fn glb(v1: Variance, v2: Variance) -> Variance {
     // Greatest lower bound of the variance lattice as defined in The Paper:
@@ -105,24 +103,24 @@ fn glb(v1: Variance, v2: Variance) -> Variance {
 
 pub(crate) fn variances_of_cycle_initial(
     db: &dyn HirDatabase,
+    _: salsa::Id,
     def: GenericDefId,
-) -> VariancesOf<'_> {
-    let interner = DbInterner::new_with(db, None, None);
+) -> StoredVariancesOf {
+    let interner = DbInterner::new_no_crate(db);
     let generics = generics(db, def);
-    let count = generics.len();
+    let count = generics.len(true);
 
-    // FIXME(next-solver): Returns `Invariance` and not `Bivariance` here, see the comment in the main query.
-    VariancesOf::new_from_iter(interner, std::iter::repeat_n(Variance::Invariant, count))
+    VariancesOf::new_from_iter(interner, std::iter::repeat_n(Variance::Bivariant, count)).store()
 }
 
 struct Context<'db> {
     db: &'db dyn HirDatabase,
-    generics: Generics,
-    variances: Vec<Variance>,
+    generics: Generics<'db>,
+    variances: Box<[Variance]>,
 }
 
 impl<'db> Context<'db> {
-    fn solve(mut self) -> Vec<Variance> {
+    fn solve(mut self) -> Box<[Variance]> {
         tracing::debug!("solve(generics={:?})", self.generics);
         match self.generics.def() {
             GenericDefId::AdtId(adt) => {
@@ -130,7 +128,7 @@ impl<'db> Context<'db> {
                 let mut add_constraints_from_variant = |variant| {
                     for (_, field) in db.field_types(variant).iter() {
                         self.add_constraints_from_ty(
-                            field.instantiate_identity(),
+                            field.ty().instantiate_identity().skip_norm_wip(),
                             Variance::Covariant,
                         );
                     }
@@ -139,7 +137,7 @@ impl<'db> Context<'db> {
                     AdtId::StructId(s) => add_constraints_from_variant(VariantId::StructId(s)),
                     AdtId::UnionId(u) => add_constraints_from_variant(VariantId::UnionId(u)),
                     AdtId::EnumId(e) => {
-                        e.enum_variants(db).variants.iter().for_each(|&(variant, _, _)| {
+                        e.enum_variants(db).variants.values().for_each(|&(variant, _)| {
                             add_constraints_from_variant(VariantId::EnumVariantId(variant))
                         });
                     }
@@ -156,7 +154,7 @@ impl<'db> Context<'db> {
 
         // Const parameters are always invariant.
         // Make all const parameters invariant.
-        for (idx, param) in self.generics.iter_id().enumerate() {
+        for (idx, param) in self.generics.iter_id(false).enumerate() {
             if let GenericParamId::ConstParamId(_) = param {
                 variances[idx] = Variance::Invariant;
             }
@@ -215,9 +213,9 @@ impl<'db> Context<'db> {
                 }
             }
             TyKind::Adt(def, args) => {
-                self.add_constraints_from_args(def.def_id().0.into(), args, variance);
+                self.add_constraints_from_args(def.def_id().into(), args, variance);
             }
-            TyKind::Alias(_, alias) => {
+            TyKind::Alias(alias) => {
                 // FIXME: Probably not correct wrt. opaques.
                 self.add_constraints_from_invariant_args(alias.args);
             }
@@ -232,11 +230,11 @@ impl<'db> Context<'db> {
                         }
                         ExistentialPredicate::Projection(projection) => {
                             self.add_constraints_from_invariant_args(projection.args);
-                            match projection.term {
-                                Term::Ty(ty) => {
+                            match projection.term.kind() {
+                                TermKind::Ty(ty) => {
                                     self.add_constraints_from_ty(ty, Variance::Invariant)
                                 }
-                                Term::Const(konst) => self.add_constraints_from_const(konst),
+                                TermKind::Const(konst) => self.add_constraints_from_const(konst),
                             }
                         }
                         ExistentialPredicate::AutoTrait(_) => {}
@@ -253,25 +251,43 @@ impl<'db> Context<'db> {
                 // we encounter this when walking the trait references for object
                 // types, where we use Error as the Self type
             }
+            TyKind::Pat(typ, pat) => {
+                self.add_constraints_from_pat(pat);
+                self.add_constraints_from_ty(typ, variance);
+            }
             TyKind::Bound(..) => {}
             TyKind::CoroutineWitness(..)
             | TyKind::Placeholder(..)
             | TyKind::Infer(..)
-            | TyKind::UnsafeBinder(..)
-            | TyKind::Pat(..) => {
+            | TyKind::UnsafeBinder(..) => {
                 never!("unexpected type encountered in variance inference: {:?}", ty)
+            }
+        }
+    }
+
+    fn add_constraints_from_pat(&mut self, pat: Pattern<'db>) {
+        match pat.kind() {
+            PatternKind::Range { start, end } => {
+                self.add_constraints_from_const(start);
+                self.add_constraints_from_const(end);
+            }
+            PatternKind::NotNull => {}
+            PatternKind::Or(patterns) => {
+                for pat in patterns {
+                    self.add_constraints_from_pat(pat)
+                }
             }
         }
     }
 
     fn add_constraints_from_invariant_args(&mut self, args: GenericArgs<'db>) {
         for k in args.iter() {
-            match k {
-                GenericArg::Lifetime(lt) => {
+            match k.kind() {
+                GenericArgKind::Lifetime(lt) => {
                     self.add_constraints_from_region(lt, Variance::Invariant)
                 }
-                GenericArg::Ty(ty) => self.add_constraints_from_ty(ty, Variance::Invariant),
-                GenericArg::Const(val) => self.add_constraints_from_const(val),
+                GenericArgKind::Type(ty) => self.add_constraints_from_ty(ty, Variance::Invariant),
+                GenericArgKind::Const(val) => self.add_constraints_from_const(val),
             }
         }
     }
@@ -290,10 +306,12 @@ impl<'db> Context<'db> {
         let variances = self.db.variances_of(def_id);
 
         for (k, v) in args.iter().zip(variances) {
-            match k {
-                GenericArg::Lifetime(lt) => self.add_constraints_from_region(lt, variance.xform(v)),
-                GenericArg::Ty(ty) => self.add_constraints_from_ty(ty, variance.xform(v)),
-                GenericArg::Const(val) => self.add_constraints_from_const(val),
+            match k.kind() {
+                GenericArgKind::Lifetime(lt) => {
+                    self.add_constraints_from_region(lt, variance.xform(v))
+                }
+                GenericArgKind::Type(ty) => self.add_constraints_from_ty(ty, variance.xform(v)),
+                GenericArgKind::Const(val) => self.add_constraints_from_const(val),
             }
         }
     }
@@ -387,7 +405,7 @@ mod tests {
         AdtId, GenericDefId, ModuleDefId, hir::generics::GenericParamDataRef, src::HasSource,
     };
     use itertools::Itertools;
-    use rustc_type_ir::{Variance, inherent::SliceLike};
+    use rustc_type_ir::Variance;
     use stdx::format_to;
     use syntax::{AstNode, ast::HasName};
     use test_fixture::WithFixture;
@@ -417,6 +435,7 @@ struct Covariant<A> {
         check(
             r#"
 //- minicore: cell
+#![feature(lang_items)]
 
 use core::cell::UnsafeCell;
 
@@ -445,6 +464,10 @@ enum Enum<A,B,C> { //~ ERROR [A: +, B: -, C: o]
     Bar(Contravariant<B>),`
     Zed(Covariant<C>,Contravariant<C>)
 }
+
+#[repr(transparent)]
+#[lang = "covariant_unsafe_cell"]
+pub struct CovariantUnsafeCell<T: ?Sized>(UnsafeCell<T>); //~ ERROR [T: +]
 "#,
             expect![[r#"
                 InvariantMut['a: covariant, A: invariant, B: invariant]
@@ -453,6 +476,7 @@ enum Enum<A,B,C> { //~ ERROR [A: +, B: -, C: o]
                 Covariant[A: covariant]
                 Contravariant[A: contravariant]
                 Enum[A: covariant, B: contravariant, C: invariant]
+                CovariantUnsafeCell[T: covariant]
             "#]],
         );
     }
@@ -470,15 +494,14 @@ struct Other<'a> {
 }
 "#,
             expect![[r#"
-                Hello['a: invariant]
-                Other['a: invariant]
+                Hello['a: bivariant]
+                Other['a: bivariant]
             "#]],
         );
     }
 
     #[test]
     fn rustc_test_variance_associated_consts() {
-        // FIXME: Should be invariant
         check(
             r#"
 trait Trait {
@@ -572,9 +595,9 @@ struct TestBox<U,T:Getter<U>+Setter<U>> { //~ ERROR [U: *, T: +]
                 get[Self: contravariant, T: covariant]
                 get[Self: contravariant, T: contravariant]
                 TestStruct[U: covariant, T: covariant]
-                TestEnum[U: invariant, T: covariant]
-                TestContraStruct[U: invariant, T: covariant]
-                TestBox[U: invariant, T: covariant]
+                TestEnum[U: bivariant, T: covariant]
+                TestContraStruct[U: bivariant, T: covariant]
+                TestBox[U: bivariant, T: covariant]
             "#]],
         );
     }
@@ -694,8 +717,8 @@ enum SomeEnum<'a> { Nothing } //~ ERROR parameter `'a` is never used
 trait SomeTrait<'a> { fn foo(&self); } // OK on traits.
 "#,
             expect![[r#"
-                SomeStruct['a: invariant]
-                SomeEnum['a: invariant]
+                SomeStruct['a: bivariant]
+                SomeEnum['a: bivariant]
                 foo[Self: contravariant, 'a: invariant]
             "#]],
         );
@@ -723,14 +746,14 @@ struct DoubleNothing<T> {
 
 "#,
             expect![[r#"
-                SomeStruct[A: invariant]
-                SomeEnum[A: invariant]
-                ListCell[T: invariant]
-                SelfTyAlias[T: invariant]
-                WithBounds[T: invariant]
-                WithWhereBounds[T: invariant]
-                WithOutlivesBounds[T: invariant]
-                DoubleNothing[T: invariant]
+                SomeStruct[A: bivariant]
+                SomeEnum[A: bivariant]
+                ListCell[T: bivariant]
+                SelfTyAlias[T: bivariant]
+                WithBounds[T: bivariant]
+                WithWhereBounds[T: bivariant]
+                WithOutlivesBounds[T: bivariant]
+                DoubleNothing[T: bivariant]
             "#]],
         );
     }
@@ -841,7 +864,7 @@ struct S3<T>(S<T, T>);
 "#,
             expect![[r#"
                 S[T: covariant]
-                S2[T: invariant]
+                S2[T: bivariant]
                 S3[T: covariant]
             "#]],
         );
@@ -854,7 +877,7 @@ struct S3<T>(S<T, T>);
 struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
 "#,
             expect![[r#"
-                FixedPoint[T: invariant, U: invariant, V: invariant]
+                FixedPoint[T: covariant, U: covariant, V: covariant]
             "#]],
         );
     }
@@ -874,7 +897,7 @@ struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
             let mut defs: Vec<GenericDefId> = Vec::new();
             let module = db.module_for_file_opt(file_id.file_id(&db)).unwrap();
             let def_map = module.def_map(&db);
-            crate::tests::visit_module(&db, def_map, module.local_id, &mut |it| {
+            crate::tests::visit_module(&db, def_map, module, &mut |it| {
                 defs.push(match it {
                     ModuleDefId::FunctionId(it) => it.into(),
                     ModuleDefId::AdtId(it) => it.into(),
@@ -925,7 +948,7 @@ struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
                     res,
                     "{name}[{}]\n",
                     generics(&db, def)
-                        .iter()
+                        .iter(false)
                         .map(|(_, param)| match param {
                             GenericParamDataRef::TypeParamData(type_param_data) => {
                                 type_param_data.name.as_ref().unwrap()

@@ -10,7 +10,7 @@ the Zulip stream is the best place to *ask* for help.
 
 Documentation for contributing to the compiler or tooling is located in the [Guide to Rustc
 Development][rustc-dev-guide], commonly known as the [rustc-dev-guide]. Documentation for the
-standard library in the [Standard library developers Guide][std-dev-guide], commonly known as the [std-dev-guide].
+standard library is in the [Standard library developers Guide][std-dev-guide], commonly known as the [std-dev-guide].
 
 ## Making changes to subtrees and submodules
 
@@ -28,6 +28,15 @@ as well as to help new contributors get involved in rustc development. It is rec
 that you read and understand the [rustc-dev-guide] before making a contribution. This guide
 talks about the different bots in the Rust ecosystem, the Rust development tools,
 bootstrapping, the compiler architecture, source code representation, and more.
+
+## LLM policy
+
+We have a policy for how LLMs are allowed to be used in contributions to `rust-lang/rust`.
+You can read it [on Forge][LLM policy].
+For suggestions about how to use LLMs *well*, and how to review LLM-created PRs, see [the dev-guide][llm-guidance].
+
+[LLM policy]: https://forge.rust-lang.org/policies/llm-usage.html
+[llm-guidance]: https://rustc-dev-guide.rust-lang.org/llm-guidance.html
 
 ## [Getting help](https://rustc-dev-guide.rust-lang.org/getting-started.html#asking-questions)
 

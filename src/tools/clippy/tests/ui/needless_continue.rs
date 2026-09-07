@@ -1,5 +1,5 @@
 #![warn(clippy::needless_continue)]
-#![allow(clippy::uninlined_format_args)]
+#![expect(clippy::uninlined_format_args)]
 
 macro_rules! zero {
     ($x:expr) => {
@@ -338,6 +338,41 @@ fn issue15548() {
         if todo!() {
         } else {
             //~^ needless_continue
+            continue;
+        }
+    }
+}
+
+fn issue16256() {
+    fn some_condition() -> bool {
+        true
+    }
+    fn another_condition() -> bool {
+        true
+    }
+
+    for _ in 0..5 {
+        if some_condition() {
+            // ...
+            continue;
+        }
+
+        if another_condition() {
+            // ...
+            // "this `continue` expression is redundant" is posted on
+            // the `continue` node.
+            #[expect(clippy::needless_continue)]
+            continue;
+        }
+    }
+
+    for _ in 0..5 {
+        // "This `else` block is redundant" is posted on the
+        // `else` node.
+        #[expect(clippy::needless_continue)]
+        if some_condition() {
+            // ...
+        } else {
             continue;
         }
     }

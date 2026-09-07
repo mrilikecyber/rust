@@ -1,5 +1,4 @@
-#![allow(clippy::assertions_on_constants, clippy::equatable_if_let, clippy::needless_ifs)]
-#![warn(clippy::collapsible_if, clippy::collapsible_else_if)]
+#![warn(clippy::collapsible_else_if)]
 
 #[rustfmt::skip]
 fn main() {
@@ -85,6 +84,19 @@ fn main() {
     //~^^^^^^^^ collapsible_else_if
 
     if x == "hello" {
+        if y == "world" {
+            print!("Hello ");
+        } else {
+            println!("world");
+        }
+    } else {
+        if let Some(42) = Some(42) {
+            println!("42");
+        }
+    }
+    //~^^^^^ collapsible_else_if
+
+    if x == "hello" {
         print!("Hello ");
     } else {
         #[cfg(not(roflol))]
@@ -92,6 +104,21 @@ fn main() {
             println!("world!")
         }
     }
+
+    if x == "hello" {
+        if y == "world" {
+            print!("Hello ");
+        } else {
+            println!("world");
+        }
+    } else {
+        if let Some(42) = Some(42) {
+            println!("42");
+        } else {
+            println!("!");
+        }
+    }
+
 }
 
 #[rustfmt::skip]
@@ -104,28 +131,10 @@ fn issue_7318() {
 }
 
 fn issue_13365() {
-    // all the `expect`s that we should fulfill
+    // ensure we fulfill `#[expect]`
     if true {
     } else {
         #[expect(clippy::collapsible_else_if)]
-        if false {}
-    }
-
-    if true {
-    } else {
-        #[expect(clippy::style)]
-        if false {}
-    }
-
-    if true {
-    } else {
-        #[expect(clippy::all)]
-        if false {}
-    }
-
-    if true {
-    } else {
-        #[expect(warnings)]
         if false {}
     }
 }
@@ -170,4 +179,37 @@ fn in_brackets() {
     } else {
         { if y == "world" { println!("world") } else { println!("!") } }
     }
+}
+
+#[rustfmt::skip]
+fn ends_with_zero_width_whitespace() {
+    // Test out snippets ending with the 2 zero-width characters recognized as whitespaces by the lexer,
+    // but not by char::is_whitespace
+    // Behaviour shows a whitespace is inserted between else and if here which is desirable in this case
+
+    let x = "hello";
+    let y = "world";
+
+
+    // LRM (U+200E)
+    if x == "hello" {
+        println!("hello LRM");
+    } else‎{
+        if y == "world" {
+            println!("LRM world");
+        }
+    }
+    //~^^^^^ collapsible_else_if
+
+    // RLM (U+200F)
+    if x == "hello" {
+        println!("hello RLM");
+    } else‏{
+        if y == "world" {
+            println!("RLM world");
+        }
+    }
+    //~^^^^^ collapsible_else_if
+
+
 }

@@ -10,7 +10,7 @@ use tracing::trace;
 
 use super::{
     ImmTy, InterpCx, InterpResult, Machine, MinMax, MulAddType, OpTy, PlaceTy, Provenance, Scalar,
-    Size, TyAndLayout, assert_matches, interp_ok, throw_ub_format,
+    Size, TyAndLayout, interp_ok, throw_ub_format,
 };
 use crate::interpret::Writeable;
 
@@ -29,7 +29,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let dest = dest.force_mplace(self)?;
 
         match intrinsic_name {
-            sym::simd_insert => {
+            sym::simd_insert | sym::simd_insert_dyn => {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
                 let elem = &args[2];
                 let (input, input_len) = self.project_to_simd(&args[0])?;
@@ -38,7 +38,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 // Bounds are not checked by typeck so we have to do it ourselves.
                 if index >= input_len {
                     throw_ub_format!(
-                        "`simd_insert` index {index} is out-of-bounds of vector with length {input_len}"
+                        "`{intrinsic_name}` index {index} is out-of-bounds of vector with length {input_len}"
                     );
                 }
 
@@ -49,16 +49,25 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     self.copy_op(&value, &place)?;
                 }
             }
-            sym::simd_extract => {
+            sym::simd_extract | sym::simd_extract_dyn => {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
                 let (input, input_len) = self.project_to_simd(&args[0])?;
                 // Bounds are not checked by typeck so we have to do it ourselves.
                 if index >= input_len {
                     throw_ub_format!(
-                        "`simd_extract` index {index} is out-of-bounds of vector with length {input_len}"
+                        "`{intrinsic_name}` index {index} is out-of-bounds of vector with length {input_len}"
                     );
                 }
                 self.copy_op(&self.project_index(&input, index)?, &dest)?;
+            }
+            sym::simd_splat => {
+                let elem = &args[0];
+                let (dest, dest_len) = self.project_to_simd(&dest)?;
+
+                for i in 0..dest_len {
+                    let place = self.project_index(&dest, i)?;
+                    self.copy_op(elem, &place)?;
+                }
             }
             sym::simd_neg
             | sym::simd_fabs
@@ -165,8 +174,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             | sym::simd_le
             | sym::simd_gt
             | sym::simd_ge
-            | sym::simd_fmax
-            | sym::simd_fmin
+            | sym::simd_maximum_number_nsz
+            | sym::simd_minimum_number_nsz
             | sym::simd_saturating_add
             | sym::simd_saturating_sub
             | sym::simd_arith_offset => {
@@ -202,8 +211,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     sym::simd_le => Op::MirOp(BinOp::Le),
                     sym::simd_gt => Op::MirOp(BinOp::Gt),
                     sym::simd_ge => Op::MirOp(BinOp::Ge),
-                    sym::simd_fmax => Op::FMinMax(MinMax::MaxNum),
-                    sym::simd_fmin => Op::FMinMax(MinMax::MinNum),
+                    sym::simd_maximum_number_nsz => Op::FMinMax(MinMax::MaximumNumberNsz),
+                    sym::simd_minimum_number_nsz => Op::FMinMax(MinMax::MinimumNumberNsz),
                     sym::simd_saturating_add => Op::SaturatingOp(BinOp::Add),
                     sym::simd_saturating_sub => Op::SaturatingOp(BinOp::Sub),
                     sym::simd_arith_offset => Op::WrappingOffset,
@@ -251,7 +260,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                         }
                         Op::SaturatingOp(mir_op) => self.saturating_arith(mir_op, &left, &right)?,
                         Op::WrappingOffset => {
-                            let ptr = left.to_scalar().to_pointer(self)?;
+                            let ptr = left.to_scalar().to_pointer(self);
                             let offset_count = right.to_scalar().to_target_isize(self)?;
                             let pointee_ty = left.layout.ty.builtin_deref(true).unwrap();
 
@@ -295,8 +304,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     sym::simd_reduce_xor => Op::MirOp(BinOp::BitXor),
                     sym::simd_reduce_any => Op::MirOpBool(BinOp::BitOr),
                     sym::simd_reduce_all => Op::MirOpBool(BinOp::BitAnd),
-                    sym::simd_reduce_max => Op::MinMax(MinMax::MaxNum),
-                    sym::simd_reduce_min => Op::MinMax(MinMax::MinNum),
+                    sym::simd_reduce_max => Op::MinMax(MinMax::MaximumNumberNsz),
+                    sym::simd_reduce_min => Op::MinMax(MinMax::MinimumNumberNsz),
                     _ => unreachable!(),
                 };
 
@@ -320,8 +329,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                             } else {
                                 // Just boring integers, no NaNs to worry about.
                                 let mirop = match mmop {
-                                    MinMax::MinNum | MinMax::Minimum => BinOp::Le,
-                                    MinMax::MaxNum | MinMax::Maximum => BinOp::Ge,
+                                    MinMax::MinimumNumberNsz | MinMax::Minimum => BinOp::Le,
+                                    MinMax::MaximumNumberNsz | MinMax::Maximum => BinOp::Ge,
                                 };
                                 if self.binary_op(mirop, &res, &op)?.to_scalar().to_bool()? {
                                     res
@@ -545,7 +554,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let (right, right_len) = self.project_to_simd(&args[1])?;
                 let (dest, dest_len) = self.project_to_simd(&dest)?;
 
-                let index = generic_args[2].expect_const().to_value().valtree.unwrap_branch();
+                let index = generic_args[2].expect_const().to_branch();
                 let index_len = index.len();
 
                 assert_eq!(left_len, right_len);
@@ -553,7 +562,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
                 for i in 0..dest_len {
                     let src_index: u64 =
-                        index[usize::try_from(i).unwrap()].unwrap_leaf().to_u32().into();
+                        index[usize::try_from(i).unwrap()].to_leaf().to_u32().into();
                     let dest = self.project_index(&dest, i)?;
 
                     let val = if src_index < left_len {
@@ -657,9 +666,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.check_simd_ptr_alignment(
                     ptr,
                     dest_layout,
-                    generic_args[3].expect_const().to_value().valtree.unwrap_branch()[0]
-                        .unwrap_leaf()
-                        .to_simd_alignment(),
+                    generic_args[3].expect_const().to_branch()[0].to_leaf().to_simd_alignment(),
                 )?;
 
                 for i in 0..dest_len {
@@ -689,9 +696,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.check_simd_ptr_alignment(
                     ptr,
                     args[2].layout,
-                    generic_args[3].expect_const().to_value().valtree.unwrap_branch()[0]
-                        .unwrap_leaf()
-                        .to_simd_alignment(),
+                    generic_args[3].expect_const().to_branch()[0].to_leaf().to_simd_alignment(),
                 )?;
 
                 for i in 0..vals_len {
@@ -832,7 +837,20 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         vector_layout: TyAndLayout<'tcx>,
         alignment: SimdAlign,
     ) -> InterpResult<'tcx> {
-        assert_matches!(vector_layout.backend_repr, BackendRepr::SimdVector { .. });
+        // Packed SIMD types with non-power-of-two element counts use BackendRepr::Memory
+        // instead of BackendRepr::SimdVector. We need to handle both cases.
+        // FIXME: remove the BackendRepr::Memory case when SIMD vectors are always passed as BackendRepr::SimdVector.
+        assert!(vector_layout.ty.is_simd(), "check_simd_ptr_alignment called on non-SIMD type");
+        match vector_layout.backend_repr {
+            BackendRepr::SimdVector { .. } | BackendRepr::Memory { .. } => {}
+            _ => {
+                span_bug!(
+                    self.cur_span(),
+                    "SIMD type has unexpected backend_repr: {:?}",
+                    vector_layout.backend_repr
+                );
+            }
+        }
 
         let align = match alignment {
             ty::SimdAlign::Unaligned => {

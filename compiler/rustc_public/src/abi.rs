@@ -55,7 +55,7 @@ pub enum PassMode {
     /// The argument has a layout abi of `ScalarPair`.
     Pair(Opaque, Opaque),
     /// Pass the argument after casting it.
-    Cast { pad_i32: bool, cast: Opaque },
+    Cast { pad_i32_count: u8, cast: Opaque },
     /// Pass the argument indirectly via a hidden pointer.
     Indirect { attrs: Opaque, meta_attrs: Opaque, on_stack: bool },
 }
@@ -188,8 +188,25 @@ pub enum VariantsShape {
         tag: Scalar,
         tag_encoding: TagEncoding,
         tag_field: usize,
-        variants: Vec<LayoutShape>,
+        variants: Vec<VariantFields>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct VariantFields {
+    /// Offsets for the first byte of each field,
+    /// ordered to match the source definition order.
+    /// I.e.: It follows the same order as [super::ty::VariantDef::fields()].
+    /// This vector does not go in increasing order.
+    pub offsets: Vec<Size>,
+}
+
+impl VariantFields {
+    pub fn fields_by_offset_order(&self) -> Vec<FieldIdx> {
+        let mut indices = (0..self.offsets.len()).collect::<Vec<_>>();
+        indices.sort_by_key(|idx| self.offsets[*idx]);
+        indices
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -215,15 +232,28 @@ pub enum TagEncoding {
     },
 }
 
+/// How many scalable vectors are in a `ValueAbi::ScalableVector`?
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct NumScalableVectors(pub(crate) u8);
+
 /// Describes how values of the type are passed by target ABIs,
 /// in terms of categories of C types there are ABI rules for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum ValueAbi {
     Scalar(Scalar),
-    ScalarPair(Scalar, Scalar),
+    ScalarPair {
+        a: Scalar,
+        b: Scalar,
+        b_offset: Size,
+    },
     Vector {
         element: Scalar,
         count: u64,
+    },
+    ScalableVector {
+        element: Scalar,
+        count: u64,
+        number_of_vectors: NumScalableVectors,
     },
     Aggregate {
         /// If true, the size is exact, otherwise it's only a lower bound.
@@ -235,7 +265,15 @@ impl ValueAbi {
     /// Returns `true` if the layout corresponds to an unsized type.
     pub fn is_unsized(&self) -> bool {
         match *self {
-            ValueAbi::Scalar(_) | ValueAbi::ScalarPair(..) | ValueAbi::Vector { .. } => false,
+            ValueAbi::Scalar(_)
+            | ValueAbi::ScalarPair { .. }
+            | ValueAbi::Vector { .. }
+            // FIXME(rustc_scalable_vector): Scalable vectors are `Sized` while the
+            // `sized_hierarchy` feature is not yet fully implemented. After `sized_hierarchy` is
+            // fully implemented, scalable vectors will remain `Sized`, they just won't be
+            // `const Sized` - whether `is_unsized` continues to return `false` at that point will
+            // need to be revisited and will depend on what `is_unsized` is used for.
+            | ValueAbi::ScalableVector { .. } => false,
             ValueAbi::Aggregate { sized } => !sized,
         }
     }
@@ -420,8 +458,12 @@ pub enum CallConvention {
     Cold,
     PreserveMost,
     PreserveAll,
+    PreserveNone,
+    Tail,
 
     Custom,
+
+    Swift,
 
     // Target-specific calling conventions.
     ArmAapcs,

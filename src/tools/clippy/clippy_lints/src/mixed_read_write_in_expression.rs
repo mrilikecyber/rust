@@ -1,55 +1,11 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
 use clippy_utils::macros::root_macro_call_first_node;
-use clippy_utils::res::MaybeResPath;
+use clippy_utils::res::MaybeResPath as _;
 use clippy_utils::{get_parent_expr, sym};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{BinOpKind, Block, Expr, ExprKind, HirId, LetStmt, Node, Stmt, StmtKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty;
-use rustc_session::declare_lint_pass;
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for a read and a write to the same variable where
-    /// whether the read occurs before or after the write depends on the evaluation
-    /// order of sub-expressions.
-    ///
-    /// ### Why restrict this?
-    /// While [the evaluation order of sub-expressions] is fully specified in Rust,
-    /// it still may be confusing to read an expression where the evaluation order
-    /// affects its behavior.
-    ///
-    /// ### Known problems
-    /// Code which intentionally depends on the evaluation
-    /// order, or which is correct for any evaluation order.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// let mut x = 0;
-    ///
-    /// let a = {
-    ///     x = 1;
-    ///     1
-    /// } + x;
-    /// // Unclear whether a is 1 or 2.
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # let mut x = 0;
-    /// let tmp = {
-    ///     x = 1;
-    ///     1
-    /// };
-    /// let a = tmp + x;
-    /// ```
-    ///
-    /// [order]: (https://doc.rust-lang.org/reference/expressions.html?highlight=subexpression#evaluation-order-of-operands)
-    #[clippy::version = "pre 1.29.0"]
-    pub MIXED_READ_WRITE_IN_EXPRESSION,
-    restriction,
-    "whether a variable read occurs before a write depends on sub-expression evaluation order"
-}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -79,7 +35,53 @@ declare_clippy_lint! {
     "whether an expression contains a diverging sub expression"
 }
 
-declare_lint_pass!(EvalOrderDependence => [MIXED_READ_WRITE_IN_EXPRESSION, DIVERGING_SUB_EXPRESSION]);
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for a read and a write to the same variable where
+    /// whether the read occurs before or after the write depends on the evaluation
+    /// order of sub-expressions.
+    ///
+    /// ### Why restrict this?
+    /// While [the evaluation order of sub-expressions][order] is fully specified in Rust,
+    /// it still may be confusing to read an expression where the evaluation order
+    /// affects its behavior.
+    ///
+    /// ### Known problems
+    /// Code which intentionally depends on the evaluation
+    /// order, or which is correct for any evaluation order.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let mut x = 0;
+    ///
+    /// let a = {
+    ///     x = 1;
+    ///     1
+    /// } + x;
+    /// // Unclear whether a is 1 or 2.
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # let mut x = 0;
+    /// let tmp = {
+    ///     x = 1;
+    ///     1
+    /// };
+    /// let a = tmp + x;
+    /// ```
+    ///
+    /// [order]: https://doc.rust-lang.org/reference/expressions.html?highlight=subexpression#evaluation-order-of-operands
+    #[clippy::version = "pre 1.29.0"]
+    pub MIXED_READ_WRITE_IN_EXPRESSION,
+    restriction,
+    "whether a variable read occurs before a write depends on sub-expression evaluation order"
+}
+
+declare_lint_pass!(EvalOrderDependence => [
+    DIVERGING_SUB_EXPRESSION,
+    MIXED_READ_WRITE_IN_EXPRESSION,
+]);
 
 impl<'tcx> LateLintPass<'tcx> for EvalOrderDependence {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -154,18 +156,14 @@ impl<'tcx> Visitor<'tcx> for DivergenceVisitor<'_, 'tcx> {
         match e.kind {
             // fix #10776
             ExprKind::Block(block, ..) => match (block.stmts, block.expr) {
-                (stmts, Some(e)) => {
-                    if stmts.iter().all(|stmt| !stmt_might_diverge(stmt)) {
-                        self.visit_expr(e);
-                    }
+                (stmts, Some(e)) if stmts.iter().all(|stmt| !stmt_might_diverge(stmt)) => {
+                    self.visit_expr(e);
                 },
-                ([first @ .., stmt], None) => {
-                    if first.iter().all(|stmt| !stmt_might_diverge(stmt)) {
-                        match stmt.kind {
-                            StmtKind::Expr(e) | StmtKind::Semi(e) => self.visit_expr(e),
-                            _ => {},
-                        }
-                    }
+                ([first @ .., stmt], None)
+                    if first.iter().all(|stmt| !stmt_might_diverge(stmt))
+                        && let StmtKind::Expr(e) | StmtKind::Semi(e) = stmt.kind =>
+                {
+                    self.visit_expr(e);
                 },
                 _ => {},
             },
@@ -204,12 +202,11 @@ impl<'tcx> Visitor<'tcx> for DivergenceVisitor<'_, 'tcx> {
 /// This means reads for which there is a common ancestor between the read and
 /// the write such that
 ///
-/// * evaluating the ancestor necessarily evaluates both the read and the write (for example, `&x`
-///   and `|| x = 1` don't necessarily evaluate `x`), and
+/// * evaluating the ancestor necessarily evaluates both the read and the write (for example, `&x` and `|| x = 1` don't
+///   necessarily evaluate `x`), and
 ///
-/// * which one is evaluated first depends on the order of sub-expression evaluation. Blocks, `if`s,
-///   loops, `match`es, and the short-circuiting logical operators are considered to have a defined
-///   evaluation order.
+/// * which one is evaluated first depends on the order of sub-expression evaluation. Blocks, `if`s, loops, `match`es,
+///   and the short-circuiting logical operators are considered to have a defined evaluation order.
 ///
 /// When such a read is found, the lint is triggered.
 fn check_for_unsequenced_reads(vis: &mut ReadVisitor<'_, '_>) {
@@ -274,12 +271,11 @@ fn check_expr<'tcx>(vis: &mut ReadVisitor<'_, 'tcx>, expr: &'tcx Expr<'_>) -> St
         ExprKind::Closure { .. } => {
             // Either
             //
-            // * `var` is defined in the closure body, in which case we've reached the top of the enclosing
-            //   function and can stop, or
+            // * `var` is defined in the closure body, in which case we've reached the top of the enclosing function and
+            //   can stop, or
             //
-            // * `var` is captured by the closure, in which case, because evaluating a closure does not evaluate
-            //   its body, we don't necessarily have a write, so we need to stop to avoid generating false
-            //   positives.
+            // * `var` is captured by the closure, in which case, because evaluating a closure does not evaluate its
+            //   body, we don't necessarily have a write, so we need to stop to avoid generating false positives.
             //
             // This is also the only place we need to stop early (grrr).
             return StopEarly::Stop;

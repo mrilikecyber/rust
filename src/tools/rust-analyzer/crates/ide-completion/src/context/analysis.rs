@@ -1,9 +1,11 @@
 //! Module responsible for analyzing the code surrounding the cursor for completion.
 use std::iter;
 
-use hir::{ExpandResult, InFile, Semantics, Type, TypeInfo, Variant};
-use ide_db::{RootDatabase, active_parameter::ActiveParameter};
-use itertools::Either;
+use hir::{EnumVariant, ExpandResult, InFile, Semantics, Type, TypeInfo};
+use ide_db::{
+    RootDatabase, active_parameter::ActiveParameter, syntax_helpers::node_ext::find_loops,
+};
+use itertools::{Either, Itertools};
 use stdx::always;
 use syntax::{
     AstNode, AstToken, Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
@@ -20,7 +22,7 @@ use syntax::{
 };
 
 use crate::{
-    completions::postfix::is_in_condition,
+    completions::postfix::{is_in_condition, is_in_value},
     context::{
         AttrCtx, BreakableKind, COMPLETION_MARKER, CompletionAnalysis, DotAccess, DotAccessExprCtx,
         DotAccessKind, ItemListKind, LifetimeContext, LifetimeKind, NameContext, NameKind,
@@ -88,15 +90,9 @@ pub(super) fn expand_and_analyze<'db>(
     let original_offset = expansion.original_offset + relative_offset;
     let token = expansion.original_file.token_at_offset(original_offset).left_biased()?;
 
-    hir::attach_db(sema.db, || analyze(sema, expansion, original_token, &token)).map(
-        |(analysis, expected, qualifier_ctx)| AnalysisResult {
-            analysis,
-            expected,
-            qualifier_ctx,
-            token,
-            original_offset,
-        },
-    )
+    analyze(sema, expansion, original_token, &token).map(|(analysis, expected, qualifier_ctx)| {
+        AnalysisResult { analysis, expected, qualifier_ctx, token, original_offset }
+    })
 }
 
 fn token_at_offset_ignore_whitespace(file: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
@@ -288,9 +284,12 @@ fn expand(
     };
 
     // Expand pseudo-derive expansion aka `derive(Debug$0)`
-    if let Some((orig_attr, spec_attr)) = attrs {
+    if let Some((orig_attr, spec_attr)) = attrs
+        && let Some(orig_meta) = orig_attr.meta()
+    {
+        // FIXME: Support speculative expansion with `cfg_attr`.
         if let (Some(actual_expansion), Some((fake_expansion, fake_mapped_tokens))) = (
-            sema.expand_derive_as_pseudo_attr_macro(&orig_attr),
+            sema.expand_derive_as_pseudo_attr_macro(&orig_meta),
             sema.speculative_expand_derive_as_pseudo_attr_macro(
                 &orig_attr,
                 &spec_attr,
@@ -467,7 +466,9 @@ fn analyze<'db>(
     }
 
     // Overwrite the path kind for derives
-    if let Some((original_file, file_with_fake_ident, offset, origin_attr)) = derive_ctx {
+    if let Some((original_file, file_with_fake_ident, offset, origin_attr)) = derive_ctx
+        && let Some(origin_meta) = origin_attr.meta()
+    {
         if let Some(ast::NameLike::NameRef(name_ref)) =
             find_node_at_offset(&file_with_fake_ident, offset)
         {
@@ -477,7 +478,7 @@ fn analyze<'db>(
             if let NameRefKind::Path(path_ctx) = &mut nameref_ctx.kind {
                 path_ctx.kind = PathKind::Derive {
                     existing_derives: sema
-                        .resolve_derive_macro(&origin_attr)
+                        .resolve_derive_macro(&origin_meta)
                         .into_iter()
                         .flatten()
                         .flatten()
@@ -502,7 +503,7 @@ fn analyze<'db>(
             let token = syntax::algo::skip_trivia_token(self_token.clone(), Direction::Prev)?;
             let p = token.parent()?;
             if p.kind() == SyntaxKind::TOKEN_TREE
-                && p.ancestors().any(|it| it.kind() == SyntaxKind::META)
+                && p.ancestors().any(|it| it.kind() == SyntaxKind::TOKEN_TREE_META)
             {
                 let colon_prefix = previous_non_trivia_token(self_token.clone())
                     .is_some_and(|it| T![:] == it.kind());
@@ -510,10 +511,32 @@ fn analyze<'db>(
                 CompletionAnalysis::UnexpandedAttrTT {
                     fake_attribute_under_caret: fake_ident_token
                         .parent_ancestors()
-                        .find_map(ast::Attr::cast),
+                        .find_map(ast::TokenTreeMeta::cast),
                     colon_prefix,
                     extern_crate: p.ancestors().find_map(ast::ExternCrate::cast),
                 }
+            } else if p.kind() == SyntaxKind::TOKEN_TREE
+                && p.ancestors().any(|it| ast::Macro::can_cast(it.kind()))
+            {
+                if let Some([_ident, colon, _name, dollar]) = fake_ident_token
+                    .siblings_with_tokens(Direction::Prev)
+                    .filter(|it| !it.kind().is_trivia())
+                    .take(4)
+                    .collect_array()
+                    && dollar.kind() == T![$]
+                    && colon.kind() == T![:]
+                {
+                    CompletionAnalysis::MacroSegment
+                } else {
+                    return None;
+                }
+            } else if find_node_at_offset::<ast::CfgPredicate>(
+                &speculative_file,
+                speculative_offset,
+            )
+            .is_some()
+            {
+                CompletionAnalysis::CfgPredicate
             } else {
                 return None;
             }
@@ -600,15 +623,41 @@ fn expected_type_and_name<'db>(
                 Some(it) => it,
                 None => return ty,
             };
-            for _ in top_syn.ancestors().skip(1).map_while(ast::RefExpr::cast) {
+            let refs_level = top_syn
+                .ancestors()
+                .skip(1)
+                .map_while(Either::<ast::RefExpr, ast::PrefixExpr>::cast)
+                .take_while(|it| match it {
+                    Either::Left(_) => true,
+                    Either::Right(prefix) => prefix.op_kind() == Some(ast::UnaryOp::Deref),
+                })
+                .fold(0i32, |level, expr| match expr {
+                    Either::Left(_) => level + 1,
+                    Either::Right(_) => level - 1,
+                });
+            for _ in 0..refs_level {
                 cov_mark::hit!(expected_type_fn_param_ref);
                 ty = ty.strip_reference();
+            }
+            for _ in refs_level..0 {
+                cov_mark::hit!(expected_type_fn_param_deref);
+                ty = ty.add_reference(sema.db, hir::Mutability::Shared);
             }
             ty
         }
         _ => ty,
     };
 
+    let mut generic_def = None;
+    let mut rebase_ty = {
+        let node = node.clone();
+        move |ty: hir::Type<'db>| {
+            let def = *generic_def
+                .get_or_insert_with(|| sema.scope(&node).and_then(|scope| scope.generic_def()));
+            def.and_then(|def| ty.try_rebase_into_owner(sema.db, def))
+                .unwrap_or_else(|| ty.instantiate_with_errors())
+        }
+    };
     let (ty, name) = loop {
         break match_ast! {
             match node {
@@ -657,7 +706,7 @@ fn expected_type_and_name<'db>(
                     cov_mark::hit!(expected_type_fn_param);
                     ActiveParameter::at_token(
                         sema,
-                       token.clone(),
+                        token.clone(),
                     ).map(|ap| {
                         let name = ap.ident().map(NameOrNameRef::Name);
                         (Some(ap.ty), name)
@@ -718,6 +767,23 @@ fn expected_type_and_name<'db>(
                     }.map(TypeInfo::original);
                     (ty, None)
                 },
+                ast::MatchArm(it) => {
+                    let on_arrow = previous_non_trivia_token(token.clone()).is_some_and(|it| T![=>] == it.kind());
+                    let in_body = it.expr().is_some_and(|it| it.syntax().text_range().contains_range(token.text_range()));
+                    let match_expr = it.parent_match();
+
+                    let ty = if on_arrow || in_body {
+                        // match foo { ..., pat => $0 }
+                        cov_mark::hit!(expected_type_match_arm_body_without_leading_char);
+                        cov_mark::hit!(expected_type_match_arm_body_with_leading_char);
+                        sema.type_of_expr(&match_expr.into())
+                    } else {
+                        // match foo { $0 }
+                        cov_mark::hit!(expected_type_match_arm_without_leading_char);
+                        match_expr.expr().and_then(|e| sema.type_of_expr(&e))
+                    }.map(TypeInfo::original);
+                    (ty, None)
+                },
                 ast::IfExpr(it) => {
                     let ty = if let Some(body) = it.then_branch()
                         && token.text_range().end() > body.syntax().text_range().start()
@@ -728,29 +794,45 @@ fn expected_type_and_name<'db>(
                     }.map(TypeInfo::original);
                     (ty, None)
                 },
+                ast::MatchGuard(it) => {
+                    let ty = it.condition().and_then(|e| sema.type_of_expr(&e)).map(TypeInfo::original);
+                    (ty, None)
+                },
                 ast::IdentPat(it) => {
                     cov_mark::hit!(expected_type_if_let_with_leading_char);
                     cov_mark::hit!(expected_type_match_arm_with_leading_char);
                     let ty = sema.type_of_pat(&ast::Pat::from(it)).map(TypeInfo::original);
                     (ty, None)
                 },
+                ast::TupleStructPat(it) => {
+                    let fields = sema.resolve_tuple_struct_pat_fields(&it);
+                    let nr = it.fields().take_while(|it| it.syntax().text_range().end() <= token.text_range().start()).count();
+                    let ty = fields.and_then(|fields| Some(rebase_ty(fields.get(nr)?.1.clone())));
+                    (ty, None)
+                },
                 ast::Fn(it) => {
                     cov_mark::hit!(expected_type_fn_ret_with_leading_char);
                     cov_mark::hit!(expected_type_fn_ret_without_leading_char);
                     let def = sema.to_def(&it);
-                    (def.map(|def| def.ret_type(sema.db)), None)
+                    (def.map(|def| rebase_ty(def.ret_type(sema.db))), None)
                 },
                 ast::ReturnExpr(it) => {
                     let fn_ = sema.ancestors_with_macros(it.syntax().clone())
                         .find_map(Either::<ast::Fn, ast::ClosureExpr>::cast);
                     let ty = fn_.and_then(|f| match f {
-                        Either::Left(f) => Some(sema.to_def(&f)?.ret_type(sema.db)),
+                        Either::Left(f) => Some(rebase_ty(sema.to_def(&f)?.ret_type(sema.db))),
                         Either::Right(f) => {
                             let ty = sema.type_of_expr(&f.into())?.original.as_callable(sema.db)?;
                             Some(ty.return_type())
                         },
                     });
                     (ty, None)
+                },
+                ast::BreakExpr(it) => {
+                    let ty = it.break_token()
+                        .and_then(|it| find_loops(sema, &it)?.next())
+                        .and_then(|expr| sema.type_of_expr(&expr));
+                    (ty.map(TypeInfo::original), None)
                 },
                 ast::ClosureExpr(it) => {
                     let ty = sema.type_of_expr(&it.into());
@@ -766,6 +848,19 @@ fn expected_type_and_name<'db>(
                     ty.and_then(|ty| ty.original.as_callable(sema.db))
                         .map(|c| (Some(c.return_type()), None))
                         .unwrap_or((None, None))
+                },
+                ast::Variant(it) => {
+                    let is_simple_field = |field: ast::TupleField| {
+                        let Some(ty) = field.ty() else { return true };
+                        matches!(ty, ast::Type::PathType(_)) && ty.generic_arg_list().is_none()
+                    };
+                    let is_simple_variant = matches!(
+                        it.field_list(),
+                        Some(ast::FieldList::TupleFieldList(list))
+                        if list.syntax().children_with_tokens().all(|it| it.kind() != T![,])
+                            && list.fields().next().is_none_or(is_simple_field)
+                    );
+                    (None, it.name().filter(|_| is_simple_variant).map(NameOrNameRef::Name))
                 },
                 ast::Stmt(_) => (None, None),
                 ast::Item(_) => (None, None),
@@ -894,10 +989,10 @@ fn classify_name_ref<'db>(
     let field_expr_handle = |receiver, node| {
         let receiver = find_opt_node_in_file(original_file, receiver);
         let receiver_is_ambiguous_float_literal = match &receiver {
-            Some(ast::Expr::Literal(l)) => matches! {
-                l.kind(),
-                ast::LiteralKind::FloatNumber { .. } if l.syntax().last_token().is_some_and(|it| it.text().ends_with('.'))
-            },
+            Some(ast::Expr::Literal(l)) => {
+                matches!(l.kind(), ast::LiteralKind::FloatNumber { .. })
+                    && l.syntax().last_token().is_some_and(|it| it.text().ends_with('.'))
+            }
             _ => false,
         };
 
@@ -1012,25 +1107,6 @@ fn classify_name_ref<'db>(
             .and_then(|next| next.first_token())
             .is_some_and(|token| token.kind() == SyntaxKind::ELSE_KW)
     };
-    let is_in_value = |it: &SyntaxNode| {
-        let Some(node) = it.parent() else { return false };
-        let kind = node.kind();
-        ast::LetStmt::can_cast(kind)
-            || ast::ArgList::can_cast(kind)
-            || ast::ArrayExpr::can_cast(kind)
-            || ast::ParenExpr::can_cast(kind)
-            || ast::BreakExpr::can_cast(kind)
-            || ast::ReturnExpr::can_cast(kind)
-            || ast::PrefixExpr::can_cast(kind)
-            || ast::FormatArgsArg::can_cast(kind)
-            || ast::RecordExprField::can_cast(kind)
-            || ast::BinExpr::cast(node.clone())
-                .and_then(|expr| expr.rhs())
-                .is_some_and(|expr| expr.syntax() == it)
-            || ast::IndexExpr::cast(node)
-                .and_then(|expr| expr.index())
-                .is_some_and(|expr| expr.syntax() == it)
-    };
 
     // We do not want to generate path completions when we are sandwiched between an item decl signature and its body.
     // ex. trait Foo $0 {}
@@ -1089,7 +1165,7 @@ fn classify_name_ref<'db>(
                                     hir::ModuleDef::Adt(adt) => {
                                         sema.source(adt)?.value.generic_param_list()
                                     }
-                                    hir::ModuleDef::Variant(variant) => {
+                                    hir::ModuleDef::EnumVariant(variant) => {
                                         sema.source(variant.parent_enum(sema.db))?.value.generic_param_list()
                                     }
                                     hir::ModuleDef::Trait(trait_) => {
@@ -1098,18 +1174,16 @@ fn classify_name_ref<'db>(
                                             let arg_name = arg_name.text();
                                             for item in trait_.items_with_supertraits(sema.db) {
                                                 match item {
-                                                    hir::AssocItem::TypeAlias(assoc_ty) => {
-                                                        if assoc_ty.name(sema.db).as_str() == arg_name {
+                                                    hir::AssocItem::TypeAlias(assoc_ty)
+                                                        if assoc_ty.name(sema.db).as_str() == arg_name => {
                                                             override_location = Some(TypeLocation::AssocTypeEq);
                                                             return None;
-                                                        }
-                                                    },
-                                                    hir::AssocItem::Const(const_) => {
-                                                        if const_.name(sema.db)?.as_str() == arg_name {
+                                                        },
+                                                    hir::AssocItem::Const(const_)
+                                                        if const_.name(sema.db)?.as_str() == arg_name => {
                                                             override_location =  Some(TypeLocation::AssocConstEq);
                                                             return None;
-                                                        }
-                                                    },
+                                                        },
                                                     _ => (),
                                                 }
                                             }
@@ -1200,15 +1274,19 @@ fn classify_name_ref<'db>(
                     let original = ast::Const::cast(name.syntax().parent()?)?;
                     TypeLocation::TypeAscription(TypeAscriptionTarget::Const(original.body()))
                 },
-                ast::RetType(it) => {
-                    it.thin_arrow_token()?;
+                ast::Static(it) => {
+                    let name = find_opt_node_in_file(original_file, it.name())?;
+                    let original = ast::Static::cast(name.syntax().parent()?)?;
+                    TypeLocation::TypeAscription(TypeAscriptionTarget::Const(original.body()))
+                },
+                ast::RetType(_) => {
                     let parent = match ast::Fn::cast(parent.parent()?) {
                         Some(it) => it.param_list(),
                         None => ast::ClosureExpr::cast(parent.parent()?)?.param_list(),
                     };
 
                     let parent = find_opt_node_in_file(original_file, parent)?.syntax().parent()?;
-                    TypeLocation::TypeAscription(TypeAscriptionTarget::RetType(match_ast! {
+                    let body = match_ast! {
                         match parent {
                             ast::ClosureExpr(it) => {
                                 it.body()
@@ -1218,7 +1296,9 @@ fn classify_name_ref<'db>(
                             },
                             _ => return None,
                         }
-                    }))
+                    };
+                    let item = ast::Fn::cast(parent);
+                    TypeLocation::TypeAscription(TypeAscriptionTarget::RetType { body, item })
                 },
                 ast::Param(it) => {
                     it.colon_token()?;
@@ -1255,14 +1335,14 @@ fn classify_name_ref<'db>(
 
     let make_path_kind_expr = |expr: ast::Expr| {
         let it = expr.syntax();
+        let prev_token = iter::successors(it.first_token(), |it| it.prev_token())
+            .skip(1)
+            .find(|it| !it.kind().is_trivia());
         let in_block_expr = is_in_block(it);
         let (in_loop_body, innermost_breakable) = is_in_breakable(it).unzip();
         let after_if_expr = is_after_if_expr(it.clone());
-        let ref_expr_parent =
-            path.as_single_name_ref().and_then(|_| it.parent()).and_then(ast::RefExpr::cast);
-        let after_amp = non_trivia_sibling(it.clone().into(), Direction::Prev)
-            .map(|it| it.kind() == SyntaxKind::AMP)
-            .unwrap_or(false);
+        let after_amp = prev_token.as_ref().is_some_and(|it| it.kind() == SyntaxKind::AMP);
+        let ref_expr_parent = prev_token.and_then(|it| it.parent()).and_then(ast::RefExpr::cast);
         let (innermost_ret_ty, self_param) = {
             let find_ret_ty = |it: SyntaxNode| {
                 if let Some(item) = ast::Item::cast(it.clone()) {
@@ -1286,10 +1366,26 @@ fn classify_name_ref<'db>(
                     )
                 }
             };
-            let find_fn_self_param = |it| match it {
-                ast::Item::Fn(fn_) => Some(sema.to_def(&fn_).and_then(|it| it.self_param(sema.db))),
-                ast::Item::MacroCall(_) => None,
-                _ => Some(None),
+            let fn_self_param =
+                |fn_: ast::Fn| sema.to_def(&fn_).and_then(|it| it.self_param(sema.db));
+            let closure_this_param = |closure: ast::ClosureExpr| {
+                if closure.param_list()?.params().next()?.pat()?.syntax().text() != "this" {
+                    return None;
+                }
+                sema.type_of_expr(&closure.into())
+                    .and_then(|it| it.original.as_callable(sema.db))
+                    .and_then(|it| it.params().into_iter().next())
+            };
+            let find_fn_self_param = |it: SyntaxNode| {
+                match_ast! {
+                    match it {
+                        ast::Fn(fn_) => Some(fn_self_param(fn_).map(Either::Left)),
+                        ast::ClosureExpr(f) => closure_this_param(f).map(Either::Right).map(Some),
+                        ast::MacroCall(_) => None,
+                        ast::Item(_) => Some(None),
+                        _ => None,
+                    }
+                }
             };
 
             match find_node_in_file_compensated(sema, original_file, &expr) {
@@ -1302,7 +1398,6 @@ fn classify_name_ref<'db>(
 
                     let self_param = sema
                         .ancestors_with_macros(it.syntax().clone())
-                        .filter_map(ast::Item::cast)
                         .find_map(find_fn_self_param)
                         .flatten();
                     (innermost_ret_ty, self_param)
@@ -1321,12 +1416,11 @@ fn classify_name_ref<'db>(
         let incomplete_expr_stmt =
             it.parent().and_then(ast::ExprStmt::cast).map(|it| it.semicolon_token().is_none());
         let before_else_kw = before_else_kw(it);
-        let incomplete_let = it
-            .parent()
-            .and_then(ast::LetStmt::cast)
+        let incomplete_let = left_ancestors(it.parent())
+            .find_map(ast::LetStmt::cast)
             .is_some_and(|it| it.semicolon_token().is_none())
             || after_incomplete_let && incomplete_expr_stmt.unwrap_or(true) && !before_else_kw;
-        let in_value = is_in_value(it);
+        let in_value = is_in_value(&expr);
         let impl_ = fetch_immediate_impl_or_trait(sema, original_file, expr.syntax())
             .and_then(Either::left);
 
@@ -1432,7 +1526,7 @@ fn classify_name_ref<'db>(
                         | SyntaxKind::RECORD_FIELD
                 )
             })
-            .and_then(|_| nameref.as_ref()?.syntax().ancestors().find_map(ast::Adt::cast))
+            .and_then(|_| find_node_at_offset::<ast::Adt>(original_file, original_offset))
             .and_then(|adt| sema.derive_helpers_in_scope(&adt))
             .unwrap_or_default();
         Some(PathKind::Attr { attr_ctx: AttrCtx { kind, annotated_item_kind, derive_helpers } })
@@ -1487,7 +1581,7 @@ fn classify_name_ref<'db>(
                     kind_macro_call(it)?
                 },
                 ast::Meta(meta) => make_path_kind_attr(meta)?,
-                ast::Visibility(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
+                ast::VisibilityInner(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
                 ast::UseTree(_) => PathKind::Use,
                 // completing inside a qualifier
                 ast::Path(parent) => {
@@ -1516,7 +1610,7 @@ fn classify_name_ref<'db>(
                                 kind_macro_call(it)?
                             },
                             ast::Meta(meta) => make_path_kind_attr(meta)?,
-                            ast::Visibility(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
+                            ast::VisibilityInner(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
                             ast::UseTree(_) => PathKind::Use,
                             ast::RecordExpr(it) => make_path_kind_expr(it.into()),
                             _ => return None,
@@ -1569,7 +1663,7 @@ fn classify_name_ref<'db>(
                     let res = sema.resolve_path(&qualifier);
 
                     // For understanding how and why super_chain_len is calculated the way it
-                    // is check the documentation at it's definition
+                    // is check the documentation at its definition
                     let mut segment_count = 0;
                     let super_count = iter::successors(Some(qualifier.clone()), |p| p.qualifier())
                         .take_while(|p| {
@@ -1628,6 +1722,7 @@ fn classify_name_ref<'db>(
                     }
                 }
                 qualifier_ctx.vis_node = error_node.children().find_map(ast::Visibility::cast);
+                qualifier_ctx.abi_node = error_node.children().find_map(ast::Abi::cast);
             }
 
             if let PathKind::Item { .. } = path_ctx.kind
@@ -1635,7 +1730,7 @@ fn classify_name_ref<'db>(
                 && let Some(t) = top.first_token()
                 && let Some(prev) =
                     t.prev_token().and_then(|t| syntax::algo::skip_trivia_token(t, Direction::Prev))
-                && ![T![;], T!['}'], T!['{']].contains(&prev.kind())
+                && ![T![;], T!['}'], T!['{'], T![']']].contains(&prev.kind())
             {
                 // This was inferred to be an item position path, but it seems
                 // to be part of some other broken node which leaked into an item
@@ -1679,12 +1774,16 @@ fn pattern_context_for(
     let mut param_ctx = None;
 
     let mut missing_variants = vec![];
+    let is_pat_like = |kind| {
+        ast::Pat::can_cast(kind)
+            || ast::RecordPatField::can_cast(kind)
+            || ast::RecordPatFieldList::can_cast(kind)
+    };
 
-    let (refutability, has_type_ascription) =
-    pat
+    let (refutability, has_type_ascription) = pat
         .syntax()
         .ancestors()
-        .find(|it| !ast::Pat::can_cast(it.kind()))
+        .find(|it| !is_pat_like(it.kind()))
         .map_or((PatternRefutability::Irrefutable, false), |node| {
             let refutability = match_ast! {
                 match node {
@@ -1741,7 +1840,7 @@ fn pattern_context_for(
                                         });
 
                                         (!variant_already_present).then_some(*variant)
-                                    }).collect::<Vec<Variant>>())
+                                    }).collect::<Vec<EnumVariant>>())
                         });
 
                         if let Some(missing_variants_) = missing_variants_opt {
@@ -1877,6 +1976,13 @@ fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<(ast::Path, bool)> {
     Some((use_tree.path()?, true))
 }
 
+fn left_ancestors(node: Option<SyntaxNode>) -> impl Iterator<Item = SyntaxNode> {
+    node.into_iter().flat_map(|node| {
+        let end = node.text_range().end();
+        node.ancestors().take_while(move |it| it.text_range().end() == end)
+    })
+}
+
 fn is_in_token_of_for_loop(path: &ast::Path) -> bool {
     // oh my ...
     (|| {
@@ -1954,9 +2060,10 @@ fn is_after_if_expr(node: SyntaxNode) -> bool {
         Some(stmt) => stmt.syntax().clone(),
         None => node,
     };
-    let prev_sibling =
-        non_trivia_sibling(node.into(), Direction::Prev).and_then(NodeOrToken::into_node);
-    iter::successors(prev_sibling, |it| it.last_child_or_token()?.into_node())
+    let Some(prev_token) = previous_non_trivia_token(node) else { return false };
+    prev_token
+        .parent_ancestors()
+        .take_while(|it| it.text_range().end() == prev_token.text_range().end())
         .find_map(ast::IfExpr::cast)
         .is_some()
 }
@@ -1978,12 +2085,12 @@ fn next_non_trivia_token(e: impl Into<SyntaxElement>) -> Option<SyntaxToken> {
 }
 
 fn next_non_trivia_sibling(ele: SyntaxElement) -> Option<SyntaxElement> {
-    let mut e = ele.next_sibling_or_token();
-    while let Some(inner) = e {
-        if !inner.kind().is_trivia() {
-            return Some(inner);
+    let mut e = ele;
+    while let Some(next) = e.next_sibling_or_token() {
+        if !next.kind().is_trivia() {
+            return Some(next);
         } else {
-            e = inner.next_sibling_or_token();
+            e = next;
         }
     }
     None
@@ -2006,7 +2113,8 @@ fn prev_special_biased_token_at_trivia(mut token: SyntaxToken) -> SyntaxToken {
         | T![|]
         | T![return]
         | T![break]
-        | T![continue] = prev.kind()
+        | T![continue]
+        | T![lifetime_ident] = prev.kind()
     {
         token = prev
     }

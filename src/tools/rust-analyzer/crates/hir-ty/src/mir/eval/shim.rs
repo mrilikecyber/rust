@@ -3,48 +3,38 @@
 //!
 use std::cmp::{self, Ordering};
 
-use hir_def::{CrateRootModuleId, resolver::HasResolver, signatures::FunctionSignature};
-use hir_expand::name::Name;
-use intern::{Symbol, sym};
-use rustc_type_ir::inherent::{AdtDef, IntoKind, SliceLike, Ty as _};
+use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
+use rustc_abi::ExternAbi;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
     display::DisplayTarget,
     drop::{DropGlue, has_drop_glue},
     mir::eval::{
-        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, HirDisplay,
-        InternedClosure, Interval, IntervalAndTy, IntervalOrOwned, ItemContainerId, LangItem,
-        Layout, Locals, Lookup, MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, pad16,
+        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, HirDisplay, Interval,
+        IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
+        MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, from_bytes, not_supported, pad16,
     },
     next_solver::Region,
 };
 
 mod simd;
 
-macro_rules! from_bytes {
-    ($ty:tt, $value:expr) => {
-        ($ty::from_le_bytes(match ($value).try_into() {
-            Ok(it) => it,
-            #[allow(unreachable_patterns)]
-            Err(_) => return Err(MirEvalError::InternalError("mismatched size".into())),
-        }))
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalLangItem {
+    BeginPanic,
+    SliceLen,
+    DropInPlace,
 }
 
-macro_rules! not_supported {
-    ($it: expr) => {
-        return Err(MirEvalError::NotSupported(format!($it)))
-    };
-}
-
-impl<'db> Evaluator<'db> {
+impl<'a, 'db> Evaluator<'a, 'db> {
     pub(super) fn detect_and_exec_special_function(
         &mut self,
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, bool> {
@@ -52,8 +42,8 @@ impl<'db> Evaluator<'db> {
             return Ok(false);
         }
 
-        let function_data = self.db.function_signature(def);
-        let attrs = self.db.attrs(def.into());
+        let function_data = FunctionSignature::of(self.db, def);
+        let attrs = AttrFlags::query(self.db, def.into());
         let is_intrinsic = FunctionSignature::is_intrinsic(self.db, def);
 
         if is_intrinsic {
@@ -65,11 +55,13 @@ impl<'db> Evaluator<'db> {
                 locals,
                 span,
                 !function_data.has_body()
-                    || attrs.by_key(sym::rustc_intrinsic_must_be_overridden).exists(),
+                    || attrs.contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN),
             );
         }
         let is_extern_c = match def.lookup(self.db).container {
-            hir_def::ItemContainerId::ExternBlockId(block) => block.abi(self.db) == Some(sym::C),
+            hir_def::ItemContainerId::ExternBlockId(block) => {
+                matches!(block.abi(self.db), ExternAbi::C { .. })
+            }
             _ => false,
         };
         if is_extern_c {
@@ -85,18 +77,13 @@ impl<'db> Evaluator<'db> {
                 .map(|()| true);
         }
 
-        let alloc_fn =
-            attrs.iter().filter_map(|it| it.path().as_ident()).map(|it| it.symbol()).find(|it| {
-                [
-                    &sym::rustc_allocator,
-                    &sym::rustc_deallocator,
-                    &sym::rustc_reallocator,
-                    &sym::rustc_allocator_zeroed,
-                ]
-                .contains(it)
-            });
-        if let Some(alloc_fn) = alloc_fn {
-            self.exec_alloc_fn(alloc_fn, args, destination)?;
+        if attrs.intersects(
+            AttrFlags::RUSTC_ALLOCATOR
+                | AttrFlags::RUSTC_DEALLOCATOR
+                | AttrFlags::RUSTC_REALLOCATOR
+                | AttrFlags::RUSTC_ALLOCATOR_ZEROED,
+        ) {
+            self.exec_alloc_fn(attrs, args, destination)?;
             return Ok(true);
         }
         if let Some(it) = self.detect_lang_function(def) {
@@ -105,7 +92,7 @@ impl<'db> Evaluator<'db> {
             return Ok(true);
         }
         if let ItemContainerId::TraitId(t) = def.lookup(self.db).container
-            && self.db.lang_attr(t.into()) == Some(LangItem::Clone)
+            && Some(t) == self.lang_items().Clone
         {
             let [self_ty] = generic_args.as_slice() else {
                 not_supported!("wrong generic arg count for clone");
@@ -131,12 +118,8 @@ impl<'db> Evaluator<'db> {
         def: FunctionId,
     ) -> Result<'db, Option<FunctionId>> {
         // `PanicFmt` is redirected to `ConstPanicFmt`
-        if let Some(LangItem::PanicFmt) = self.db.lang_attr(def.into()) {
-            let resolver = CrateRootModuleId::from(self.crate_id).resolver(self.db);
-
-            let Some(const_panic_fmt) =
-                LangItem::ConstPanicFmt.resolve_function(self.db, resolver.krate())
-            else {
+        if Some(def) == self.lang_items().PanicFmt {
+            let Some(const_panic_fmt) = self.lang_items().ConstPanicFmt else {
                 not_supported!("const_panic_fmt lang item not found or not a function");
             };
             return Ok(Some(const_panic_fmt));
@@ -150,7 +133,7 @@ impl<'db> Evaluator<'db> {
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         self_ty: Ty<'db>,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -163,19 +146,14 @@ impl<'db> Evaluator<'db> {
                 return destination
                     .write_from_interval(self, Interval { addr, size: destination.size });
             }
-            TyKind::Closure(id, subst) => {
-                let [arg] = args else {
-                    not_supported!("wrong arg count for clone");
-                };
-                let addr = Address::from_bytes(arg.get(self)?)?;
-                let InternedClosure(closure_owner, _) = self.db.lookup_intern_closure(id.0);
-                let infer = self.db.infer(closure_owner);
-                let (captures, _) = infer.closure_info(id.0);
-                let layout = self.layout(self_ty)?;
-                let db = self.db;
-                let ty_iter = captures.iter().map(|c| c.ty(db, subst));
-                self.exec_clone_for_fields(ty_iter, layout, addr, def, locals, destination, span)?;
-            }
+            TyKind::Closure(_, closure_args) => self.exec_clone(
+                def,
+                args,
+                closure_args.as_closure().tupled_upvars_ty(),
+                locals,
+                destination,
+                span,
+            )?,
             TyKind::Tuple(subst) => {
                 let [arg] = args else {
                     not_supported!("wrong arg count for clone");
@@ -196,7 +174,7 @@ impl<'db> Evaluator<'db> {
                 self.exec_fn_with_args(
                     def,
                     args,
-                    GenericArgs::new_from_iter(self.interner(), [self_ty.into()]),
+                    GenericArgs::new_from_slice(&[self_ty.into()]),
                     locals,
                     destination,
                     None,
@@ -213,7 +191,7 @@ impl<'db> Evaluator<'db> {
         layout: Arc<Layout>,
         addr: Address,
         def: FunctionId,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -245,12 +223,14 @@ impl<'db> Evaluator<'db> {
 
     fn exec_alloc_fn(
         &mut self,
-        alloc_fn: &Symbol,
+        alloc_fn: AttrFlags,
         args: &[IntervalAndTy<'db>],
         destination: Interval,
     ) -> Result<'db, ()> {
         match alloc_fn {
-            _ if *alloc_fn == sym::rustc_allocator_zeroed || *alloc_fn == sym::rustc_allocator => {
+            _ if alloc_fn
+                .intersects(AttrFlags::RUSTC_ALLOCATOR_ZEROED | AttrFlags::RUSTC_ALLOCATOR) =>
+            {
                 let [size, align] = args else {
                     return Err(MirEvalError::InternalError(
                         "rustc_allocator args are not provided".into(),
@@ -261,8 +241,8 @@ impl<'db> Evaluator<'db> {
                 let result = self.heap_allocate(size, align)?;
                 destination.write_from_bytes(self, &result.to_bytes())?;
             }
-            _ if *alloc_fn == sym::rustc_deallocator => { /* no-op for now */ }
-            _ if *alloc_fn == sym::rustc_reallocator => {
+            _ if alloc_fn.contains(AttrFlags::RUSTC_DEALLOCATOR) => { /* no-op for now */ }
+            _ if alloc_fn.contains(AttrFlags::RUSTC_REALLOCATOR) => {
                 let [ptr, old_size, align, new_size] = args else {
                     return Err(MirEvalError::InternalError(
                         "rustc_allocator args are not provided".into(),
@@ -286,19 +266,26 @@ impl<'db> Evaluator<'db> {
         Ok(())
     }
 
-    fn detect_lang_function(&self, def: FunctionId) -> Option<LangItem> {
-        use LangItem::*;
-        let attrs = self.db.attrs(def.into());
+    fn detect_lang_function(&self, def: FunctionId) -> Option<EvalLangItem> {
+        use EvalLangItem::*;
+        let lang_items = self.lang_items();
+        let attrs = AttrFlags::query(self.db, def.into());
 
-        if attrs.by_key(sym::rustc_const_panic_str).exists() {
+        if attrs.contains(AttrFlags::RUSTC_CONST_PANIC_STR) {
             // `#[rustc_const_panic_str]` is treated like `lang = "begin_panic"` by rustc CTFE.
-            return Some(LangItem::BeginPanic);
+            return Some(BeginPanic);
         }
 
-        let candidate = attrs.lang_item()?;
         // We want to execute these functions with special logic
         // `PanicFmt` is not detected here as it's redirected later.
-        if [BeginPanic, SliceLen, DropInPlace].contains(&candidate) {
+        if let Some((_, candidate)) = [
+            (lang_items.BeginPanic, BeginPanic),
+            (lang_items.SliceLen, SliceLen),
+            (lang_items.DropInPlace, DropInPlace),
+        ]
+        .iter()
+        .find(|&(candidate, _)| candidate == Some(def))
+        {
             return Some(candidate);
         }
 
@@ -307,13 +294,13 @@ impl<'db> Evaluator<'db> {
 
     fn exec_lang_item(
         &mut self,
-        it: LangItem,
+        it: EvalLangItem,
         generic_args: GenericArgs<'db>,
         args: &[IntervalAndTy<'db>],
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
     ) -> Result<'db, Vec<u8>> {
-        use LangItem::*;
+        use EvalLangItem::*;
         let mut args = args.iter();
         match it {
             BeginPanic => {
@@ -374,7 +361,6 @@ impl<'db> Evaluator<'db> {
                 )?;
                 Ok(vec![])
             }
-            it => not_supported!("Executing lang item {it:?}"),
         }
     }
 
@@ -383,7 +369,7 @@ impl<'db> Evaluator<'db> {
         id: i64,
         args: &[IntervalAndTy<'db>],
         destination: Interval,
-        _locals: &Locals<'db>,
+        _locals: &Locals<'a, 'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         match id {
@@ -414,7 +400,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         _generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
     ) -> Result<'db, ()> {
         match as_str {
@@ -440,7 +426,7 @@ impl<'db> Evaluator<'db> {
                         "libc::write args are not provided".into(),
                     ));
                 };
-                let fd = u128::from_le_bytes(pad16(fd.get(self)?, false));
+                let fd = u128::from_le_bytes(pad16(fd.get(self)?, IsSigned::No));
                 let interval = Interval {
                     addr: Address::from_bytes(ptr.get(self)?)?,
                     size: from_bytes!(usize, len.get(self)?),
@@ -487,7 +473,7 @@ impl<'db> Evaluator<'db> {
                         "pthread_getspecific arg0 is not provided".into(),
                     ));
                 };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, false)[0..8]);
+                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
                 let value = self.thread_local_storage.get_key(key)?;
                 destination.write_from_bytes(self, &value.to_le_bytes()[0..destination.size])?;
                 Ok(())
@@ -498,13 +484,13 @@ impl<'db> Evaluator<'db> {
                         "pthread_setspecific arg0 is not provided".into(),
                     ));
                 };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, false)[0..8]);
+                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
                 let Some(arg1) = args.get(1) else {
                     return Err(MirEvalError::InternalError(
                         "pthread_setspecific arg1 is not provided".into(),
                     ));
                 };
-                let value = from_bytes!(u128, pad16(arg1.get(self)?, false));
+                let value = from_bytes!(u128, pad16(arg1.get(self)?, IsSigned::No));
                 self.thread_local_storage.set_key(key, value)?;
                 // return 0 as success
                 destination.write_from_bytes(self, &0u64.to_le_bytes()[0..destination.size])?;
@@ -526,7 +512,7 @@ impl<'db> Evaluator<'db> {
             "sched_getaffinity" => {
                 let [_pid, _set_size, set] = args else {
                     return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
+                        "sched_getaffinity args are not provided".into(),
                     ));
                 };
                 let set = Address::from_bytes(set.get(self)?)?;
@@ -538,9 +524,7 @@ impl<'db> Evaluator<'db> {
             }
             "getenv" => {
                 let [name] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
-                    ));
+                    return Err(MirEvalError::InternalError("getenv args are not provided".into()));
                 };
                 let mut name_buf = vec![];
                 let name = {
@@ -580,7 +564,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
         needs_override: bool,
     ) -> Result<'db, bool> {
@@ -749,9 +733,7 @@ impl<'db> Evaluator<'db> {
                 let size = self.size_of_sized(ty, locals, "size_of arg")?;
                 destination.write_from_bytes(self, &size.to_le_bytes()[0..destination.size])
             }
-            // FIXME: `min_align_of` was renamed to `align_of` in Rust 1.89
-            // (https://github.com/rust-lang/rust/pull/142410)
-            "min_align_of" | "align_of" => {
+            "align_of" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of generic arg is not provided".into(),
@@ -779,9 +761,7 @@ impl<'db> Evaluator<'db> {
                     destination.write_from_bytes(self, &size.to_le_bytes())
                 }
             }
-            // FIXME: `min_align_of_val` was renamed to `align_of_val` in Rust 1.89
-            // (https://github.com/rust-lang/rust/pull/142410)
-            "min_align_of_val" | "align_of_val" => {
+            "align_of_val" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of_val generic arg is not provided".into(),
@@ -833,7 +813,7 @@ impl<'db> Evaluator<'db> {
                         "size_of generic arg is not provided".into(),
                     ));
                 };
-                let result = match has_drop_glue(&self.infcx, ty, self.trait_env.clone()) {
+                let result = match has_drop_glue(&self.infcx, ty, self.param_env.param_env) {
                     DropGlue::HasDropGlue => true,
                     DropGlue::None => false,
                     DropGlue::DependOnParams => {
@@ -848,7 +828,7 @@ impl<'db> Evaluator<'db> {
                 // cases.
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
-                        "wrapping_add args are not provided".into(),
+                        "ptr_guaranteed_cmp args are not provided".into(),
                     ));
                 };
                 let ans = lhs.get(self)? == rhs.get(self)?;
@@ -860,8 +840,8 @@ impl<'db> Evaluator<'db> {
                         "saturating_add args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = match name {
                     "saturating_add" => lhs.saturating_add(rhs),
                     "saturating_sub" => lhs.saturating_sub(rhs),
@@ -882,8 +862,8 @@ impl<'db> Evaluator<'db> {
                         "wrapping_add args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_add(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
@@ -893,8 +873,8 @@ impl<'db> Evaluator<'db> {
                         "wrapping_sub args are not provided".into(),
                     ));
                 };
-                let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_sub(rhs);
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -911,8 +891,8 @@ impl<'db> Evaluator<'db> {
                         "wrapping_sub args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_sub(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
@@ -922,8 +902,8 @@ impl<'db> Evaluator<'db> {
                         "wrapping_mul args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_mul(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
@@ -934,8 +914,8 @@ impl<'db> Evaluator<'db> {
                         "unchecked_shl args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_shl(rhs as u32);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
@@ -946,8 +926,8 @@ impl<'db> Evaluator<'db> {
                         "unchecked_shr args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.wrapping_shr(rhs as u32);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
@@ -958,8 +938,8 @@ impl<'db> Evaluator<'db> {
                         "unchecked_rem args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.checked_rem(rhs).ok_or_else(|| {
                     MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
                 })?;
@@ -972,8 +952,8 @@ impl<'db> Evaluator<'db> {
                         "unchecked_div args are not provided".into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let ans = lhs.checked_div(rhs).ok_or_else(|| {
                     MirEvalError::UndefinedBehavior("unchecked_rem with bad inputs".to_owned())
                 })?;
@@ -990,8 +970,8 @@ impl<'db> Evaluator<'db> {
                     [lhs.ty, Ty::new_bool(self.interner())].into_iter(),
                 );
                 let op_size = self.size_of_sized(lhs.ty, locals, "operand of add_with_overflow")?;
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
                 let (ans, u128overflow) = match name {
                     "add_with_overflow" => lhs.overflowing_add(rhs),
                     "sub_with_overflow" => lhs.overflowing_sub(rhs),
@@ -1031,6 +1011,43 @@ impl<'db> Evaluator<'db> {
                 let src = Interval { addr: src, size };
                 let dst = Interval { addr: dst, size };
                 dst.write_from_interval(self, src)
+            }
+            "slice_get_unchecked" => {
+                let [slice_ptr, index] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "slice_get_unchecked args are not provided".into(),
+                    ));
+                };
+                let Some(ty) = generic_args.as_slice().get(2).and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "slice_get_unchecked item type is not provided".into(),
+                    ));
+                };
+                let slice_ptr = slice_ptr.get(self)?;
+                let ptr_size = self.ptr_size();
+                let Some(data) = slice_ptr.get(..ptr_size) else {
+                    return Err(MirEvalError::InternalError(
+                        "slice_get_unchecked slice pointer is too small".into(),
+                    ));
+                };
+                let Some(len) = slice_ptr.get(ptr_size..2 * ptr_size) else {
+                    return Err(MirEvalError::InternalError(
+                        "slice_get_unchecked slice metadata is missing".into(),
+                    ));
+                };
+                let slice_ptr = Address::from_bytes(data)?;
+                let len = from_bytes!(usize, len);
+                let index = from_bytes!(usize, index.get(self)?);
+                if index >= len {
+                    return Err(MirEvalError::UndefinedBehavior(format!(
+                        "slice_get_unchecked index {index} is out of bounds for slice of length {len}"
+                    )));
+                }
+                let size = self.size_of_sized(ty, locals, "slice_get_unchecked item type")?;
+                let offset = index* size;
+                let addr = slice_ptr.to_usize() + offset;
+                let addr = Address::from_usize(addr);
+                destination.write_from_bytes(self, &addr.to_bytes()[..destination.size])
             }
             "offset" | "arith_offset" => {
                 let [ptr, offset] = args else {
@@ -1072,18 +1089,21 @@ impl<'db> Evaluator<'db> {
                     };
                     ty
                 };
-                let ptr = u128::from_le_bytes(pad16(ptr.get(self)?, false));
-                let offset = u128::from_le_bytes(pad16(offset.get(self)?, false));
+                let ptr = u128::from_le_bytes(pad16(ptr.get(self)?, IsSigned::No));
+                let offset = u128::from_le_bytes(pad16(offset.get(self)?, IsSigned::No));
                 let size = self.size_of_sized(ty, locals, "offset ptr type")? as u128;
                 let ans = ptr + offset * size;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "assert_inhabited" | "assert_zero_valid" | "assert_uninit_valid" | "assume" => {
+            "assert_inhabited"
+            | "assert_zero_valid"
+            | "assert_uninit_valid"
+            | "assert_mem_uninitialized_valid" => {
                 // FIXME: We should actually implement these checks
                 Ok(())
             }
             "forget" => {
-                // We don't call any drop glue yet, so there is nothing here
+                // FIXME
                 Ok(())
             }
             "transmute" | "transmute_unchecked" => {
@@ -1098,7 +1118,7 @@ impl<'db> Evaluator<'db> {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctpop arg is not provided".into()));
                 };
-                let result = u128::from_le_bytes(pad16(arg.get(self)?, false)).count_ones();
+                let result = u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)).count_ones();
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
@@ -1107,7 +1127,7 @@ impl<'db> Evaluator<'db> {
                     return Err(MirEvalError::InternalError("ctlz arg is not provided".into()));
                 };
                 let result =
-                    u128::from_le_bytes(pad16(arg.get(self)?, false)).leading_zeros() as usize;
+                    u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)).leading_zeros() as usize;
                 let result = result - (128 - arg.interval.size * 8);
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
@@ -1116,7 +1136,9 @@ impl<'db> Evaluator<'db> {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("cttz arg is not provided".into()));
                 };
-                let result = u128::from_le_bytes(pad16(arg.get(self)?, false)).trailing_zeros();
+                let arg: &[u8] = arg.get(self)?;
+                let bit_count = arg.len() as u32 * 8;
+                let result = u128::from_le_bytes(pad16(arg, IsSigned::No)).trailing_zeros().min(bit_count);
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
@@ -1219,16 +1241,12 @@ impl<'db> Evaluator<'db> {
                     let addr = tuple.interval.addr.offset(offset);
                     args.push(IntervalAndTy::new(addr, field, self, locals)?);
                 }
-                if let Some(target) = LangItem::FnOnce.resolve_trait(self.db, self.crate_id)
-                    && let Some(def) = target
-                        .trait_items(self.db)
-                        .method_by_name(&Name::new_symbol_root(sym::call_once))
-                {
+                if let Some(def) = self.lang_items().FnOnce_call_once {
                     self.exec_fn_trait(
                         def,
                         &args,
                         // FIXME: wrong for manual impls of `FnOnce`
-                        GenericArgs::new_from_iter(self.interner(), []),
+                        GenericArgs::empty(self.interner()),
                         locals,
                         destination,
                         None,
@@ -1329,7 +1347,7 @@ impl<'db> Evaluator<'db> {
                 {
                     result = (l as i8).cmp(&(r as i8));
                 }
-                if let Some(e) = LangItem::Ordering.resolve_enum(self.db, self.crate_id) {
+                if let Some(e) = self.lang_items().Ordering {
                     let ty = self.db.ty(e.into()).skip_binder();
                     let r = self.compute_discriminant(ty, &[result as i8 as u8])?;
                     destination.write_from_bytes(self, &r.to_le_bytes()[0..destination.size])?;
@@ -1352,6 +1370,93 @@ impl<'db> Evaluator<'db> {
                 .write_from_interval(self, meta.interval)?;
                 Ok(())
             }
+            "fabs" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "fabs intrinsic signature doesn't match fn (T) -> T".into(),
+                    ));
+                };
+                let mut bytes = arg.get(self)?.to_vec();
+                if let Some(sign_byte) = bytes.last_mut() {
+                    *sign_byte &= 0x7f;
+                }
+                destination.write_from_bytes(self, &bytes)
+            }
+            "unreachable" => {
+                return Err(MirEvalError::UndefinedBehavior(
+                    "`unreachable` intrinsic executed".to_owned(),
+                ));
+            }
+            "const_allocate" => {
+                let [size, align] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "const_allocate args are not provided".into(),
+                    ));
+                };
+                let size = from_bytes!(usize, size.get(self)?);
+                let align = from_bytes!(usize, align.get(self)?);
+                let result = self.heap_allocate(size, align)?;
+                destination.write_from_bytes(self, &result.to_bytes())
+            }
+            "const_deallocate" => Ok(()),
+            "caller_location" => {
+                let Some(location_adt) = self.lang_items().PanicLocation else {
+                    not_supported!("`caller_location` requires the `panic_location` lang item");
+                };
+                let location_ty = self.db.ty(location_adt.into()).skip_binder();
+                let TyKind::Adt(_, subst) = location_ty.kind() else {
+                    return Err(MirEvalError::InternalError(
+                        "`panic_location` lang item is not an ADT".into(),
+                    ));
+                };
+                let layout = self.layout(location_ty)?;
+                let (file, line, col) = self.caller_location_fields(locals.body.owner, span);
+                let file_len = file.len();
+                let file_addr = self.heap_allocate(file_len + 1, 1)?;
+                self.write_memory(file_addr, file.as_bytes())?;
+                let ptr_size = self.ptr_size();
+                let field_types = self.db.field_types(location_adt.into());
+                let mut line_col = [line, col].into_iter();
+                let mut fields = Vec::with_capacity(field_types.iter().count());
+                for (_, field) in field_types.iter() {
+                    let field_ty = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let bytes =
+                        if matches!(field_ty.kind(), TyKind::Uint(rustc_type_ir::UintTy::U32)) {
+                            line_col.next().unwrap_or(0).to_le_bytes().to_vec()
+                        } else {
+                            let size =
+                                self.size_of_sized(field_ty, locals, "caller_location field")?;
+                            if size == ptr_size * 2 {
+                                // The string slice pointing at the file name: (data pointer, length).
+                                let mut bytes = file_addr.to_bytes()[..ptr_size].to_vec();
+                                bytes.extend_from_slice(&file_len.to_le_bytes()[..ptr_size]);
+                                bytes
+                            } else {
+                                vec![0; size]
+                            }
+                        };
+                    fields.push(IntervalOrOwned::Owned(bytes));
+                }
+                let location = self.construct_with_layout(
+                    layout.size.bytes_usize(),
+                    &layout,
+                    None,
+                    fields.into_iter(),
+                )?;
+                let location_addr =
+                    self.heap_allocate(layout.size.bytes_usize(), layout.align.bytes() as usize)?;
+                self.write_memory(location_addr, &location)?;
+                destination.write_from_bytes(self, &location_addr.to_bytes()[..ptr_size])
+            }
+            "box_new" => {
+                let ty = generic_args.type_at(0);
+                let Some((size, align)) = self.size_align_of(ty, locals)? else {
+                    not_supported!("unsized box initialization");
+                };
+                let addr = self.heap_allocate(size, align)?;
+                self.copy_from_interval(addr, args[0].interval)?;
+                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
+            }
             _ if needs_override => not_supported!("intrinsic {name} is not implemented"),
             _ => return Ok(false),
         }
@@ -1362,7 +1467,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         ty: Ty<'db>,
         metadata: Interval,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
     ) -> Result<'db, (usize, usize)> {
         Ok(match ty.kind() {
             TyKind::Str => (from_bytes!(usize, metadata.get(self)?), 1),
@@ -1377,15 +1482,21 @@ impl<'db> Evaluator<'db> {
                 "dyn concrete type",
             )?,
             TyKind::Adt(adt_def, subst) => {
-                let id = adt_def.def_id().0;
+                let id = adt_def.def_id();
                 let layout = self.layout_adt(id, subst)?;
                 let id = match id {
                     AdtId::StructId(s) => s,
                     _ => not_supported!("unsized enum or union"),
                 };
                 let field_types = self.db.field_types(id.into());
-                let last_field_ty =
-                    field_types.iter().next_back().unwrap().1.instantiate(self.interner(), subst);
+                let last_field_ty = field_types
+                    .iter()
+                    .next_back()
+                    .unwrap()
+                    .1
+                    .ty()
+                    .instantiate(self.interner(), subst)
+                    .skip_norm_wip();
                 let sized_part_size =
                     layout.fields.offset(field_types.iter().count() - 1).bytes_usize();
                 let sized_part_align = layout.align.bytes() as usize;
@@ -1416,7 +1527,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'db>,
+        locals: &Locals<'a, 'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so
@@ -1458,43 +1569,43 @@ impl<'db> Evaluator<'db> {
         }
         if name.starts_with("xadd_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = lhs.wrapping_add(rhs);
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }
         if name.starts_with("xsub_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = lhs.wrapping_sub(rhs);
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }
         if name.starts_with("and_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = lhs & rhs;
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }
         if name.starts_with("or_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = lhs | rhs;
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }
         if name.starts_with("xor_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = lhs ^ rhs;
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }
         if name.starts_with("nand_") {
             destination.write_from_interval(self, arg0_interval)?;
-            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, IsSigned::No));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, IsSigned::No));
             let ans = !(lhs & rhs);
             return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
         }

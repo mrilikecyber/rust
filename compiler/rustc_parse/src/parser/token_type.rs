@@ -91,6 +91,7 @@ pub enum TokenType {
     KwElse,
     KwEnum,
     KwExtern,
+    KwFinal,
     KwFn,
     KwFor,
     KwGen,
@@ -105,6 +106,7 @@ pub enum TokenType {
     KwMod,
     KwMove,
     KwMut,
+    KwPin,
     KwPub,
     KwRaw,
     KwRef,
@@ -129,6 +131,7 @@ pub enum TokenType {
     // Keyword-like symbols.
     // tidy-alphabetical-start
     SymAttSyntax,
+    SymBikeshed,
     SymClobberAbi,
     SymInlateout,
     SymInout,
@@ -232,6 +235,7 @@ impl TokenType {
             KwExtern,
             KwFn,
             KwFor,
+            KwFinal,
             KwGen,
             KwIf,
             KwImpl,
@@ -244,6 +248,7 @@ impl TokenType {
             KwMod,
             KwMove,
             KwMut,
+            KwPin,
             KwPub,
             KwRaw,
             KwRef,
@@ -308,6 +313,7 @@ impl TokenType {
             TokenType::KwExtern => Some(kw::Extern),
             TokenType::KwFn => Some(kw::Fn),
             TokenType::KwFor => Some(kw::For),
+            TokenType::KwFinal => Some(kw::Final),
             TokenType::KwGen => Some(kw::Gen),
             TokenType::KwIf => Some(kw::If),
             TokenType::KwImpl => Some(kw::Impl),
@@ -320,6 +326,7 @@ impl TokenType {
             TokenType::KwMod => Some(kw::Mod),
             TokenType::KwMove => Some(kw::Move),
             TokenType::KwMut => Some(kw::Mut),
+            TokenType::KwPin => Some(kw::Pin),
             TokenType::KwPub => Some(kw::Pub),
             TokenType::KwRaw => Some(kw::Raw),
             TokenType::KwRef => Some(kw::Ref),
@@ -523,6 +530,7 @@ macro_rules! exp {
     (Extern)         => { exp!(@kw, Extern,     KwExtern) };
     (Fn)             => { exp!(@kw, Fn,         KwFn) };
     (For)            => { exp!(@kw, For,        KwFor) };
+    (Final)          => { exp!(@kw, Final,      KwFinal) };
     (Gen)            => { exp!(@kw, Gen,        KwGen) };
     (If)             => { exp!(@kw, If,         KwIf) };
     (Impl)           => { exp!(@kw, Impl,       KwImpl) };
@@ -535,6 +543,7 @@ macro_rules! exp {
     (Mod)            => { exp!(@kw, Mod,        KwMod) };
     (Move)           => { exp!(@kw, Move,       KwMove) };
     (Mut)            => { exp!(@kw, Mut,        KwMut) };
+    (Pin)            => { exp!(@kw, Pin,        KwMut) };
     (Pub)            => { exp!(@kw, Pub,        KwPub) };
     (Raw)            => { exp!(@kw, Raw,        KwRaw) };
     (Ref)            => { exp!(@kw, Ref,        KwRef) };
@@ -556,6 +565,7 @@ macro_rules! exp {
     (Yield)          => { exp!(@kw, Yield,      KwYield) };
 
     (AttSyntax)      => { exp!(@sym, att_syntax,      SymAttSyntax) };
+    (Bikeshed)       => { exp!(@sym, bikeshed,        SymBikeshed) };
     (ClobberAbi)     => { exp!(@sym, clobber_abi,     SymClobberAbi) };
     (Inlateout)      => { exp!(@sym, inlateout,       SymInlateout) };
     (Inout)          => { exp!(@sym, inout,           SymInout) };
@@ -583,7 +593,7 @@ macro_rules! exp {
 pub(super) struct TokenTypeSet(u128);
 
 impl TokenTypeSet {
-    pub(super) fn new() -> TokenTypeSet {
+    pub(super) const fn new() -> TokenTypeSet {
         TokenTypeSet(0)
     }
 

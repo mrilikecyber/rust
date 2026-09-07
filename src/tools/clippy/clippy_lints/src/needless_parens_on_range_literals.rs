@@ -5,8 +5,7 @@ use clippy_utils::source::{snippet, snippet_with_applicability};
 use rustc_ast::ast;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 
 declare_clippy_lint! {
   /// ### What it does
@@ -38,7 +37,9 @@ declare_clippy_lint! {
   "needless parenthesis on range literals can be removed"
 }
 
-declare_lint_pass!(NeedlessParensOnRangeLiterals => [NEEDLESS_PARENS_ON_RANGE_LITERALS]);
+declare_lint_pass!(NeedlessParensOnRangeLiterals => [
+    NEEDLESS_PARENS_ON_RANGE_LITERALS,
+]);
 
 fn snippet_enclosed_in_parenthesis(snippet: &str) -> bool {
     snippet.starts_with('(') && snippet.ends_with(')')

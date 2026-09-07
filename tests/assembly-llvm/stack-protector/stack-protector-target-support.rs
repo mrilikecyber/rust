@@ -173,17 +173,19 @@
 //@ [r84] needs-llvm-components: x86
 //@ [r85] compile-flags: --target x86_64-unknown-redox
 //@ [r85] needs-llvm-components: x86
-//@ compile-flags: -Z stack-protector=all
+//@ compile-flags: -Z stack-protector=all -Cpanic=abort
 //@ compile-flags: -C opt-level=2
 
 #![crate_type = "lib"]
-#![feature(no_core, lang_items)]
+#![feature(no_core, lang_items, sanitize)]
 #![crate_type = "lib"]
 #![no_core]
 
 extern crate minicore;
 use minicore::*;
 
+// We only do this because we can't disable default sanitizers via compile-flags.
+#[sanitize(safestack = "off")]
 #[no_mangle]
 pub fn foo() {
     // CHECK: foo{{:|()}}

@@ -1,31 +1,37 @@
-#![feature(abort_unwind)]
-#![feature(cfg_select)]
+#![cfg_attr(all(feature = "native-lib", unix), feature(iter_advance_by))]
+#![cfg_attr(
+    all(
+        feature = "native-lib",
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ),
+    feature(abort_unwind)
+)]
 #![feature(rustc_private)]
+#![feature(dirfd)]
+#![feature(f16)]
 #![feature(float_gamma)]
 #![feature(float_erf)]
 #![feature(map_try_insert)]
-#![feature(never_type)]
+#![cfg_attr(bootstrap, feature(never_type))]
 #![feature(try_blocks)]
 #![feature(io_error_more)]
-#![feature(if_let_guard)]
+#![feature(io_error_inprogress)]
+#![feature(io_error_input_output_error)]
+#![feature(io_error_too_many_open_files)]
 #![feature(variant_count)]
 #![feature(yeet_expr)]
-#![feature(nonzero_ops)]
 #![feature(pointer_is_aligned_to)]
-#![feature(ptr_metadata)]
 #![feature(unqualified_local_imports)]
 #![feature(derive_coerce_pointee)]
 #![feature(arbitrary_self_types)]
-#![feature(iter_advance_by)]
-#![cfg_attr(bootstrap, feature(duration_from_nanos_u128))]
+#![feature(macro_metavar_expr)]
+#![feature(uint_carryless_mul)]
 // Configure clippy and other lints
 #![allow(
-    clippy::collapsible_else_if,
     clippy::collapsible_if,
-    clippy::if_same_then_else,
-    clippy::comparison_chain,
     clippy::enum_variant_names,
-    clippy::field_reassign_with_default,
     clippy::manual_map,
     clippy::neg_cmp_op_on_partial_ord,
     clippy::new_without_default,
@@ -39,13 +45,16 @@
     clippy::needless_question_mark,
     clippy::needless_lifetimes,
     clippy::too_long_first_doc_paragraph,
-    // We don't use translatable diagnostics
-    rustc::diagnostic_outside_of_impl,
+    clippy::len_zero,
     // We are not implementing queries here so it's fine
     rustc::potential_query_instability,
-    rustc::untranslatable_diagnostic,
 )]
-#![warn(rust_2018_idioms, unqualified_local_imports, clippy::as_conversions)]
+#![warn(
+    rust_2018_idioms,
+    unqualified_local_imports,
+    clippy::as_conversions,
+    clippy::manual_let_else
+)]
 // Needed for rustdoc from bootstrap (with `-Znormalize-docs`).
 #![recursion_limit = "256"]
 
@@ -57,13 +66,14 @@ extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
-extern crate rustc_hash;
 extern crate rustc_hir;
+extern crate rustc_hir_analysis;
 extern crate rustc_index;
 extern crate rustc_log;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 // Linking `rustc_driver` pulls in the required  object code as the rest of the rustc crates are
@@ -86,6 +96,7 @@ mod math;
 mod operator;
 mod provenance_gc;
 mod shims;
+pub mod sym;
 
 // Establish a "crate-wide prelude": we often import `crate::*`.
 // Make all those symbols available in the same place as our own.
@@ -94,10 +105,11 @@ pub use rustc_const_eval::interpret::*;
 // Resolve ambiguity.
 #[doc(no_inline)]
 pub use rustc_const_eval::interpret::{self, AllocMap, Provenance as _};
-use rustc_log::tracing::{self, info, trace};
-use rustc_middle::{bug, span_bug};
+pub use rustc_data_structures::either::Either;
+pub use rustc_log::tracing::{self, info, trace, warn};
+pub use rustc_middle::{bug, span_bug};
 
-#[cfg(all(unix, feature = "native-lib"))]
+#[cfg(all(feature = "native-lib", unix))]
 pub mod native_lib {
     pub use crate::shims::{init_sv, register_retcode_sv};
 }
@@ -121,16 +133,20 @@ pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
 pub use crate::borrow_tracker::{
     BorTag, BorrowTrackerMethod, EvalContextExt as _, TreeBorrowsParams,
 };
-pub use crate::clock::{Instant, MonotonicClock};
+pub use crate::clock::{Deadline, Instant, MonotonicClock, TimeoutClock, TimeoutStyle};
+pub use crate::concurrency::blocking_io::{
+    BlockingIoInterest, BlockingIoManager, EvalContextExt as _, SourceFileDescription,
+};
 pub use crate::concurrency::cpu_affinity::MAX_CPUS;
 pub use crate::concurrency::data_race::{
     AtomicFenceOrd, AtomicReadOrd, AtomicRwOrd, AtomicWriteOrd, EvalContextExt as _,
 };
 pub use crate::concurrency::init_once::{EvalContextExt as _, InitOnceRef};
+pub use crate::concurrency::scheduler::EvalContextExt as _;
 pub use crate::concurrency::sync::{CondvarRef, EvalContextExt as _, MutexRef, RwLockRef};
 pub use crate::concurrency::thread::{
     BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
-    ThreadManager, TimeoutAnchor, TimeoutClock, UnblockKind,
+    ThreadManager, TlsAllocAction, UnblockKind,
 };
 pub use crate::concurrency::{GenmcConfig, GenmcCtx, run_genmc_mode};
 pub use crate::data_structures::dedup_range_map::DedupRangeMap;
@@ -138,7 +154,7 @@ pub use crate::data_structures::mono_hash_map::MonoHashMap;
 pub use crate::diagnostics::{
     EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_result,
 };
-pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, eval_entry};
+pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, entry_fn, eval_entry};
 pub use crate::helpers::{EvalContextExt as _, ToU64 as _, ToUsize as _};
 pub use crate::intrinsics::EvalContextExt as _;
 pub use crate::machine::{
@@ -155,6 +171,10 @@ pub use crate::shims::foreign_items::{DynSym, EvalContextExt as _};
 pub use crate::shims::io_error::{EvalContextExt as _, IoError, LibcError};
 pub use crate::shims::os_str::EvalContextExt as _;
 pub use crate::shims::panic::EvalContextExt as _;
+pub use crate::shims::readiness::{
+    EvalContextExt as _, Readiness, ReadinessInterest, ReadinessUpdateFlags, ReadinessWatched,
+    ReadinessWatcher,
+};
 pub use crate::shims::sig::EvalContextExt as _;
 pub use crate::shims::time::EvalContextExt as _;
 pub use crate::shims::tls::TlsData;
@@ -165,14 +185,19 @@ pub use crate::shims::unwind::{CatchUnwindData, EvalContextExt as _};
 /// Also disable the MIR pass that inserts an alignment check on every pointer dereference. Miri
 /// does that too, and with a better error message.
 pub const MIRI_DEFAULT_ARGS: &[&str] = &[
-    "-Zcodegen-backend=dummy",
     "--cfg=miri",
     "-Zalways-encode-mir",
     "-Zextra-const-ub-checks",
-    "-Zmir-emit-retag",
     "-Zmir-preserve-ub",
     "-Zmir-opt-level=0",
+    // Disable passes that add checks for language UB -- we get better diagnostics if
+    // we let Miri do these checks.
     "-Zmir-enable-passes=-CheckAlignment,-CheckNull,-CheckEnums",
+    // FIXME: Disable some passes to make higher opt levels also work.
+    // - ReferencePropagation is incompatible with SB's ref-to-raw castb behavior.
+    //   The fix here is to ditch SB and use TB instead but we're not yet ready for that.
+    // - GVN is not yet adjusted for implicit retags during assignments.
+    "-Zmir-enable-passes=-ReferencePropagation,-GVN",
     // Deduplicating diagnostics means we miss events when tracking what happens during an
     // execution. Let's not do that.
     "-Zdeduplicate-diagnostics=no",

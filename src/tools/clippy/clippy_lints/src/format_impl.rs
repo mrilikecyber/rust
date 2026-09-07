@@ -1,53 +1,13 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
 use clippy_utils::macros::{FormatArgsStorage, find_format_arg_expr, is_format_macro, root_macro_call_first_node};
-use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::{get_parent_as_impl, peel_ref_operators, sym};
 use rustc_ast::{FormatArgsPiece, FormatTrait};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, Impl, ImplItem, ImplItemKind, QPath};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_span::Symbol;
 use rustc_span::symbol::kw;
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for format trait implementations (e.g. `Display`) with a recursive call to itself
-    /// which uses `self` as a parameter.
-    /// This is typically done indirectly with the `write!` macro or with `to_string()`.
-    ///
-    /// ### Why is this bad?
-    /// This will lead to infinite recursion and a stack overflow.
-    ///
-    /// ### Example
-    ///
-    /// ```no_run
-    /// use std::fmt;
-    ///
-    /// struct Structure(i32);
-    /// impl fmt::Display for Structure {
-    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    ///         write!(f, "{}", self.to_string())
-    ///     }
-    /// }
-    ///
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// use std::fmt;
-    ///
-    /// struct Structure(i32);
-    /// impl fmt::Display for Structure {
-    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    ///         write!(f, "{}", self.0)
-    ///     }
-    /// }
-    /// ```
-    #[clippy::version = "1.48.0"]
-    pub RECURSIVE_FORMAT_IMPL,
-    correctness,
-    "Format trait method called while implementing the same Format trait"
-}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -90,6 +50,47 @@ declare_clippy_lint! {
     "use of a print macro in a formatting trait impl"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for format trait implementations (e.g. `Display`) with a recursive call to itself
+    /// which uses `self` as a parameter.
+    /// This is typically done indirectly with the `write!` macro or with `to_string()`.
+    ///
+    /// ### Why is this bad?
+    /// This will lead to infinite recursion and a stack overflow.
+    ///
+    /// ### Example
+    ///
+    /// ```no_run
+    /// use std::fmt;
+    ///
+    /// struct Structure(i32);
+    /// impl fmt::Display for Structure {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         write!(f, "{}", self.to_string())
+    ///     }
+    /// }
+    ///
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// use std::fmt;
+    ///
+    /// struct Structure(i32);
+    /// impl fmt::Display for Structure {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         write!(f, "{}", self.0)
+    ///     }
+    /// }
+    /// ```
+    #[clippy::version = "1.48.0"]
+    pub RECURSIVE_FORMAT_IMPL,
+    correctness,
+    "Format trait method called while implementing the same Format trait"
+}
+
+impl_lint_pass!(FormatImpl => [PRINT_IN_FORMAT_IMPL, RECURSIVE_FORMAT_IMPL]);
+
 #[derive(Clone, Copy)]
 struct FormatTraitNames {
     /// e.g. `sym::Display`
@@ -112,8 +113,6 @@ impl FormatImpl {
         }
     }
 }
-
-impl_lint_pass!(FormatImpl => [RECURSIVE_FORMAT_IMPL, PRINT_IN_FORMAT_IMPL]);
 
 impl<'tcx> LateLintPass<'tcx> for FormatImpl {
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &ImplItem<'_>) {

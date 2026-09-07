@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 /* global addClass, getNakedUrl, getVar, getSettingValue, hasClass, nonnull */
 /* global onEachLazy, removeClass, searchState, browserSupportsHistoryApi */
 
@@ -28,7 +28,7 @@ if (!Array.prototype.toSpliced) {
  * @template T
  * @param {Iterable<T>} arr
  * @param {function(T): Promise<any>} func
- * @param {function(T): boolean} funcBtwn
+ * @param {function(T): void} funcBtwn
  */
 async function onEachBtwnAsync(arr, func, funcBtwn) {
     let skipped = true;
@@ -120,6 +120,8 @@ const itemTypes = Object.freeze({
     traitalias: 25,
     generic: 26,
     attribute: 27,
+    decl_macro_attribute: 28,
+    decl_macro_derive: 29,
 });
 const itemTypesName = Array.from(Object.keys(itemTypes));
 
@@ -158,6 +160,7 @@ const REGEX_INVALID_TYPE_FILTER = /[^a-z]/ui;
 
 const MAX_RESULTS = 200;
 const NO_TYPE_FILTER = -1;
+const DEPRECATED_COUNT_SELECTOR = "deprecated-count";
 
 /**
  * The [edit distance] is a metric for measuring the difference between two strings.
@@ -1633,6 +1636,7 @@ class DocSearch {
          * parent,
          * trait_parent,
          * deprecated,
+         * unstable,
          * associated_item_disambiguator
          * @type {rustdoc.ArrayWithOptionals<[
          *     number,
@@ -1642,10 +1646,11 @@ class DocSearch {
          *     number,
          *     number,
          *     number,
+         *     number,
          * ], [string]>}
          */
         const raw = JSON.parse(encoded);
-        return {
+        const item = {
             krate: raw[0],
             ty: raw[1],
             modulePath: raw[2] === 0 ? null : raw[2] - 1,
@@ -1653,8 +1658,17 @@ class DocSearch {
             parent: raw[4] === 0 ? null : raw[4] - 1,
             traitParent: raw[5] === 0 ? null : raw[5] - 1,
             deprecated: raw[6] === 1 ? true : false,
-            associatedItemDisambiguator: raw.length === 7 ? null : raw[7],
+            unstable: raw[7] === 1 ? true : false,
+            associatedItemDisambiguatorOrExternCrateUrl: raw.length === 8 ? null : raw[8],
+            forceMacroHref: false,
         };
+        if (item.ty === itemTypes.decl_macro_attribute || item.ty === itemTypes.decl_macro_derive) {
+            // "proc attribute" is 23, "proc derive" is 24 whereas "decl macro attribute" is 28 and
+            // "decl macro derive" is 29, so 5 of difference to go from the latter to the former.
+            item.ty -= 5;
+            item.forceMacroHref = true;
+        }
+        return item;
     }
 
     /**
@@ -1946,6 +1960,7 @@ class DocSearch {
             path,
             functionData,
             deprecated: entry ? entry.deprecated : false,
+            unstable: entry ? entry.unstable : false,
             parent,
             traitParent,
         };
@@ -2132,8 +2147,8 @@ class DocSearch {
      *
      * @param  {rustdoc.ParsedQuery<rustdoc.ParserQueryElement>} parsedQuery
      *     - The parsed user query
-     * @param  {Object} filterCrates - Crate to search in if defined
-     * @param  {string} currentCrate - Current crate, to rank results from this crate higher
+     * @param  {string|null} filterCrates - Crate to search in if defined
+     * @param  {string|null} currentCrate - Current crate, to rank results from this crate higher
      *
      * @return {Promise<rustdoc.ResultsTable>}
      */
@@ -2151,7 +2166,7 @@ class DocSearch {
             let displayPath;
             let href;
             let traitPath = null;
-            const type = itemTypesName[item.ty];
+            const type = item.entry && item.entry.forceMacroHref ? "macro" : itemTypesName[item.ty];
             const name = item.name;
             let path = item.modulePath;
             let exactPath = item.exactModulePath;
@@ -2171,7 +2186,12 @@ class DocSearch {
                     "/" + type + "." + name + ".html";
             } else if (type === "externcrate") {
                 displayPath = "";
-                href = this.rootPath + name + "/index.html";
+                let base = this.rootPath + name;
+                if (item.entry && item.entry.associatedItemDisambiguatorOrExternCrateUrl) {
+                    base = item.entry.associatedItemDisambiguatorOrExternCrateUrl;
+                }
+
+                href = base + "/index.html";
             } else if (item.parent) {
                 const myparent = item.parent;
                 let anchor = type + "." + name;
@@ -2196,8 +2216,8 @@ class DocSearch {
                 } else {
                     displayPath = path + "::" + myparent.name + "::";
                 }
-                if (item.entry && item.entry.associatedItemDisambiguator !== null) {
-                    anchor = item.entry.associatedItemDisambiguator + "/" + anchor;
+                if (item.entry && item.entry.associatedItemDisambiguatorOrExternCrateUrl !== null) {
+                    anchor = item.entry.associatedItemDisambiguatorOrExternCrateUrl + "/" + anchor;
                 }
                 href = this.rootPath + path.replace(/::/g, "/") +
                     "/" + pageType +
@@ -2421,7 +2441,6 @@ class DocSearch {
                     await onEachBtwnAsync(
                         fnType.generics,
                         nested => writeFn(nested, result),
-                        // @ts-expect-error
                         () => pushText({ name: ", ", highlighted: false }, result),
                     );
                     pushText({ name: sb, highlighted: fnType.highlighted }, result);
@@ -2435,7 +2454,6 @@ class DocSearch {
                             prevHighlighted = !!value.highlighted;
                             await writeFn(value, result);
                         },
-                        // @ts-expect-error
                         value => pushText({
                             name: " ",
                             highlighted: prevHighlighted && value.highlighted,
@@ -2454,7 +2472,6 @@ class DocSearch {
                             prevHighlighted = !!value.highlighted;
                             await writeFn(value, result);
                         },
-                        // @ts-expect-error
                         value => pushText({
                             name: " ",
                             highlighted: prevHighlighted && value.highlighted,
@@ -2515,7 +2532,6 @@ class DocSearch {
                     await onEachBtwnAsync(
                         fnType.generics,
                         nested => writeFn(nested, where),
-                        // @ts-expect-error
                         () => pushText({ name: " + ", highlighted: false }, where),
                     );
                     if (where.length > 0) {
@@ -2545,7 +2561,6 @@ class DocSearch {
                         await onEachBtwnAsync(
                             fnType.generics,
                             value => writeFn(value, result),
-                            // @ts-expect-error
                             () => pushText({ name: ", ",  highlighted: false }, result),
                         );
                         if (fnType.generics.length > 1) {
@@ -2568,6 +2583,7 @@ class DocSearch {
                                 async([key, values]) => [await this.getName(key), values],
                             )),
                             async([name, values]) => {
+                                // values[0] cannot be null due to length check
                                 // @ts-expect-error
                                 if (values.length === 1 && values[0].id < 0 &&
                                     // @ts-expect-error
@@ -2593,14 +2609,12 @@ class DocSearch {
                                 await onEachBtwnAsync(
                                     values || [],
                                     value => writeFn(value, result),
-                                    // @ts-expect-error
                                     () => pushText({ name: " + ",  highlighted: false }, result),
                                 );
                                 if (values.length !== 1) {
                                     pushText({ name: ")", highlighted: false }, result);
                                 }
                             },
-                            // @ts-expect-error
                             () => pushText({ name: ", ",  highlighted: false }, result),
                         );
                     }
@@ -2610,7 +2624,6 @@ class DocSearch {
                     await onEachBtwnAsync(
                         fnType.generics,
                         value => writeFn(value, result),
-                        // @ts-expect-error
                         () => pushText({ name: ", ",  highlighted: false }, result),
                     );
                     if (hasBindings || fnType.generics.length > 0) {
@@ -2623,14 +2636,12 @@ class DocSearch {
             await onEachBtwnAsync(
                 fnInputs,
                 fnType => writeFn(fnType, type),
-                // @ts-expect-error
                 () => pushText({ name: ", ",  highlighted: false }, type),
             );
             pushText({ name: " -> ", highlighted: false }, type);
             await onEachBtwnAsync(
                 fnOutput,
                 fnType => writeFn(fnType, type),
-                // @ts-expect-error
                 () => pushText({ name: ", ",  highlighted: false }, type),
             );
 
@@ -2765,7 +2776,7 @@ class DocSearch {
              * @this {DocSearch}
              * @param {Array<rustdoc.PlainResultObject|null>} results
              * @param {"sig"|"elems"|"returned"|null} typeInfo
-             * @param {string} preferredCrate
+             * @param {string|null} preferredCrate
              * @param {Set<string>} duplicates
              * @returns {AsyncGenerator<rustdoc.ResultObject, number>}
              */
@@ -2798,6 +2809,8 @@ class DocSearch {
                 result_list.sort((aaa, bbb) => {
                     const aai = aaa.item;
                     const bbi = bbb.item;
+                    const ap = aai.modulePath !== undefined ? aai.modulePath : "";
+                    const bp = bbi.modulePath !== undefined ? bbi.modulePath : "";
                     /** @type {number} */
                     let a;
                     /** @type {number} */
@@ -2828,14 +2841,25 @@ class DocSearch {
                         if (a !== b) {
                             return a - b;
                         }
-                    }
 
-                    // Sort by distance in the path part, if specified
-                    // (less changes required to match means higher rankings)
-                    a = Number(aaa.path_dist);
-                    b = Number(bbb.path_dist);
-                    if (a !== b) {
-                        return a - b;
+                        if (parsedQuery.elems[0] &&
+                            parsedQuery.elems[0].pathWithoutLast.length !== 0
+                        ) {
+                            // Sort by distance in the path part, if specified
+                            // (less changes required to match means higher rankings)
+                            a = Number(aaa.path_dist);
+                            b = Number(bbb.path_dist);
+                            if (a !== b) {
+                                return a - b;
+                            }
+
+                            // sort by path (longer goes later)
+                            a = ap.length + (aai.parent ? aai.parent.name.length + 2 : 0);
+                            b = bp.length + (bbi.parent ? bbi.parent.name.length + 2 : 0);
+                            if (a !== b) {
+                                return a - b;
+                            }
+                        }
                     }
 
                     // (later literal occurrence, if any, goes later)
@@ -2867,6 +2891,13 @@ class DocSearch {
                         return a - b;
                     }
 
+                    // sort unstable items later
+                    a = Number(aai.unstable);
+                    b = Number(bbi.unstable);
+                    if (a !== b) {
+                        return a - b;
+                    }
+
                     // sort by crate (current crate comes first)
                     a = Number(aai.crate !== preferredCrate);
                     b = Number(bbi.crate !== preferredCrate);
@@ -2882,8 +2913,8 @@ class DocSearch {
                     }
 
                     // sort by item name (lexicographically larger goes later)
-                    let aw = aai.normalizedName;
-                    let bw = bbi.normalizedName;
+                    const aw = aai.normalizedName;
+                    const bw = bbi.normalizedName;
                     if (aw !== bw) {
                         return (aw > bw ? +1 : -1);
                     }
@@ -2906,12 +2937,8 @@ class DocSearch {
                     }
 
                     // sort by path (lexicographically larger goes later)
-                    const ap = aai.modulePath;
-                    const bp = bbi.modulePath;
-                    aw = ap === undefined ? "" : ap;
-                    bw = bp === undefined ? "" : bp;
-                    if (aw !== bw) {
-                        return (aw > bw ? +1 : -1);
+                    if (ap !== bp) {
+                        return (ap > bp ? +1 : -1);
                     }
 
                     // que sera, sera
@@ -3037,10 +3064,8 @@ class DocSearch {
                     )) {
                         continue;
                     }
-                    // @ts-expect-error
-                    if (fnType.id < 0) {
+                    if (fnType.id !== null && fnType.id < 0) {
                         const highlightedGenerics = unifyFunctionTypes(
-                            // @ts-expect-error
                             whereClause[(-fnType.id) - 1],
                             queryElems,
                             whereClause,
@@ -3842,13 +3867,19 @@ class DocSearch {
                 let dist_total = 0;
                 for (let x = 0; x < clength; ++x) {
                     const [p, c] = [path[i + x], contains[x]];
+                    const indexOf = p.indexOf(c);
                     if (parsedQuery.literalSearch && p !== c) {
                         continue pathiter;
-                    } else if (Math.floor((p.length - c.length) / 3) <= maxPathEditDistance &&
-                        p.indexOf(c) !== -1
-                    ) {
+                    } else if (indexOf !== -1) {
                         // discount distance on substring match
-                        dist_total += Math.floor((p.length - c.length) / 3);
+                        // if component is surrounded by underscores or edges,
+                        // count the distance as zero
+                        if (
+                            (indexOf !== 0 && p[indexOf - 1] !== "_") ||
+                            (indexOf + c.length !== p.length && p[indexOf + c.length] !== "_")
+                        ) {
+                            dist_total += Math.floor((p.length - c.length) / 3);
+                        }
                     } else {
                         const dist = editDistance(p, c, maxPathEditDistance);
                         if (dist > maxPathEditDistance) {
@@ -3903,7 +3934,7 @@ class DocSearch {
         const innerRunNameQuery =
             /**
              * @this {DocSearch}
-             * @param {string} currentCrate
+             * @param {string|null} currentCrate
              * @returns {AsyncGenerator<rustdoc.ResultObject>}
              */
             async function*(currentCrate) {
@@ -3951,7 +3982,7 @@ class DocSearch {
                  * @param {Promise<rustdoc.PlainResultObject|null>[]} data
                  * @returns {AsyncGenerator<rustdoc.ResultObject, boolean>}
                  */
-                const flush = async function* (data) {
+                const flush = async function*(data) {
                     const satr = sortAndTransformResults(
                         await Promise.all(data),
                         null,
@@ -4145,7 +4176,7 @@ class DocSearch {
              * @param {rustdoc.ParserQueryElement[]} inputs
              * @param {rustdoc.ParserQueryElement[]} output
              * @param {"sig"|"elems"|"returned"|null} typeInfo
-             * @param {string} currentCrate
+             * @param {string|null} currentCrate
              * @returns {AsyncGenerator<rustdoc.ResultObject>}
              */
             async function*(inputs, output, typeInfo, currentCrate) {
@@ -4728,11 +4759,16 @@ class DocSearch {
                 })(),
                 "query": parsedQuery,
             };
-        } else if (parsedQuery.error !== null) {
+        } else if (parsedQuery.error !== null || parsedQuery.foundElems === 0) {
+            // Symbol-only queries like `==` do not parse into type elements,
+            // but can still match exact item names or doc aliases.
+            const others = parsedQuery.userQuery.length === 0 ?
+                (async function*() {})() :
+                innerRunNameQuery(currentCrate);
             return {
                 "in_args": (async function*() {})(),
                 "returned": (async function*() {})(),
-                "others": innerRunNameQuery(currentCrate),
+                "others": others,
                 "query": parsedQuery,
             };
         } else {
@@ -4743,14 +4779,12 @@ class DocSearch {
             return {
                 "in_args": (async function*() {})(),
                 "returned": (async function*() {})(),
-                "others": parsedQuery.foundElems === 0 ?
-                    (async function*() {})() :
-                    innerRunTypeQuery(
-                        parsedQuery.elems,
-                        parsedQuery.returned,
-                        typeInfo,
-                        currentCrate,
-                    ),
+                "others": innerRunTypeQuery(
+                    parsedQuery.elems,
+                    parsedQuery.returned,
+                    typeInfo,
+                    currentCrate,
+                ),
                 "query": parsedQuery,
             };
         }
@@ -4791,6 +4825,8 @@ const longItemTypes = [
     "trait alias",
     "",
     "attribute",
+    "", // decl macro attribute, never used as is
+    "", // decl macro derive, never used as is
 ];
 // @ts-expect-error
 let currentResults;
@@ -4915,7 +4951,12 @@ async function addTab(results, query, display, finishedCallback, isTypeSearch) {
     let output = document.createElement("ul");
     output.className = "search-results " + extraClass;
 
+    const deprecatedCountElem = document.createElement("span");
+    deprecatedCountElem.className = DEPRECATED_COUNT_SELECTOR;
+    output.appendChild(deprecatedCountElem);
+
     let count = 0;
+    let deprecatedCount = 0;
 
     /** @type {Promise<string|null>[]} */
     const descList = [];
@@ -4931,6 +4972,13 @@ async function addTab(results, query, display, finishedCallback, isTypeSearch) {
 
         const link = document.createElement("a");
         link.className = "result-" + type;
+        if (obj.item.deprecated) {
+            link.className += " deprecated";
+            deprecatedCount += 1;
+            const plural = deprecatedCount > 1 ? "s" : "";
+            deprecatedCountElem.innerText =
+                `${deprecatedCount} deprecated item${plural} hidden by setting`;
+        }
         link.href = obj.href;
 
         const resultName = document.createElement("span");
@@ -5050,9 +5098,11 @@ ${obj.displayPath}<span class="${type}">${name}</span>\
     if (query.proposeCorrectionFrom !== null && isTypeSearch) {
         const orig = query.proposeCorrectionFrom;
         const targ = query.proposeCorrectionTo;
-        correctionOutput = "<h3 class=\"search-corrections\">" +
-            `Type "${orig}" not found and used as generic parameter. ` +
-            `Consider searching for "${targ}" instead.</h3>`;
+        let message = `Type "${orig}" not found and used as generic parameter.`;
+        if (targ !== null) {
+            message += ` Consider searching for "${targ}" instead.`;
+        }
+        correctionOutput = `<h3 class="search-corrections">${message}</h3>`;
     }
     if (firstResult.value) {
         if (correctionOutput !== "") {
@@ -5135,9 +5185,9 @@ function makeTab(tabNb, text, results, query, isTypeSearch, goToFirst) {
                 errorReport.className = "error";
                 errorReport.innerHTML = `Query parser error: "${error.join("")}".`;
                 search.insertBefore(errorReport, search.firstElementChild);
-            } else if (goToFirst ||
+            } else if (tabNb === 0 && (goToFirst ||
                 (count === 1 && getSettingValue("go-to-only-result") === "true")
-            ) {
+            )) {
                 // Needed to force re-execution of JS when coming back to a page. Let's take this
                 // scenario as example:
                 //
@@ -5178,7 +5228,7 @@ function makeTab(tabNb, text, results, query, isTypeSearch, goToFirst) {
  * @param {DocSearch} docSearch
  * @param {rustdoc.ResultsTable} results
  * @param {boolean} goToFirst
- * @param {string} filterCrates
+ * @param {string|null} filterCrates
  */
 async function showResults(docSearch, results, goToFirst, filterCrates) {
     const search = window.searchState.outputElement();
@@ -5251,6 +5301,8 @@ async function showResults(docSearch, results, goToFirst, filterCrates) {
     }
     const crateSearch = document.getElementById("crate-search");
     if (crateSearch) {
+        // #crate-search is a `<select>` element.
+        // @ts-expect-error
         crateSearch.addEventListener("input", updateCrate);
     }
     search.appendChild(tabsElem);
@@ -5330,10 +5382,8 @@ async function search(forced) {
 
     await showResults(
         docSearch,
-        // @ts-expect-error
         await docSearch.execQuery(query, filterCrates, window.currentCrate),
         params.go_to_first,
-        // @ts-expect-error
         filterCrates);
 }
 
@@ -5410,27 +5460,33 @@ function registerSearchEvents() {
         }
         // up and down arrow select next/previous search result, or the
         // search box if we're already at the top.
+        //
+        // the .focus() calls are safe because there's no kind of element
+        // that lacks .focus() that should be in the document.
         if (e.which === 38) { // up
-            // @ts-expect-error
-            const previous = document.activeElement.previousElementSibling;
-            if (previous) {
-                // @ts-expect-error
-                previous.focus();
-            } else {
-                searchState.focus();
+            const active = document.activeElement;
+            if (active) {
+                const previous = active.previousElementSibling;
+                if (previous && previous.className !== DEPRECATED_COUNT_SELECTOR) {
+                    // @ts-expect-error
+                    previous.focus();
+                } else {
+                    searchState.focus();
+                }
             }
             e.preventDefault();
         } else if (e.which === 40) { // down
-            // @ts-expect-error
-            const next = document.activeElement.nextElementSibling;
-            if (next) {
-                // @ts-expect-error
-                next.focus();
-            }
-            // @ts-expect-error
-            const rect = document.activeElement.getBoundingClientRect();
-            if (window.innerHeight - rect.bottom < rect.height) {
-                window.scrollBy(0, rect.height);
+            const active = document.activeElement;
+            if (active) {
+                const next = active.nextElementSibling;
+                if (next) {
+                    // @ts-expect-error
+                    next.focus();
+                }
+                const rect = active.getBoundingClientRect();
+                if (window.innerHeight - rect.bottom < rect.height) {
+                    window.scrollBy(0, rect.height);
+                }
             }
             e.preventDefault();
         } else if (e.which === 37) { // left
@@ -5454,7 +5510,9 @@ function registerSearchEvents() {
     });
 }
 
-// @ts-expect-error
+/**
+ * @param {Event & { target: HTMLInputElement }} ev
+ */
 function updateCrate(ev) {
     if (ev.target.value === "all crates") {
         // If we don't remove it from the URL, it'll be picked up again by the search.

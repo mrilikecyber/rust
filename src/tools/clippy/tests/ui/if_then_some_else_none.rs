@@ -1,5 +1,6 @@
 #![warn(clippy::if_then_some_else_none)]
-#![allow(clippy::redundant_pattern_matching, clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::manual_filter, clippy::unnecessary_lazy_evaluations)]
+#![expect(clippy::redundant_pattern_matching)]
 
 fn main() {
     // Should issue an error.
@@ -272,5 +273,28 @@ mod issue15770 {
         let _x: Option<u32> = if b { Some(maybe_error()?) } else { None };
         // Process _x locally
         Ok(())
+    }
+}
+
+mod issue16176 {
+    pub async fn foo() -> u32 {
+        todo!()
+    }
+
+    pub async fn bar(cond: bool) -> Option<u32> {
+        if cond { Some(foo().await) } else { None } // OK
+    }
+}
+
+fn issue16269() -> Option<i32> {
+    use std::cell::UnsafeCell;
+
+    //~v if_then_some_else_none
+    if 1 <= 3 {
+        let a = UnsafeCell::new(1);
+        // SAFETY: `bytes` bytes starting at `new_end` were just reserved.
+        Some(unsafe { *a.get() })
+    } else {
+        None
     }
 }

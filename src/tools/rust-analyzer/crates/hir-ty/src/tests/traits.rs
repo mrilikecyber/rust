@@ -1,4 +1,3 @@
-use cov_mark::check;
 use expect_test::expect;
 
 use crate::tests::infer_with_mismatches;
@@ -88,7 +87,7 @@ async fn test() {
 fn infer_async_closure() {
     check_types(
         r#"
-//- minicore: future, option
+//- minicore: future, option, async_fn
 async fn test() {
     let f = async move |x: i32| x + 42;
     f;
@@ -119,6 +118,25 @@ async fn test() {
     let _: Option<u64> = c().await;
     c;
 //  ^ impl AsyncFn() -> Option<u64>
+}
+"#,
+    );
+}
+
+#[test]
+fn infer_async_gen_closure() {
+    check(
+        r#"
+//- minicore: async_iterator, fn, add, builtin_impls
+//- /main.rs edition:2024
+fn test() {
+    let f = async gen move |x: i32| {
+        yield x + 42;
+            //^^^^^^ expected Poll<Option<{unknown}>>, got i32
+    };
+    let a = f(4);
+    a;
+//  ^ type: impl AsyncIterator<Item = {unknown}>
 }
 "#,
     );
@@ -220,14 +238,16 @@ fn test() {
 
 #[test]
 fn infer_try_block() {
-    // FIXME: We should test more cases, but it currently doesn't work, since
-    // our labeled block type inference is broken.
     check_types(
         r#"
-//- minicore: try, option
+//- minicore: try, option, result, from
 fn test() {
     let x: Option<_> = try { Some(2)?; };
       //^ Option<()>
+    let homogeneous = try { Ok::<(), u32>(())?; "hi" };
+      //^^^^^^^^^^^ Result<&'? str, u32>
+    let heterogeneous = try bikeshed Result<_, u64> { 1 };
+      //^^^^^^^^^^^^^ Result<i32, u64>
 }
 "#,
     );
@@ -278,11 +298,11 @@ pub mod collections {
 fn infer_ops_neg() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore:unary_ops
 struct Bar;
 struct Foo;
 
-impl std::ops::Neg for Bar {
+impl core::ops::Neg for Bar {
     type Output = Foo;
 }
 
@@ -291,15 +311,6 @@ fn test() {
     let b = -a;
     b;
 } //^ Foo
-
-//- /std.rs crate:std
-#[prelude_import] use ops::*;
-mod ops {
-    #[lang = "neg"]
-    pub trait Neg {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -308,11 +319,11 @@ mod ops {
 fn infer_ops_not() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore:unary_ops
 struct Bar;
 struct Foo;
 
-impl std::ops::Not for Bar {
+impl core::ops::Not for Bar {
     type Output = Foo;
 }
 
@@ -321,15 +332,6 @@ fn test() {
     let b = !a;
     b;
 } //^ Foo
-
-//- /std.rs crate:std
-#[prelude_import] use ops::*;
-mod ops {
-    #[lang = "not"]
-    pub trait Not {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -368,7 +370,6 @@ fn test() {
 
 #[test]
 fn trait_default_method_self_bound_implements_trait() {
-    cov_mark::check!(trait_self_implements_self);
     check(
         r#"
 trait Trait {
@@ -449,7 +450,7 @@ fn associated_type_shorthand_from_method_bound() {
 trait Iterable {
     type Item;
 }
-struct S<T>;
+struct S<T>(T);
 impl<T> S<T> {
     fn foo(self) -> T::Item where T: Iterable { loop {} }
 }
@@ -871,7 +872,7 @@ struct S;
 trait Trait<T> {}
 impl Trait<&str> for S {}
 
-struct O<T>;
+struct O<T>(T);
 impl<U, T: Trait<U>> O<T> {
     fn foo(&self) -> U { loop {} }
 }
@@ -1123,40 +1124,50 @@ fn test() {
 fn argument_impl_trait_type_args_2() {
     check_infer_with_mismatches(
         r#"
-//- minicore: sized
+//- minicore: sized, phantom_data
+use core::marker::PhantomData;
+
 trait Trait {}
 struct S;
 impl Trait for S {}
-struct F<T>;
+struct F<T>(PhantomData<T>);
 impl<T> F<T> {
     fn foo<U>(self, x: impl Trait) -> (T, U) { loop {} }
 }
 
 fn test() {
-    F.foo(S);
-    F::<u32>.foo(S);
-    F::<u32>.foo::<i32>(S);
-    F::<u32>.foo::<i32, u32>(S); // extraneous argument should be ignored
+    F(PhantomData).foo(S);
+    F::<u32>(PhantomData).foo(S);
+    F::<u32>(PhantomData).foo::<i32>(S);
+    F::<u32>(PhantomData).foo::<i32, u32>(S); // extraneous argument should be ignored
 }"#,
         expect![[r#"
-            87..91 'self': F<T>
-            93..94 'x': impl Trait
-            118..129 '{ loop {} }': (T, U)
-            120..127 'loop {}': !
-            125..127 '{}': ()
-            143..283 '{     ...ored }': ()
-            149..150 'F': F<{unknown}>
-            149..157 'F.foo(S)': ({unknown}, {unknown})
-            155..156 'S': S
-            163..171 'F::<u32>': F<u32>
-            163..178 'F::<u32>.foo(S)': (u32, {unknown})
-            176..177 'S': S
-            184..192 'F::<u32>': F<u32>
-            184..206 'F::<u3...32>(S)': (u32, i32)
-            204..205 'S': S
-            212..220 'F::<u32>': F<u32>
-            212..239 'F::<u3...32>(S)': (u32, i32)
-            237..238 'S': S
+            135..139 'self': F<T>
+            141..142 'x': impl Trait
+            166..177 '{ loop {} }': (T, U)
+            168..175 'loop {}': !
+            173..175 '{}': ()
+            191..383 '{     ...ored }': ()
+            197..198 'F': fn F<{unknown}>(PhantomData<{unknown}>) -> F<{unknown}>
+            197..211 'F(PhantomData)': F<{unknown}>
+            197..218 'F(Phan...foo(S)': ({unknown}, {unknown})
+            199..210 'PhantomData': PhantomData<{unknown}>
+            216..217 'S': S
+            224..232 'F::<u32>': fn F<u32>(PhantomData<u32>) -> F<u32>
+            224..245 'F::<u3...mData)': F<u32>
+            224..252 'F::<u3...foo(S)': (u32, {unknown})
+            233..244 'PhantomData': PhantomData<u32>
+            250..251 'S': S
+            258..266 'F::<u32>': fn F<u32>(PhantomData<u32>) -> F<u32>
+            258..279 'F::<u3...mData)': F<u32>
+            258..293 'F::<u3...32>(S)': (u32, i32)
+            267..278 'PhantomData': PhantomData<u32>
+            291..292 'S': S
+            299..307 'F::<u32>': fn F<u32>(PhantomData<u32>) -> F<u32>
+            299..320 'F::<u3...mData)': F<u32>
+            299..339 'F::<u3...32>(S)': (u32, i32)
+            308..319 'PhantomData': PhantomData<u32>
+            337..338 'S': S
         "#]],
     );
 }
@@ -1211,7 +1222,7 @@ fn test(x: impl Trait<u64>, y: &impl Trait<u64>) {
         expect![[r#"
             29..33 'self': &'? Self
             54..58 'self': &'? Self
-            98..100 '{}': impl Trait<u64>
+            98..100 '{}': ()
             110..111 'x': impl Trait<u64>
             130..131 'y': &'? impl Trait<u64>
             151..268 '{     ...2(); }': ()
@@ -1479,7 +1490,7 @@ fn test(x: Box<dyn Trait<u64>>, y: &dyn Trait<u64>) {
         expect![[r#"
             29..33 'self': &'? Self
             54..58 'self': &'? Self
-            206..208 '{}': Box<dyn Trait<u64> + 'static>
+            206..208 '{}': Box<dyn Trait<u64> + '?>
             218..219 'x': Box<dyn Trait<u64> + 'static>
             242..243 'y': &'? (dyn Trait<u64> + 'static)
             262..379 '{     ...2(); }': ()
@@ -1512,7 +1523,7 @@ fn dyn_trait_in_impl() {
 trait Trait<T, U> {
     fn foo(&self) -> (T, U);
 }
-struct S<T, U> {}
+struct S<T, U>(T, U);
 impl<T, U> S<T, U> {
     fn bar(&self) -> &dyn Trait<T, U> { loop {} }
 }
@@ -1526,16 +1537,16 @@ fn test(s: S<u32, i32>) {
 }"#,
         expect![[r#"
             32..36 'self': &'? Self
-            102..106 'self': &'? S<T, U>
-            128..139 '{ loop {} }': &'? (dyn Trait<T, U> + 'static)
-            130..137 'loop {}': !
-            135..137 '{}': ()
-            175..179 'self': &'? Self
-            251..252 's': S<u32, i32>
-            267..289 '{     ...z(); }': ()
-            273..274 's': S<u32, i32>
-            273..280 's.bar()': &'? (dyn Trait<u32, i32> + 'static)
-            273..286 's.bar().baz()': (u32, i32)
+            106..110 'self': &'? S<T, U>
+            132..143 '{ loop {} }': &'? (dyn Trait<T, U> + 'static)
+            134..141 'loop {}': !
+            139..141 '{}': ()
+            179..183 'self': &'? Self
+            255..256 's': S<u32, i32>
+            271..293 '{     ...z(); }': ()
+            277..278 's': S<u32, i32>
+            277..284 's.bar()': &'? (dyn Trait<u32, i32> + 'static)
+            277..290 's.bar().baz()': (u32, i32)
         "#]],
     );
 }
@@ -1560,7 +1571,7 @@ fn test(x: Trait, y: &Trait) -> u64 {
 }"#,
         expect![[r#"
             26..30 'self': &'? Self
-            60..62 '{}': dyn Trait + 'static
+            60..62 '{}': dyn Trait + '?
             72..73 'x': dyn Trait + 'static
             82..83 'y': &'? (dyn Trait + 'static)
             100..175 '{     ...o(); }': u64
@@ -1701,7 +1712,7 @@ fn test<T: Trait<Type = u32>>(x: T, y: impl Trait<Type = i64>) {
 }"#,
         expect![[r#"
             81..82 't': T
-            109..111 '{}': <T as Trait>::Type
+            109..111 '{}': ()
             143..144 't': T
             154..156 '{}': U
             186..187 't': T
@@ -2222,6 +2233,40 @@ fn test() {
             472..482 's.method()': u64
             484..485 'S': S
         "#]],
+    );
+}
+
+#[test]
+fn tuple_struct_constructor_as_fn_trait() {
+    check_types(
+        r#"
+//- minicore: fn
+struct S<T, U>(T, U);
+
+fn takes_fn<F: Fn(u32, u64) -> S<u32, u64>>(f: F) -> S<u32, u64> { f(1, 2) }
+
+fn test() {
+    takes_fn(S);
+  //^^^^^^^^^^^ S<u32, u64>
+}
+"#,
+    );
+}
+
+#[test]
+fn enum_variant_constructor_as_fn_trait() {
+    check_types(
+        r#"
+//- minicore: fn
+enum E<T> { A(T) }
+
+fn takes_fn<F: Fn(u32) -> E<u32>>(f: F) -> E<u32> { f(1) }
+
+fn test() {
+    takes_fn(E::A);
+  //^^^^^^^^^^^^^^ E<u32>
+}
+"#,
     );
 }
 
@@ -3122,6 +3167,7 @@ impl<A: Step> core::iter::Iterator for core::ops::Range<A> {
 fn infer_closure_arg() {
     check_infer(
         r#"
+//- minicore: fn
 //- /lib.rs
 
 enum Option<T> {
@@ -3944,7 +3990,6 @@ fn test() {
 
 #[test]
 fn foreign_trait_with_local_trait_impl() {
-    check!(block_local_impls);
     check(
         r#"
 mod module {
@@ -3955,15 +4000,16 @@ mod module {
 }
 
 fn f() {
+    struct Foo;
     use module::T;
-    impl T for usize {
+    impl T for Foo {
         const C: usize = 0;
         fn f(&self) {}
     }
-    0usize.f();
-  //^^^^^^^^^^ type: ()
-    usize::C;
-  //^^^^^^^^type: usize
+    Foo.f();
+  //^^^^^^^ type: ()
+    Foo::C;
+  //^^^^^^ type: usize
 }
 "#,
     );
@@ -4032,7 +4078,7 @@ fn f<F: Foo>() {
 fn dyn_map() {
     check_types(
         r#"
-pub struct Key<K, V, P = (K, V)> {}
+pub struct Key<K, V, P = (K, V)>(K, V, P);
 
 pub trait Policy {
     type K;
@@ -4044,7 +4090,7 @@ impl<K, V> Policy for (K, V) {
     type V = V;
 }
 
-pub struct KeyMap<KEY> {}
+pub struct KeyMap<KEY>(KEY);
 
 impl<P: Policy> KeyMap<Key<P::K, P::V, P>> {
     pub fn get(&self, key: &P::K) -> P::V {
@@ -4154,7 +4200,7 @@ trait Trait {
 }
 
 fn f(t: &dyn Trait<T = (), T = ()>) {}
-   //^&'? {unknown}
+   //^&'? (dyn Trait<T = ()> + 'static)
         "#,
     );
 }
@@ -4271,10 +4317,10 @@ fn f<'a>(v: &dyn Trait<Assoc<i32> = &'a i32>) {
     "#,
         expect![[r#"
             90..94 'self': &'? Self
-            127..128 'v': &'? (dyn Trait<Assoc<i32> = &'a i32> + 'static)
+            127..128 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
             164..195 '{     ...f(); }': ()
-            170..171 'v': &'? (dyn Trait<Assoc<i32> = &'a i32> + 'static)
-            170..184 'v.get::<i32>()': <dyn Trait<Assoc<i32> = &'a i32> + 'static as Trait>::Assoc<i32>
+            170..171 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
+            170..184 'v.get::<i32>()': <{unknown} as Trait>::Assoc<i32>
             170..192 'v.get:...eref()': {unknown}
         "#]],
     );
@@ -4417,14 +4463,14 @@ impl Trait for () {
         let a = Self::Assoc { x };
       //    ^ S
         let a = <Self>::Assoc { x }; // unstable
-      //    ^ {unknown}
+      //    ^ S
 
         // should be `Copy` but we don't track ownership anyway.
         let value = S { x };
         if let Self::Assoc { x } = value {}
       //                     ^ u32
         if let <Self>::Assoc { x } = value {} // unstable
-      //                       ^ {unknown}
+      //                       ^ u32
     }
 }
     "#,
@@ -4476,22 +4522,22 @@ impl Trait for () {
         let a = Self::Assoc::Struct { x };
       //    ^ E
         let a = <Self>::Assoc::Struct { x }; // unstable
-      //    ^ {unknown}
+      //    ^ E
         let a = <Self::Assoc>::Struct { x }; // unstable
-      //    ^ {unknown}
+      //    ^ E
         let a = <<Self>::Assoc>::Struct { x }; // unstable
-      //    ^ {unknown}
+      //    ^ E
 
         // should be `Copy` but we don't track ownership anyway.
         let value = E::Struct { x: 42 };
         if let Self::Assoc::Struct { x } = value {}
       //                             ^ u32
         if let <Self>::Assoc::Struct { x } = value {} // unstable
-      //                               ^ {unknown}
+      //                               ^ u32
         if let <Self::Assoc>::Struct { x } = value {} // unstable
-      //                               ^ {unknown}
+      //                               ^ u32
         if let <<Self>::Assoc>::Struct { x } = value {} // unstable
-      //                                 ^ {unknown}
+      //                                 ^ u32
     }
 }
     "#,
@@ -4717,21 +4763,21 @@ fn f<T: Send, U>() {
     Struct::<T>::IS_SEND;
   //^^^^^^^^^^^^^^^^^^^^Yes
     Struct::<U>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^^^{unknown}
     Struct::<*const T>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^{unknown}
     Enum::<T>::IS_SEND;
   //^^^^^^^^^^^^^^^^^^Yes
     Enum::<U>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^{unknown}
     Enum::<*const T>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^^^^^^^^{unknown}
     Union::<T>::IS_SEND;
   //^^^^^^^^^^^^^^^^^^^Yes
     Union::<U>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^^{unknown}
     Union::<*const T>::IS_SEND;
-  //^^^^^^^^^^^^^^^^^^^^^^^^^^Yes
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^{unknown}
     PhantomData::<T>::IS_SEND;
   //^^^^^^^^^^^^^^^^^^^^^^^^^Yes
     PhantomData::<U>::IS_SEND;
@@ -4829,12 +4875,29 @@ fn allowed3(baz: impl Baz<Assoc = Qux<impl Foo>>) {}
             431..433 '{}': ()
             447..450 'baz': impl Baz<Assoc = impl Foo>
             480..482 '{}': ()
-            500..503 'baz': impl Baz<Assoc = &'a impl Foo + 'a>
+            500..503 'baz': impl Baz<Assoc = &'a (impl Foo + 'a)>
             544..546 '{}': ()
             560..563 'baz': impl Baz<Assoc = Qux<impl Foo>>
             598..600 '{}': ()
         "#]],
     )
+}
+
+#[test]
+fn rpit_with_lifetimes() {
+    check_no_mismatches(
+        r#"
+struct Event<'a> {};
+struct Range<T> {}
+trait Iterator {
+    type Item;
+}
+
+struct Vec<T> {}
+
+fn foo<'e>(events: &'e mut dyn Iterator<Item = (Event<'e>, Range<usize>)>) -> impl Iterator<Item = Event<'e>> {}
+"#,
+    );
 }
 
 #[test]
@@ -4878,8 +4941,8 @@ async fn baz<T: AsyncFnOnce(u32) -> i32>(c: T) {
     "#,
         expect![[r#"
             37..38 'a': T
+            37..38 'a': T
             43..83 '{     ...ait; }': ()
-            43..83 '{     ...ait; }': impl Future<Output = ()>
             53..57 'fut1': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
             60..61 'a': T
             60..64 'a(0)': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
@@ -4887,8 +4950,8 @@ async fn baz<T: AsyncFnOnce(u32) -> i32>(c: T) {
             70..74 'fut1': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
             70..80 'fut1.await': i32
             124..129 'mut b': T
+            124..129 'mut b': T
             134..174 '{     ...ait; }': ()
-            134..174 '{     ...ait; }': impl Future<Output = ()>
             144..148 'fut2': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
             151..152 'b': T
             151..155 'b(0)': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
@@ -4896,8 +4959,8 @@ async fn baz<T: AsyncFnOnce(u32) -> i32>(c: T) {
             161..165 'fut2': <T as AsyncFnMut<(u32,)>>::CallRefFuture<'?>
             161..171 'fut2.await': i32
             216..217 'c': T
+            216..217 'c': T
             222..262 '{     ...ait; }': ()
-            222..262 '{     ...ait; }': impl Future<Output = ()>
             232..236 'fut3': <T as AsyncFnOnce<(u32,)>>::CallOnceFuture
             239..240 'c': T
             239..243 'c(0)': <T as AsyncFnOnce<(u32,)>>::CallOnceFuture
@@ -4972,7 +5035,7 @@ where
 "#,
         expect![[r#"
             84..86 'de': D
-            135..138 '{ }': <D as Deserializer<'de>>::Error
+            135..138 '{ }': ()
         "#]],
     );
 }
@@ -5037,17 +5100,314 @@ fn main() {
     let _ = iter.into_iter();
 }"#,
         expect![[r#"
-            10..313 '{     ...r(); }': ()
+            10..313 '{     ...r(); }': !
             223..227 'iter': Box<dyn Iterator<Item = &'? [u8]> + 'static>
             273..280 'loop {}': !
             278..280 '{}': ()
             290..291 '_': Box<dyn Iterator<Item = &'? [u8]> + '?>
             294..298 'iter': Box<dyn Iterator<Item = &'? [u8]> + 'static>
-            294..310 'iter.i...iter()': Box<dyn Iterator<Item = &'? [u8]> + 'static>
+            294..310 'iter.i...iter()': Box<dyn Iterator<Item = &'? [u8]> + '?>
             152..156 'self': &'? mut Box<I>
             177..208 '{     ...     }': Option<<I as Iterator>::Item>
             191..198 'loop {}': !
             196..198 '{}': ()
         "#]],
+    );
+}
+
+#[test]
+fn implicit_sized_bound_on_param() {
+    check(
+        r#"
+//- minicore: sized
+struct PBox<T, A>(T, A);
+
+impl<T, A> PBox<T, A> {
+    fn token_with(self) {}
+}
+
+trait MoveMessage {
+    fn token<A>(self, alloc: A)
+    where
+        Self: Sized,
+    {
+        let b = PBox::<Self, A>(self, alloc);
+        b.token_with();
+     // ^^^^^^^^^^^^^^ type: ()
+    }
+}
+    "#,
+    );
+}
+
+#[test]
+fn dyn_trait_supertrait_projections_are_elaborated() {
+    check_types(
+        r#"
+//- minicore: deref, sized, unsize, coerce_unsized, dispatch_from_dyn
+use core::ops::Deref;
+
+struct Base;
+
+impl Base {
+    fn func(&self) -> i32 { 111 }
+}
+
+trait BaseLayerOne: Deref<Target = Base>{}
+
+fn foo(base_layer_two: &dyn BaseLayerOne) {
+    let _r = base_layer_two.func();
+     // ^^ i32
+}
+    "#,
+    );
+}
+
+#[test]
+fn default_assoc_types() {
+    check_types(
+        r#"
+trait Trait<T> {
+    type Assoc<U> = (T, U);
+    fn method(self) -> Self::Assoc<i32> { loop {} }
+}
+
+struct Struct<T>(T);
+impl<T> Trait<((), T)> for Struct<T> {}
+
+fn foo(v: Struct<f32>) {
+    v.method();
+ // ^^^^^^^^^^ (((), f32), i32)
+}
+    "#,
+    );
+}
+
+#[test]
+fn more_qualified_paths() {
+    check_infer(
+        r#"
+struct T;
+struct S {
+    a: u32,
+}
+
+trait Trait {
+    type Assoc;
+
+    fn foo();
+}
+
+impl Trait for T {
+    type Assoc = S;
+
+    fn foo() {
+        let <Self>::Assoc { a } = <Self>::Assoc { a: 0 };
+    }
+}
+
+enum E {
+    ES { a: u32 },
+    ET(u32),
+}
+
+impl Trait for E {
+    type Assoc = Self;
+
+    fn foo() {
+        let <Self>::Assoc::ES { a } = <Self>::Assoc::ES { a: 0 };
+    }
+}
+
+fn foo() {
+    let <T as Trait>::Assoc { a } = <T as Trait>::Assoc { a: 0 };
+
+    let <E>::ES { a } = (<E>::ES { a: 0 }) else { loop {} };
+    let <E>::ET(a) = <E>::ET(0) else { loop {} };
+    let <E as Trait>::Assoc::ES { a } = (<E as Trait>::Assoc::ES { a: 0 }) else { loop {} };
+    let <E as Trait>::Assoc::ET(a) = <E as Trait>::Assoc::ET(0) else { loop {} };
+}
+    "#,
+        expect![[r#"
+            137..202 '{     ...     }': ()
+            151..170 '<Self>... { a }': S
+            167..168 'a': u32
+            173..195 '<Self>...a: 0 }': S
+            192..193 '0': u32
+            306..379 '{     ...     }': ()
+            320..343 '<Self>... { a }': E
+            340..341 'a': u32
+            346..372 '<Self>...a: 0 }': E
+            369..370 '0': u32
+            392..748 '{     ...} }; }': ()
+            402..427 '<T as ... { a }': S
+            424..425 'a': u32
+            430..458 '<T as ...a: 0 }': S
+            455..456 '0': u32
+            469..482 '<E>::ES { a }': E
+            479..480 'a': u32
+            486..502 '<E>::E...a: 0 }': E
+            499..500 '0': u32
+            509..520 '{ loop {} }': !
+            511..518 'loop {}': !
+            516..518 '{}': ()
+            530..540 '<E>::ET(a)': E
+            538..539 'a': u32
+            543..550 '<E>::ET': fn ET(u32) -> E
+            543..553 '<E>::ET(0)': E
+            551..552 '0': u32
+            559..570 '{ loop {} }': !
+            561..568 'loop {}': !
+            566..568 '{}': ()
+            580..609 '<E as ... { a }': E
+            606..607 'a': u32
+            613..645 '<E as ...a: 0 }': E
+            642..643 '0': u32
+            652..663 '{ loop {} }': !
+            654..661 'loop {}': !
+            659..661 '{}': ()
+            673..699 '<E as ...:ET(a)': E
+            697..698 'a': u32
+            702..725 '<E as ...oc::ET': fn ET(u32) -> E
+            702..728 '<E as ...:ET(0)': E
+            726..727 '0': u32
+            734..745 '{ loop {} }': !
+            736..743 'loop {}': !
+            741..743 '{}': ()
+        "#]],
+    );
+}
+
+#[test]
+fn rpit_with_type_and_only_late_bound_lifetime() {
+    check_no_mismatches(
+        r#"
+trait Trait<'a> {}
+struct Foo {}
+
+impl<'a> Trait for () {}
+
+fn foo<'a, T>(t: &'a mut T) -> impl Trait<'a> {}
+
+fn bar() {
+    let mut f = Foo {};
+    let p = foo(&mut f);
+}
+"#,
+    );
+}
+
+#[test]
+fn rpit_with_type_and_both_lifetimes() {
+    check_no_mismatches(
+        r#"
+trait Trait<'a> {}
+struct Foo {}
+
+impl<'a> Trait for () {}
+
+fn foo<'a, 'b, T: 'b>(t: &'a mut T) -> impl Trait<'a> {}
+
+fn bar() {
+    let mut f = Foo {};
+    let p = foo(&mut f);
+}
+"#,
+    );
+}
+
+#[test]
+fn async_impl_trait() {
+    check_no_mismatches(
+        r#"
+//- minicore: future
+trait Reader {}
+
+struct Path {}
+struct Result<T> { v: T }
+
+impl Reader for () {}
+
+async fn read<'a>(path: &'a Path) -> Result<impl Reader + 'a> {
+    Result { v: () }
+}
+
+fn foo() {
+    let p = Path {};
+    let v = read(&p);
+}
+"#,
+    );
+}
+
+#[test]
+fn hrtb_impl_trait() {
+    check_infer(
+        r#"
+trait Trait<'a> {}
+
+struct Foo;
+
+impl<'a> Trait<'a> for Bot {}
+
+fn impl_fn(val: impl for<'a> Trait<'a>) {}
+"#,
+        expect![[r#"
+            75..78 'val': impl Trait<'?0.0> + ?Sized
+            104..106 '{}': ()
+        "#]],
+    );
+}
+
+#[test]
+fn hrtb_dyn_trait() {
+    check_infer(
+        r#"
+trait Trait<'a, 'b> {}
+
+struct Foo;
+
+impl<'a, 'b> Trait<'a, 'b> for Foo {}
+
+fn run_dyn<'b>(val: &dyn for<'a> Trait<'a, 'b>) {}
+"#,
+        expect![[r#"
+            91..94 'val': &'? (dyn Trait<'_, '_> + 'static)
+            124..126 '{}': ()
+        "#]],
+    );
+}
+
+#[test]
+fn recursive_auto_trait() {
+    check_types(
+        r#"
+auto trait Send {}
+impl<T> !Send for *const T {}
+
+struct Vec<T>(*const T);
+impl<T: Send> Send for Vec<T> {}
+
+struct Node {
+    children: Vec<Node>,
+}
+
+struct Holder<T>(T);
+
+trait Lock<T> {
+    fn get(&self) -> &T;
+}
+
+impl<T: Send> Lock<T> for Holder<T> {
+    fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+fn probe(h: &Holder<Node>) {
+    h.get();
+ // ^^^^^^^ &'? Node
+}
+    "#,
     );
 }

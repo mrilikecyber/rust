@@ -74,10 +74,18 @@ pub mod ext {
         expr_from_text("_")
     }
     pub fn expr_ty_default(ty: &ast::Type) -> ast::Expr {
-        expr_from_text(&format!("{ty}::default()"))
+        if !ty.needs_angles_in_path() {
+            expr_from_text(&format!("{ty}::default()"))
+        } else {
+            expr_from_text(&format!("<{ty}>::default()"))
+        }
     }
     pub fn expr_ty_new(ty: &ast::Type) -> ast::Expr {
-        expr_from_text(&format!("{ty}::new()"))
+        if !ty.needs_angles_in_path() {
+            expr_from_text(&format!("{ty}::new()"))
+        } else {
+            expr_from_text(&format!("<{ty}>::new()"))
+        }
     }
     pub fn expr_self() -> ast::Expr {
         expr_from_text("self")
@@ -178,6 +186,9 @@ pub fn ty_tuple(types: impl IntoIterator<Item = ast::Type>) -> ast::Type {
     }
 
     ty_from_text(&format!("({contents})"))
+}
+pub fn ty_paren(ty: ast::Type) -> ast::Type {
+    ty_from_text(&format!("({ty})"))
 }
 pub fn ty_ref(target: ast::Type, exclusive: bool) -> ast::Type {
     ty_from_text(&if exclusive { format!("&mut {target}") } else { format!("&{target}") })
@@ -286,12 +297,7 @@ fn merge_where_clause(
         (None, None) => None,
         (None, Some(bs)) => Some(bs),
         (Some(ps), None) => Some(ps),
-        (Some(ps), Some(bs)) => {
-            let preds = where_clause(std::iter::empty()).clone_for_update();
-            ps.predicates().for_each(|p| preds.add_predicate(p));
-            bs.predicates().for_each(|p| preds.add_predicate(p));
-            Some(preds)
-        }
+        (Some(ps), Some(bs)) => Some(where_clause(ps.predicates().chain(bs.predicates()))),
     }
 }
 
@@ -533,9 +539,10 @@ pub fn block_expr(
     quote! {
         BlockExpr {
             StmtList {
-                ['{'] "\n"
-                #("    " #stmts "\n")*
-                #("    " #tail_expr "\n")*
+                ['{']
+                #("\n    " #stmts)*
+                #("\n    " #tail_expr)*
+                "\n"
                 ['}']
             }
         }
@@ -558,7 +565,17 @@ pub fn async_move_block_expr(
 }
 
 pub fn tail_only_block_expr(tail_expr: ast::Expr) -> ast::BlockExpr {
-    ast_from_text(&format!("fn f() {{ {tail_expr} }}"))
+    quote! {
+        BlockExpr {
+            StmtList {
+                ['{']
+                " "
+                #tail_expr
+                " "
+                ['}']
+            }
+        }
+    }
 }
 
 /// Ideally this function wouldn't exist since it involves manual indenting.
@@ -644,7 +661,8 @@ pub fn expr_await(expr: ast::Expr) -> ast::Expr {
     expr_from_text(&format!("{expr}.await"))
 }
 pub fn expr_match(expr: ast::Expr, match_arm_list: ast::MatchArmList) -> ast::MatchExpr {
-    expr_from_text(&format!("match {expr} {match_arm_list}"))
+    let ws = block_whitespace(&expr);
+    expr_from_text(&format!("match {expr}{ws}{match_arm_list}"))
 }
 pub fn expr_if(
     condition: ast::Expr,
@@ -652,18 +670,21 @@ pub fn expr_if(
     else_branch: Option<ast::ElseBranch>,
 ) -> ast::IfExpr {
     let else_branch = match else_branch {
-        Some(ast::ElseBranch::Block(block)) => format!("else {block}"),
-        Some(ast::ElseBranch::IfExpr(if_expr)) => format!("else {if_expr}"),
+        Some(ast::ElseBranch::Block(block)) => format!(" else {block}"),
+        Some(ast::ElseBranch::IfExpr(if_expr)) => format!(" else {if_expr}"),
         None => String::new(),
     };
-    expr_from_text(&format!("if {condition} {then_branch} {else_branch}"))
+    let ws = block_whitespace(&condition);
+    expr_from_text(&format!("if {condition}{ws}{then_branch}{else_branch}"))
 }
-pub fn expr_for_loop(pat: ast::Pat, expr: ast::Expr, block: ast::BlockExpr) -> ast::Expr {
-    expr_from_text(&format!("for {pat} in {expr} {block}"))
+pub fn expr_for_loop(pat: ast::Pat, expr: ast::Expr, block: ast::BlockExpr) -> ast::ForExpr {
+    let ws = block_whitespace(&expr);
+    expr_from_text(&format!("for {pat} in {expr}{ws}{block}"))
 }
 
 pub fn expr_while_loop(condition: ast::Expr, block: ast::BlockExpr) -> ast::WhileExpr {
-    expr_from_text(&format!("while {condition} {block}"))
+    let ws = block_whitespace(&condition);
+    expr_from_text(&format!("while {condition}{ws}{block}"))
 }
 
 pub fn expr_loop(block: ast::BlockExpr) -> ast::Expr {
@@ -675,7 +696,12 @@ pub fn expr_prefix(op: SyntaxKind, expr: ast::Expr) -> ast::PrefixExpr {
     expr_from_text(&format!("{token}{expr}"))
 }
 pub fn expr_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::CallExpr {
-    expr_from_text(&format!("{f}{arg_list}"))
+    quote! {
+        CallExpr {
+            #f
+            #arg_list
+        }
+    }
 }
 pub fn expr_method_call(
     receiver: ast::Expr,
@@ -689,6 +715,13 @@ pub fn expr_macro(path: ast::Path, tt: ast::TokenTree) -> ast::MacroExpr {
 }
 pub fn expr_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
     expr_from_text(&if exclusive { format!("&mut {expr}") } else { format!("&{expr}") })
+}
+pub fn expr_raw_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
+    expr_from_text(&if exclusive {
+        format!("&raw mut {expr}")
+    } else {
+        format!("&raw const {expr}")
+    })
 }
 pub fn expr_reborrow(expr: ast::Expr) -> ast::Expr {
     expr_from_text(&format!("&mut *{expr}"))
@@ -713,13 +746,9 @@ pub fn expr_tuple(elements: impl IntoIterator<Item = ast::Expr>) -> ast::TupleEx
 pub fn expr_assignment(lhs: ast::Expr, rhs: ast::Expr) -> ast::BinExpr {
     expr_from_text(&format!("{lhs} = {rhs}"))
 }
-fn expr_from_text<E: Into<ast::Expr> + AstNode>(text: &str) -> E {
-    ast_from_text(&format!("const C: () = {text};"))
+fn block_whitespace(after: &impl AstNode) -> &'static str {
+    if after.syntax().text().contains_char('\n') { "\n" } else { " " }
 }
-pub fn expr_let(pattern: ast::Pat, expr: ast::Expr) -> ast::LetExpr {
-    ast_from_text(&format!("const _: () = while let {pattern} = {expr} {{}};"))
-}
-
 pub fn arg_list(args: impl IntoIterator<Item = ast::Expr>) -> ast::ArgList {
     let args = args.into_iter().format(", ");
     ast_from_text(&format!("fn main() {{ ()({args}) }}"))
@@ -855,6 +884,10 @@ pub fn box_pat(pat: ast::Pat) -> ast::BoxPat {
     ast_from_text(&format!("fn f(box {pat}: ())"))
 }
 
+pub fn deref_pat(pat: ast::Pat) -> ast::Pat {
+    ast_from_text(&format!("fn f(deref!({pat}): ())"))
+}
+
 pub fn paren_pat(pat: ast::Pat) -> ast::ParenPat {
     ast_from_text(&format!("fn f(({pat}): ())"))
 }
@@ -873,23 +906,11 @@ pub fn ref_pat(pat: ast::Pat) -> ast::RefPat {
 
 pub fn match_arm(pat: ast::Pat, guard: Option<ast::MatchGuard>, expr: ast::Expr) -> ast::MatchArm {
     let comma_str = if expr.is_block_like() { "" } else { "," };
+    let ws = guard.as_ref().filter(|_| expr.is_block_like()).map_or(" ", block_whitespace);
     return match guard {
-        Some(guard) => from_text(&format!("{pat} {guard} => {expr}{comma_str}")),
+        Some(guard) => from_text(&format!("{pat} {guard} =>{ws}{expr}{comma_str}")),
         None => from_text(&format!("{pat} => {expr}{comma_str}")),
     };
-
-    fn from_text(text: &str) -> ast::MatchArm {
-        ast_from_text(&format!("fn f() {{ match () {{{text}}} }}"))
-    }
-}
-
-pub fn match_arm_with_guard(
-    pats: impl IntoIterator<Item = ast::Pat>,
-    guard: ast::Expr,
-    expr: ast::Expr,
-) -> ast::MatchArm {
-    let pats_str = pats.into_iter().join(" | ");
-    return from_text(&format!("{pats_str} if {guard} => {expr}"));
 
     fn from_text(text: &str) -> ast::MatchArm {
         ast_from_text(&format!("fn f() {{ match () {{{text}}} }}"))
@@ -1016,11 +1037,30 @@ pub fn item_static(
 }
 
 pub fn unnamed_param(ty: ast::Type) -> ast::Param {
-    ast_from_text(&format!("fn f({ty}) {{ }}"))
+    quote! {
+        Param {
+            #ty
+        }
+    }
+}
+
+pub fn untyped_param(pat: ast::Pat) -> ast::Param {
+    quote! {
+        Param {
+            #pat
+        }
+    }
 }
 
 pub fn param(pat: ast::Pat, ty: ast::Type) -> ast::Param {
-    ast_from_text(&format!("fn f({pat}: {ty}) {{ }}"))
+    quote! {
+        Param {
+            #pat
+            [:]
+            " "
+            #ty
+        }
+    }
 }
 
 pub fn self_param() -> ast::SelfParam {
@@ -1300,6 +1340,18 @@ pub fn meta_path(path: ast::Path) -> ast::Meta {
     ast_from_text(&format!("#[{path}]"))
 }
 
+pub fn cfg_attr_meta(
+    predicate: ast::CfgPredicate,
+    inner: impl IntoIterator<Item = ast::Meta>,
+) -> ast::CfgAttrMeta {
+    let inner = inner.into_iter().join(", ");
+    ast_from_text(&format!("#![cfg_attr({predicate}, {inner})]"))
+}
+
+pub fn cfg_flag(flag: &str) -> ast::CfgPredicate {
+    ast_from_text(&format!("#![cfg({flag})]"))
+}
+
 pub fn token_tree(
     delimiter: SyntaxKind,
     tt: impl IntoIterator<Item = NodeOrToken<ast::TokenTree, SyntaxToken>>,
@@ -1315,6 +1367,30 @@ pub fn token_tree(
     ast_from_text(&format!("tt!{l_delimiter}{tt}{r_delimiter}"))
 }
 
+pub fn expr_let(pattern: ast::Pat, expr: ast::Expr) -> ast::LetExpr {
+    expr_from_text(&format!("while let {pattern} = {expr} {{}}"))
+}
+
+#[track_caller]
+fn expr_from_text<E: Into<ast::Expr> + AstNode>(text: &str) -> E {
+    expr_from_text_with_edition(text, Edition::CURRENT)
+}
+
+#[track_caller]
+fn expr_from_text_with_edition<E: Into<ast::Expr> + AstNode>(text: &str, edition: Edition) -> E {
+    let parse = ast::Expr::parse(text, edition);
+    let node = match parse.tree().syntax().descendants().find_map(E::cast) {
+        Some(it) => it,
+        None => {
+            let node = std::any::type_name::<E>();
+            panic!("Failed to make expr node `{node}` from text `{text}`")
+        }
+    };
+    let node = node.clone_subtree();
+    assert_eq!(node.syntax().text_range().start(), 0.into());
+    node
+}
+
 #[track_caller]
 fn ast_from_text<N: AstNode>(text: &str) -> N {
     ast_from_text_with_edition(text, Edition::CURRENT)
@@ -1327,7 +1403,7 @@ fn ast_from_text_with_edition<N: AstNode>(text: &str, edition: Edition) -> N {
         Some(it) => it,
         None => {
             let node = std::any::type_name::<N>();
-            panic!("Failed to make ast node `{node}` from text {text}")
+            panic!("Failed to make ast node `{node}` from text `{text}`")
         }
     };
     let node = node.clone_subtree();
@@ -1339,7 +1415,6 @@ pub fn token(kind: SyntaxKind) -> SyntaxToken {
     tokens::SOURCE_FILE
         .tree()
         .syntax()
-        .clone_for_update()
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .find(|it| it.kind() == kind)
@@ -1360,43 +1435,10 @@ pub mod tokens {
         )
     });
 
-    pub fn semicolon() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == SEMICOLON)
-            .unwrap()
-    }
-
-    pub fn single_space() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == " ")
-            .unwrap()
-    }
-
-    pub fn crate_kw() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == CRATE_KW)
-            .unwrap()
-    }
-
     pub fn whitespace(text: &str) -> SyntaxToken {
         assert!(text.trim().is_empty());
         let sf = SourceFile::parse(text, Edition::CURRENT).ok().unwrap();
-        sf.syntax().clone_for_update().first_child_or_token().unwrap().into_token().unwrap()
+        sf.syntax().first_child_or_token().unwrap().into_token().unwrap()
     }
 
     pub fn doc_comment(text: &str) -> SyntaxToken {
@@ -1420,39 +1462,97 @@ pub mod tokens {
             .find(|it| it.kind() == IDENT)
             .unwrap()
     }
+}
 
-    pub fn single_newline() -> SyntaxToken {
-        let res = SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == "\n")
-            .unwrap();
-        res.detach();
-        res
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+
+    use super::*;
+
+    #[track_caller]
+    fn check(node: impl AstNode, expect: expect_test::Expect) {
+        let node_debug = format!("{:#?}", node.syntax());
+        expect.assert_eq(&node_debug);
     }
 
-    pub fn blank_line() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == "\n\n")
-            .unwrap()
+    #[test]
+    fn test_unnamed_param() {
+        check(
+            unnamed_param(ty("Vec")),
+            expect![[r#"
+                PARAM@0..3
+                  PATH_TYPE@0..3
+                    PATH@0..3
+                      PATH_SEGMENT@0..3
+                        NAME_REF@0..3
+                          IDENT@0..3 "Vec"
+            "#]],
+        );
+
+        check(
+            unnamed_param(ty("Vec<T>")),
+            expect![[r#"
+                PARAM@0..6
+                  PATH_TYPE@0..6
+                    PATH@0..6
+                      PATH_SEGMENT@0..6
+                        NAME_REF@0..3
+                          IDENT@0..3 "Vec"
+                        GENERIC_ARG_LIST@3..6
+                          L_ANGLE@3..4 "<"
+                          TYPE_ARG@4..5
+                            PATH_TYPE@4..5
+                              PATH@4..5
+                                PATH_SEGMENT@4..5
+                                  NAME_REF@4..5
+                                    IDENT@4..5 "T"
+                          R_ANGLE@5..6 ">"
+            "#]],
+        );
     }
 
-    pub struct WsBuilder(SourceFile);
+    #[test]
+    fn expr_if_without_else_has_no_trailing_whitespace() {
+        let if_expr = expr_if(ext::expr_underscore(), block_expr(None, None), None);
+        assert_eq!(if_expr.syntax().to_string(), "if _ {\n}");
 
-    impl WsBuilder {
-        pub fn new(text: &str) -> WsBuilder {
-            WsBuilder(SourceFile::parse(text, Edition::CURRENT).ok().unwrap())
-        }
-        pub fn ws(&self) -> SyntaxToken {
-            self.0.syntax().first_child_or_token().unwrap().into_token().unwrap()
-        }
+        let stmt = expr_stmt(if_expr.into());
+        let block = block_expr([stmt.into()], None);
+        assert_eq!(block.syntax().to_string(), "{\n    if _ {\n}\n}");
+    }
+
+    #[test]
+    fn test_untyped_param() {
+        check(
+            untyped_param(path_pat(ext::ident_path("name"))),
+            expect![[r#"
+                PARAM@0..4
+                  IDENT_PAT@0..4
+                    NAME@0..4
+                      IDENT@0..4 "name"
+            "#]],
+        );
+
+        check(
+            untyped_param(
+                range_pat(
+                    Some(path_pat(ext::ident_path("start"))),
+                    Some(path_pat(ext::ident_path("end"))),
+                )
+                .into(),
+            ),
+            expect![[r#"
+                PARAM@0..10
+                  RANGE_PAT@0..10
+                    IDENT_PAT@0..5
+                      NAME@0..5
+                        IDENT@0..5 "start"
+                    DOT2@5..7 ".."
+                    IDENT_PAT@7..10
+                      NAME@7..10
+                        IDENT@7..10 "end"
+            "#]],
+        );
     }
 }

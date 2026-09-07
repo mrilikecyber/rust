@@ -8,10 +8,9 @@
 
 use rustc_macros::extension;
 use rustc_middle::ty::{
-    self, DelayedMap, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
-    TypeVisitableExt, TypeVisitor,
+    self, DelayedMap, Ty, TyCtxt, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
-use rustc_type_ir::{TypeFlags, TypeVisitable};
 
 use crate::infer::canonical::{Canonical, CanonicalVarValues};
 
@@ -43,7 +42,7 @@ impl<'tcx, V> Canonical<'tcx, V> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        assert_eq!(self.variables.len(), var_values.len());
+        assert_eq!(self.var_kinds.len(), var_values.len());
         let value = projection_fn(&self.value);
         instantiate_value(tcx, var_values, value)
     }
@@ -144,17 +143,18 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for CanonicalInstantiator<'tcx> {
         // is both expensive (depending on the size of the clauses) and a pure function.
         let index = *self
             .tcx
+            .caches
             .highest_var_in_clauses_cache
             .lock()
             .entry(c)
             .or_insert_with(|| highest_var_in_clauses(c));
         let c_args = &self.var_values[..=index];
 
-        if let Some(c) = self.tcx.clauses_cache.lock().get(&(c, c_args)) {
+        if let Some(c) = self.tcx.caches.clauses_cache.lock().get(&(c, c_args)) {
             c
         } else {
             let folded = c.super_fold_with(self);
-            self.tcx.clauses_cache.lock().insert((c, c_args), folded);
+            self.tcx.caches.clauses_cache.lock().insert((c, c_args), folded);
             folded
         }
     }

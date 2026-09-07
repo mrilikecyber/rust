@@ -1,9 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeDef as _;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::sym;
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, LangItem};
+use rustc_hir::Expr;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_lint::LateContext;
 
 use crate::methods::method_call;
@@ -34,7 +35,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, recv: &'tcx E
             parent.span,
             format!("called `.bytes().nth().unwrap()` on a `{caller_type}`"),
             "try",
-            format!("{receiver}.as_bytes()[{n}]",),
+            format!("{receiver}.as_bytes()[{n}]"),
             applicability,
         );
     } else {

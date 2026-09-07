@@ -422,7 +422,7 @@ impl<T> From<T> for Mutex<T> {
 }
 
 #[unstable(feature = "nonpoison_mutex", issue = "134645")]
-impl<T: ?Sized + Default> Default for Mutex<T> {
+impl<T: Default> Default for Mutex<T> {
     /// Creates a `Mutex<T>`, with the `Default` value for T.
     fn default() -> Mutex<T> {
         Mutex::new(Default::default())
@@ -447,7 +447,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 
 impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
     unsafe fn new(lock: &'mutex Mutex<T>) -> MutexGuard<'mutex, T> {
-        return MutexGuard { lock };
+        MutexGuard { lock }
     }
 }
 

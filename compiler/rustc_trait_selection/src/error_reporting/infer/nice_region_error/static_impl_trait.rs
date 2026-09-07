@@ -13,8 +13,8 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::{Ident, Span};
 use tracing::debug;
 
+use crate::diagnostics::ButNeedsToSatisfy;
 use crate::error_reporting::infer::nice_region_error::NiceRegionError;
-use crate::errors::ButNeedsToSatisfy;
 use crate::infer::{RegionResolutionError, SubregionOrigin};
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
@@ -162,7 +162,12 @@ pub fn suggest_new_region_bound(
             TyKind::OpaqueDef(opaque) => {
                 // Get the identity type for this RPIT
                 let did = opaque.def_id.to_def_id();
-                let ty = Ty::new_opaque(tcx, did, ty::GenericArgs::identity_for_item(tcx, did));
+                let ty = Ty::new_opaque(
+                    tcx,
+                    ty::IsRigid::No,
+                    did,
+                    ty::GenericArgs::identity_for_item(tcx, did),
+                );
 
                 if let Some(span) = opaque.bounds.iter().find_map(|arg| match arg {
                     GenericBound::Outlives(Lifetime {
@@ -238,15 +243,15 @@ pub fn suggest_new_region_bound(
                             format!("you can use the named lifetime parameter `{name}`")
                         };
                         spans_suggs.push((fn_return.span.shrink_to_hi(), format!(" + {name} ")));
-                        err.multipart_suggestion_verbose(
-                            format!("{declare} `{ty}` {captures}, {use_lt}",),
+                        err.multipart_suggestion(
+                            format!("{declare} `{ty}` {captures}, {use_lt}"),
                             spans_suggs,
                             Applicability::MaybeIncorrect,
                         );
                     } else {
                         err.span_suggestion_verbose(
                             fn_return.span.shrink_to_hi(),
-                            format!("{declare} `{ty}` {captures}, {explicit}",),
+                            format!("{declare} `{ty}` {captures}, {explicit}"),
                             &plus_lt,
                             Applicability::MaybeIncorrect,
                         );
@@ -257,7 +262,7 @@ pub fn suggest_new_region_bound(
                 if let LifetimeKind::ImplicitObjectLifetimeDefault = lt.kind {
                     err.span_suggestion_verbose(
                         fn_return.span.shrink_to_hi(),
-                        format!("{declare} the trait object {captures}, {explicit}",),
+                        format!("{declare} the trait object {captures}, {explicit}"),
                         &plus_lt,
                         Applicability::MaybeIncorrect,
                     );

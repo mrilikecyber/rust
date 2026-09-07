@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use rustc_hir::attrs::lang_items::LangItem;
 use thin_vec::thin_vec;
 
 use crate::LoweringContext;
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     /// Lowered contracts are guarded with the `contract_checks` compiler flag,
     /// i.e. the flag turns into a boolean guard in the lowered HIR. The reason
     /// for not eliminating the contract code entirely when the `contract_checks`
@@ -23,7 +24,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // The order in which things are lowered is important! I.e to
         // refer to variables in contract_decls from postcond/precond,
         // we must lower it first!
-        let contract_decls = self.lower_stmts(&contract.declarations).0;
+        let contract_decls = self.lower_decls(contract);
 
         match (&contract.requires, &contract.ensures) {
             (Some(req), Some(ens)) => {
@@ -124,6 +125,18 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         }
     }
 
+    fn lower_decls(&mut self, contract: &rustc_ast::FnContract) -> &'hir [rustc_hir::Stmt<'hir>] {
+        let (decls, decls_tail) = self.lower_stmts(&contract.declarations);
+
+        if let Some(e) = decls_tail {
+            // include the tail expression in the declaration statements
+            let tail = self.stmt_expr(e.span, *e);
+            self.arena.alloc_from_iter(decls.into_iter().map(|d| *d).chain([tail].into_iter()))
+        } else {
+            decls
+        }
+    }
+
     /// Lower the precondition check intrinsic.
     fn lower_precond(&mut self, req: &Box<rustc_ast::Expr>) -> rustc_hir::Stmt<'hir> {
         let lowered_req = self.lower_expr_mut(&req);
@@ -134,7 +147,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         );
         let precond = self.expr_call_lang_item_fn_mut(
             req_span,
-            rustc_hir::LangItem::ContractCheckRequires,
+            LangItem::ContractCheckRequires,
             &*arena_vec![self; lowered_req],
         );
         self.stmt_expr(req.span, precond)
@@ -153,7 +166,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let lowered_ens = self.lower_expr_mut(&ens);
         self.expr_call_lang_item_fn(
             ens_span,
-            rustc_hir::LangItem::ContractBuildCheckEnsures,
+            LangItem::ContractBuildCheckEnsures,
             &*arena_vec![self; lowered_ens],
         )
     }
@@ -196,7 +209,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         let postcond_checker = self.arena.alloc(self.expr_enum_variant_lang_item(
             postcond_checker.span,
-            rustc_hir::lang_items::LangItem::OptionSome,
+            rustc_hir::attrs::lang_items::LangItem::OptionSome,
             &*arena_vec![self; *postcond_checker],
         ));
         let then_block_stmts = self.block_all(span, stmts, Some(postcond_checker));
@@ -204,7 +217,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         let none_expr = self.arena.alloc(self.expr_enum_variant_lang_item(
             postcond_checker.span,
-            rustc_hir::lang_items::LangItem::OptionNone,
+            rustc_hir::attrs::lang_items::LangItem::OptionNone,
             Default::default(),
         ));
         let else_block = self.block_expr(none_expr);
@@ -314,7 +327,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let cond_fn = self.expr_ident(span, cond_ident, cond_hir_id);
         let contract_check = self.expr_call_lang_item_fn_mut(
             span,
-            rustc_hir::LangItem::ContractCheckEnsures,
+            LangItem::ContractCheckEnsures,
             arena_vec![self; *cond_fn, *ret],
         );
         let contract_check = self.arena.alloc(contract_check);

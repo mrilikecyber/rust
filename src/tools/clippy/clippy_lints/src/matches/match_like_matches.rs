@@ -1,15 +1,16 @@
 //! Lint a `match` or `if let .. { .. } else { .. }` expr that could be replaced by `matches!`
 
 use super::REDUNDANT_PATTERN_MATCHING;
-use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::higher::has_let_expr;
+use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::{is_lint_allowed, is_wild, span_contains_comment};
 use rustc_ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{Arm, BorrowKind, Expr, ExprKind, Pat, PatKind, QPath};
-use rustc_lint::{LateContext, LintContext};
+use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 use super::MATCH_LIKE_MATCHES_MACRO;
 
@@ -21,7 +22,7 @@ pub(crate) fn check_if_let<'tcx>(
     then_expr: &'tcx Expr<'_>,
     else_expr: &'tcx Expr<'_>,
 ) {
-    if !span_contains_comment(cx.sess().source_map(), expr.span)
+    if !span_contains_comment(cx, expr.span)
         && cx.typeck_results().expr_ty(expr).is_bool()
         && let Some(b0) = find_bool_lit(then_expr)
         && let Some(b1) = find_bool_lit(else_expr)
@@ -43,18 +44,21 @@ pub(crate) fn check_if_let<'tcx>(
         {
             ex_new = ex_inner;
         }
-        span_lint_and_sugg(
+
+        let (snippet, _) = snippet_with_context(cx, ex_new.span, expr.span.ctxt(), "..", &mut applicability);
+        span_lint_and_then(
             cx,
             MATCH_LIKE_MATCHES_MACRO,
             expr.span,
-            "if let .. else expression looks like `matches!` macro",
-            "try",
-            format!(
-                "{}matches!({}, {pat})",
-                if b0 { "" } else { "!" },
-                snippet_with_applicability(cx, ex_new.span, "..", &mut applicability),
-            ),
-            applicability,
+            "`if let .. else` expression looks like `matches!` macro",
+            |diag| {
+                diag.span_suggestion_verbose(
+                    expr.span,
+                    "use `matches!` directly",
+                    format!("{}matches!({snippet}, {pat})", if b0 { "" } else { "!" }),
+                    applicability,
+                );
+            },
         );
     }
 }
@@ -67,7 +71,7 @@ pub(super) fn check_match<'tcx>(
 ) -> bool {
     if let Some((last_arm, arms_without_last)) = arms.split_last()
         && let Some((first_arm, middle_arms)) = arms_without_last.split_first()
-        && !span_contains_comment(cx.sess().source_map(), e.span)
+        && !span_contains_comment(cx, e.span)
         && cx.typeck_results().expr_ty(e).is_bool()
         && let Some(b0) = find_bool_lit(first_arm.body)
         && let Some(b1) = find_bool_lit(last_arm.body)
@@ -87,7 +91,10 @@ pub(super) fn check_match<'tcx>(
             // ```rs
             // matches!(e, Either::Left $(if $guard)|+)
             // ```
-            middle_arms.is_empty()
+            //
+            // But if the guard _is_ present, it may not be an `if-let` guard, as `matches!` doesn't
+            // support these (currently?)
+            (middle_arms.is_empty() && first_arm.guard.is_none_or(|g| !has_let_expr(g)))
 
             // - (added in #6216) There are middle arms
             //
@@ -169,18 +176,21 @@ pub(super) fn check_match<'tcx>(
         {
             ex_new = ex_inner;
         }
-        span_lint_and_sugg(
+
+        let (snippet, _) = snippet_with_context(cx, ex_new.span, e.span.ctxt(), "..", &mut applicability);
+        span_lint_and_then(
             cx,
             MATCH_LIKE_MATCHES_MACRO,
             e.span,
             "match expression looks like `matches!` macro",
-            "try",
-            format!(
-                "{}matches!({}, {pat_and_guard})",
-                if b0 { "" } else { "!" },
-                snippet_with_applicability(cx, ex_new.span, "..", &mut applicability),
-            ),
-            applicability,
+            |diag| {
+                diag.span_suggestion_verbose(
+                    e.span,
+                    "use `matches!` directly",
+                    format!("{}matches!({snippet}, {pat_and_guard})", if b0 { "" } else { "!" }),
+                    applicability,
+                );
+            },
         );
         true
     } else {

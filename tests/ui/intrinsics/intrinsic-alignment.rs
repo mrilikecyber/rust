@@ -1,6 +1,6 @@
 //@ run-pass
 
-#![feature(core_intrinsics, rustc_attrs)]
+#![feature(rustc_attrs)]
 
 #[cfg(any(
     target_os = "aix",
@@ -16,6 +16,7 @@
     target_os = "solaris",
     target_os = "vxworks",
     target_os = "nto",
+    target_os = "qnx",
     target_vendor = "apple",
 ))]
 mod m {

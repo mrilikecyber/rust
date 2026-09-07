@@ -12,14 +12,14 @@ use crate::{
     context::{PathCompletionCtx, PathExprCtx, Qualified},
 };
 
-struct PathCallback<'a, F> {
-    ctx: &'a CompletionContext<'a>,
+struct PathCallback<'a, 'db, F> {
+    ctx: &'a CompletionContext<'a, 'db>,
     acc: &'a mut Completions,
     add_assoc_item: F,
     seen: FxHashSet<hir::AssocItem>,
 }
 
-impl<F> PathCandidateCallback for PathCallback<'_, F>
+impl<F> PathCandidateCallback for PathCallback<'_, '_, F>
 where
     F: FnMut(&mut Completions, hir::AssocItem),
 {
@@ -44,9 +44,9 @@ where
     }
 }
 
-pub(crate) fn complete_expr_path(
+pub(crate) fn complete_expr_path<'db>(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, 'db>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     expr_ctx: &PathExprCtx<'_>,
 ) {
@@ -87,7 +87,7 @@ pub(crate) fn complete_expr_path(
         false
     };
 
-    let scope_def_applicable = |def| match def {
+    let scope_def_applicable = |def: ScopeDef<'db>| match def {
         ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) => false,
         ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
         _ => true,
@@ -126,13 +126,12 @@ pub(crate) fn complete_expr_path(
                 ctx.db,
                 &ctx.scope,
                 &ctx.traits_in_scope(),
-                Some(ctx.module),
                 None,
                 PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
             );
 
             // Iterate assoc types separately
-            ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+            ty.iterate_assoc_items(ctx.db, |item| {
                 if let hir::AssocItem::TypeAlias(ty) = item {
                     acc.add_type_alias(ctx, ty)
                 }
@@ -183,6 +182,9 @@ pub(crate) fn complete_expr_path(
                         }
                         _ => return,
                     };
+                    // Note: this is not *required* here, we do it to also find methods that require
+                    // the type to be instantiated with specific types.
+                    let ty = ty.instantiate_with_errors();
 
                     if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
                         cov_mark::hit!(completes_variant_through_alias);
@@ -196,13 +198,12 @@ pub(crate) fn complete_expr_path(
                         ctx.db,
                         &ctx.scope,
                         &ctx.traits_in_scope(),
-                        Some(ctx.module),
                         None,
                         PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
                     );
 
                     // Iterate assoc types separately
-                    ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+                    ty.iterate_assoc_items(ctx.db, |item| {
                         if let hir::AssocItem::TypeAlias(ty) = item {
                             acc.add_type_alias(ctx, ty)
                         }
@@ -232,7 +233,6 @@ pub(crate) fn complete_expr_path(
                         ctx.db,
                         &ctx.scope,
                         &ctx.traits_in_scope(),
-                        Some(ctx.module),
                         None,
                         PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
                     );
@@ -343,7 +343,7 @@ pub(crate) fn complete_expr_path(
                             let missing_fields =
                                 ctx.sema.record_literal_missing_fields(record_expr);
                             if !missing_fields.is_empty() {
-                                add_default_update(acc, ctx, ty);
+                                add_default_update(acc, ctx, ty.as_ref());
                             }
                         }
                     };
@@ -355,7 +355,10 @@ pub(crate) fn complete_expr_path(
 
                     if !in_block_expr {
                         add_keyword("unsafe", "unsafe {\n    $0\n}");
-                        add_keyword("const", "const {\n    $0\n}");
+                        if !wants_const_token {
+                            // Avoid having two `const` items in `&raw $0`
+                            add_keyword("const", "const {\n    $0\n}");
+                        }
                     }
                     add_keyword("match", "match $1 {\n    $0\n}");
                     add_keyword("while", "while $1 {\n    $0\n}");
@@ -451,7 +454,11 @@ pub(crate) fn complete_expr_path(
     }
 }
 
-pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+pub(crate) fn complete_expr(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_, '_>,
+    PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
+) {
     let _p = tracing::info_span!("complete_expr").entered();
 
     if !ctx.config.enable_term_search {
@@ -459,6 +466,10 @@ pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) 
     }
 
     if !ctx.qualifier_ctx.none() {
+        return;
+    }
+
+    if !matches!(qualified, Qualified::No) {
         return;
     }
 
@@ -473,7 +484,6 @@ pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) 
             scope: &ctx.scope,
             goal: ty.clone(),
             config: hir::term_search::TermSearchConfig {
-                enable_borrowcheck: false,
                 many_alternatives_threshold: 1,
                 fuel: 200,
             },

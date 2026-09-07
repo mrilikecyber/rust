@@ -117,6 +117,7 @@ function getOrCreateSection(id, classes) {
         el = document.createElement("section");
         el.id = id;
         el.className = classes;
+        // MAIN_ID exists, and is not the root
         // @ts-expect-error
         insertAfter(el, document.getElementById(MAIN_ID));
     }
@@ -154,8 +155,7 @@ function switchDisplayedElement(elemToDisplay) {
     const el = getAlternativeDisplayElem();
 
     if (el.children.length > 0) {
-        // @ts-expect-error
-        getNotDisplayedElem().appendChild(el.firstElementChild);
+        getNotDisplayedElem().appendChild(nonnull(el.firstElementChild));
     }
     if (elemToDisplay === null) {
         addClass(el, "hidden");
@@ -202,7 +202,7 @@ function preLoadCss(cssUrl) {
     /**
      * Run a JavaScript file asynchronously.
      * @param {string} url
-     * @param {function(): any} errorCallback
+     * @param {function(): any} [errorCallback]
      */
     function loadScript(url, errorCallback) {
         const script = document.createElement("script");
@@ -224,14 +224,12 @@ function preLoadCss(cssUrl) {
             event.preventDefault();
             // Sending request for the CSS and the JS files at the same time so it will
             // hopefully be loaded when the JS will generate the settings content.
-            // @ts-expect-error
             loadScript(getVar("static-root-path") + getVar("settings-js"));
             // Pre-load all theme CSS files, so that switching feels seamless.
             //
             // When loading settings.html as a standalone page, the equivalent HTML is
             // generated in context.rs.
             setTimeout(() => {
-                // @ts-expect-error
                 const themes = getVar("themes").split(",");
                 for (const theme of themes) {
                     // if there are no themes, do nothing
@@ -247,6 +245,32 @@ function preLoadCss(cssUrl) {
     window.searchState = {
         rustdocToolbar: document.querySelector("rustdoc-toolbar"),
         loadingText: "Loading search results...",
+        searchLoaded: false,
+        loadSearch() {
+            // If you're browsing the nightly docs, the page might need to be refreshed for
+            // the search to work because the hash of the JS scripts might have changed.
+            function sendSearchForm() {
+                // @ts-expect-error
+                document.getElementsByClassName("search-form")[0].submit();
+            }
+            if (!window.searchState.searchLoaded) {
+                window.searchState.searchLoaded = true;
+                window.rr_ = data => {
+                    window.searchIndex = data;
+                };
+                if (!window.StringdexOnload) {
+                    window.StringdexOnload = [];
+                }
+                window.StringdexOnload.push(() => {
+                    loadScript(
+                        getVar("static-root-path") + getVar("search-js"),
+                        sendSearchForm,
+                    );
+                });
+                loadScript(getVar("static-root-path") + getVar("stringdex-js"), sendSearchForm);
+                loadScript(resourcePath("search.index/root", ".js"), sendSearchForm);
+            }
+        },
         inputElement: () => {
             let el = document.getElementsByClassName("search-input")[0];
             if (!el) {
@@ -271,6 +295,10 @@ function preLoadCss(cssUrl) {
                 </nav><div class="search-switcher"></div>`;
                 out.insertBefore(hdr, window.searchState.outputElement());
                 el = document.getElementsByClassName("search-input")[0];
+
+                el.addEventListener("focus", () => {
+                    window.searchState.loadSearch();
+                });
             }
             if (el instanceof HTMLInputElement) {
                 return el;
@@ -393,43 +421,6 @@ function preLoadCss(cssUrl) {
             return params;
         },
         setup: () => {
-            let searchLoaded = false;
-            const search_input = window.searchState.inputElement();
-            if (!search_input) {
-                return;
-            }
-            // If you're browsing the nightly docs, the page might need to be refreshed for the
-            // search to work because the hash of the JS scripts might have changed.
-            function sendSearchForm() {
-                // @ts-expect-error
-                document.getElementsByClassName("search-form")[0].submit();
-            }
-            function loadSearch() {
-                if (!searchLoaded) {
-                    searchLoaded = true;
-                    window.rr_ = data => {
-                        window.searchIndex = data;
-                    };
-                    if (!window.StringdexOnload) {
-                        window.StringdexOnload = [];
-                    }
-                    window.StringdexOnload.push(() => {
-                        loadScript(
-                            // @ts-expect-error
-                            getVar("static-root-path") + getVar("search-js"),
-                            sendSearchForm,
-                        );
-                    });
-                    // @ts-expect-error
-                    loadScript(getVar("static-root-path") + getVar("stringdex-js"), sendSearchForm);
-                    loadScript(resourcePath("search.index/root", ".js"), sendSearchForm);
-                }
-            }
-
-            search_input.addEventListener("focus", () => {
-                loadSearch();
-            });
-
             const btn = document.getElementById("search-button");
             if (btn) {
                 btn.onclick = event => {
@@ -438,7 +429,7 @@ function preLoadCss(cssUrl) {
                     }
                     event.preventDefault();
                     window.searchState.toggle();
-                    loadSearch();
+                    window.searchState.loadSearch();
                 };
             }
 
@@ -459,7 +450,7 @@ function preLoadCss(cssUrl) {
                     // previous state with nothing in the bar.
                     const inputElement = window.searchState.inputElement();
                     if (params.search !== undefined && inputElement !== null) {
-                        loadSearch();
+                        window.searchState.loadSearch();
                         inputElement.value = params.search;
                         // Some browsers fire "onpopstate" for every page load
                         // (Chrome), while others fire the event only when actually
@@ -486,29 +477,32 @@ function preLoadCss(cssUrl) {
             // that try to sync state between the URL and the search input. To work around it,
             // do a small amount of re-init on page show.
             window.onpageshow = () => {
-                const inputElement = window.searchState.inputElement();
                 const qSearch = window.searchState.getQueryStringParams().search;
-                if (qSearch !== undefined && inputElement !== null) {
-                    if (inputElement.value === "") {
-                        inputElement.value = qSearch;
+                if (qSearch !== undefined) {
+                    const inputElement = window.searchState.inputElement();
+                    if (inputElement !== null) {
+                        if (inputElement.value === "") {
+                            inputElement.value = qSearch;
+                        }
+                        window.searchState.showResults();
+                        if (qSearch === "") {
+                            window.searchState.loadSearch();
+                            window.searchState.focus();
+                        }
                     }
-                    window.searchState.showResults();
-                    if (qSearch === "") {
-                        loadSearch();
-                        window.searchState.focus();
-                    }
-                } else {
-                    window.searchState.hideResults();
                 }
             };
 
             const params = window.searchState.getQueryStringParams();
             if (params.search !== undefined) {
                 window.searchState.setLoadingSearch();
-                loadSearch();
+                window.searchState.loadSearch();
             }
         },
         setLoadingSearch: () => {
+            // We set up the search input before adding the other search elements (like
+            // "search loading") in case it's not already there yet.
+            window.searchState.inputElement();
             const search = window.searchState.outputElement();
             nonnull(search).innerHTML = "<h3 class=\"search-loading\">" +
                 window.searchState.loadingText + "</h3>";
@@ -622,8 +616,7 @@ function preLoadCss(cssUrl) {
      */
     function openParentDetails(elem) {
         while (elem) {
-            if (elem.tagName === "DETAILS") {
-                // @ts-expect-error
+            if (elem instanceof HTMLDetailsElement) {
                 elem.open = true;
             }
             elem = elem.parentElement;
@@ -659,10 +652,8 @@ function preLoadCss(cssUrl) {
         }
 
         if (document.activeElement &&
-            document.activeElement.tagName === "INPUT" &&
-            // @ts-expect-error
+            document.activeElement instanceof HTMLInputElement &&
             document.activeElement.type !== "checkbox" &&
-            // @ts-expect-error
             document.activeElement.type !== "radio") {
             switch (getVirtualKey(ev)) {
             case "Escape":
@@ -737,12 +728,15 @@ function preLoadCss(cssUrl) {
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
-            for (const name of filtered) {
+            for (const item of filtered) {
+                const [name, isMacro] = Array.isArray(item) ? [item[0], true] : [item, false];
                 let path;
                 if (shortty === "mod") {
                     path = `${modpath}${name}/index.html`;
-                } else {
+                } else if (!isMacro) {
                     path = `${modpath}${shortty}.${name}.html`;
+                } else {
+                    path = `${modpath}macro.${name}.html`;
                 }
                 let current_page = document.location.href.toString();
                 if (current_page.endsWith("/")) {
@@ -791,7 +785,7 @@ function preLoadCss(cssUrl) {
             //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
-            block("attribute", "attributes", "Attributes");
+            block("attribute", "attribute-docs", "Attributes");
             block("attr", "attributes", "Attribute Macros");
             block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
@@ -800,36 +794,47 @@ function preLoadCss(cssUrl) {
 
     // <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+trait.impl&type=code>
     window.register_implementors = imp => {
-        const implementors = document.getElementById("implementors-list");
-        const synthetic_implementors = document.getElementById("synthetic-implementors-list");
+        /** Takes an ID as input and returns a list of two elements. The first element is the DOM
+         * element with the given ID and the second is the "negative marker", meaning the location
+         * between the negative and non-negative impls.
+         *
+         * @param {string} id: ID of the DOM element.
+         *
+         * @return {[HTMLElement|null, HTMLElement|null]}
+         */
+        function implementorsElems(id) {
+            const elem = document.getElementById(id);
+            return [elem, elem ? elem.querySelector(".negative-marker") : null];
+        }
+        const implementors = implementorsElems("implementors-list");
+        const syntheticImplementors = implementorsElems("synthetic-implementors-list");
+        /** @type {Set<string>} */
         const inlined_types = new Set();
 
         const TEXT_IDX = 0;
-        const SYNTHETIC_IDX = 1;
-        const TYPES_IDX = 2;
+        const IS_NEG_IDX = 1;
+        const SYNTHETIC_IDX = 2;
+        const TYPES_IDX = 3;
 
-        if (synthetic_implementors) {
+        if (syntheticImplementors[0]) {
             // This `inlined_types` variable is used to avoid having the same implementation
             // showing up twice. For example "String" in the "Sync" doc page.
             //
             // By the way, this is only used by and useful for traits implemented automatically
             // (like "Send" and "Sync").
-            onEachLazy(synthetic_implementors.getElementsByClassName("impl"), el => {
+            onEachLazy(syntheticImplementors[0].getElementsByClassName("impl"), el => {
                 const aliases = el.getAttribute("data-aliases");
                 if (!aliases) {
                     return;
                 }
-                // @ts-expect-error
-                aliases.split(",").forEach(alias => {
+                aliases.split(",").forEach(/** @param {string} alias */ alias => {
                     inlined_types.add(alias);
                 });
             });
         }
 
-        // @ts-expect-error
-        let currentNbImpls = implementors.getElementsByClassName("impl").length;
-        // @ts-expect-error
-        const traitName = document.querySelector(".main-heading h1 > .trait").textContent;
+        let currentNbImpls = nonnull(implementors[0]).getElementsByClassName("impl").length;
+        const traitName = nonnull(document.querySelector(".main-heading h1 > .trait")).textContent;
         const baseIdName = "impl-" + traitName + "-";
         const libs = Object.getOwnPropertyNames(imp);
         // We don't want to include impls from this JS file, when the HTML already has them.
@@ -849,7 +854,8 @@ function preLoadCss(cssUrl) {
 
             struct_loop:
             for (const struct of structs) {
-                const list = struct[SYNTHETIC_IDX] ? synthetic_implementors : implementors;
+                const [impList, negImpMarker] =
+                    struct[SYNTHETIC_IDX] ? syntheticImplementors : implementors;
 
                 // The types list is only used for synthetic impls.
                 // If this changes, `main.js` and `write_shared.rs` both need changed.
@@ -884,10 +890,22 @@ function preLoadCss(cssUrl) {
                 addClass(display, "impl");
                 display.appendChild(anchor);
                 display.appendChild(code);
-                // @ts-expect-error
-                list.appendChild(display);
+
+                // If this is a negative implementor, we put it into the right location (just
+                // before the negative impl marker).
+                if (struct[IS_NEG_IDX]) {
+                    nonnull(negImpMarker).before(display);
+                } else {
+                    nonnull(impList).appendChild(display);
+                }
                 currentNbImpls += 1;
             }
+        }
+        if (implementors[0]) {
+            implementors[0].classList.add("loaded");
+        }
+        if (syntheticImplementors[0]) {
+            syntheticImplementors[0].classList.add("loaded");
         }
     };
     if (window.pending_implementors) {
@@ -942,20 +960,19 @@ function preLoadCss(cssUrl) {
         const selfPath = script ? script.getAttribute("data-self-path") : null;
 
         // These sidebar blocks need filled in, too.
-        const mainContent = document.querySelector("#main-content");
-        const sidebarSection = document.querySelector(".sidebar section");
+        const mainContent = nonnull(document.querySelector("#main-content"));
+        const sidebarSection = nonnull(document.querySelector(".sidebar section"));
         let methods = document.querySelector(".sidebar .block.method");
         let associatedTypes = document.querySelector(".sidebar .block.associatedtype");
         let associatedConstants = document.querySelector(".sidebar .block.associatedconstant");
         let sidebarTraitList = document.querySelector(".sidebar .block.trait-implementation");
 
-        // @ts-expect-error
-        for (const impList of imp[window.currentCrate]) {
+        for (const impList of imp[nonnull(window.currentCrate)]) {
             const types = impList.slice(2);
             const text = impList[0];
-            const isTrait = impList[1] !== 0;
             const traitName = impList[1];
-            if (types.indexOf(selfPath) === -1) {
+            const isTrait = typeof traitName === "string";
+            if (selfPath === null || types.indexOf(selfPath) === -1) {
                 continue;
             }
             let outputList = isTrait ? trait_implementations : implementations;
@@ -978,28 +995,19 @@ function preLoadCss(cssUrl) {
                     h.appendChild(link);
                     trait_implementations = outputList;
                     trait_implementations_header = outputListHeader;
-                    // @ts-expect-error
                     sidebarSection.appendChild(h);
                     sidebarTraitList = document.createElement("ul");
                     sidebarTraitList.className = "block trait-implementation";
-                    // @ts-expect-error
                     sidebarSection.appendChild(sidebarTraitList);
-                    // @ts-expect-error
                     mainContent.appendChild(outputListHeader);
-                    // @ts-expect-error
                     mainContent.appendChild(outputList);
                 } else {
                     implementations = outputList;
                     if (trait_implementations) {
-                        // @ts-expect-error
                         mainContent.insertBefore(outputListHeader, trait_implementations_header);
-                        // @ts-expect-error
                         mainContent.insertBefore(outputList, trait_implementations_header);
                     } else {
-                        const mainContent = document.querySelector("#main-content");
-                        // @ts-expect-error
                         mainContent.appendChild(outputListHeader);
-                        // @ts-expect-error
                         mainContent.appendChild(outputList);
                     }
                 }
@@ -1044,8 +1052,7 @@ function preLoadCss(cssUrl) {
             if (isTrait) {
                 const li = document.createElement("li");
                 const a = document.createElement("a");
-                // @ts-expect-error
-                a.href = `#${template.content.querySelector(".impl").id}`;
+                a.href = `#${nonnull(template.content.querySelector(".impl")).id}`;
                 a.textContent = traitName;
                 li.appendChild(a);
                 // @ts-expect-error
@@ -1072,14 +1079,10 @@ function preLoadCss(cssUrl) {
                         const insertionReference = methods || sidebarTraitList;
                         if (insertionReference) {
                             const insertionReferenceH = insertionReference.previousElementSibling;
-                            // @ts-expect-error
                             sidebarSection.insertBefore(blockHeader, insertionReferenceH);
-                            // @ts-expect-error
                             sidebarSection.insertBefore(block, insertionReferenceH);
                         } else {
-                            // @ts-expect-error
                             sidebarSection.appendChild(blockHeader);
-                            // @ts-expect-error
                             sidebarSection.appendChild(block);
                         }
                         if (hasClass(item, "associatedtype")) {
@@ -1642,7 +1645,7 @@ function preLoadCss(cssUrl) {
              restrict the search to a given item kind.",
             "Accepted kinds are: <code>fn</code>, <code>mod</code>, <code>struct</code>, \
              <code>enum</code>, <code>trait</code>, <code>type</code>, <code>macro</code>, \
-             and <code>const</code>.",
+             and <code>constant</code>.",
             "Search functions by type signature (e.g., <code>vec -&gt; usize</code> or \
              <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
@@ -1665,7 +1668,7 @@ function preLoadCss(cssUrl) {
 
         const container = document.createElement("div");
         if (!isHelpPage) {
-            container.className = "popover content";
+            container.className = "popover";
         }
         container.id = "help";
 
@@ -1674,9 +1677,14 @@ function preLoadCss(cssUrl) {
         side_by_side.appendChild(div_shortcuts);
         side_by_side.appendChild(div_infos);
 
-        container.appendChild(book_info);
-        container.appendChild(side_by_side);
-        container.appendChild(rustdoc_version);
+        const content = document.createElement("div");
+        content.className = "content";
+
+        content.appendChild(book_info);
+        content.appendChild(side_by_side);
+        content.appendChild(rustdoc_version);
+
+        container.appendChild(content);
 
         if (isHelpPage) {
             const help_section = document.createElement("section");
@@ -2111,20 +2119,27 @@ function preLoadCss(cssUrl) {
         return;
     }
     but.onclick = () => {
-        // Most page titles are '<Item> in <path::to::module> - Rust', except
-        // modules (which don't have the first part) and keywords/primitives
-        // (which don't have a module path)
-        const titleElement = document.querySelector("title");
-        const title = titleElement && titleElement.textContent ?
-                      titleElement.textContent.replace(" - Rust", "") : "";
-        const [item, module] = title.split(" in ");
-        const path = [item];
-        if (module !== undefined) {
-            path.unshift(module);
-        }
+        // We get the path from the "breadcrumbs" and the actual item name.
+        let path = "";
+        // @ts-expect-error
+        const heading = document.getElementById(MAIN_ID).querySelector(".main-heading");
 
-        copyContentToClipboard(path.join("::"));
-        copyButtonAnimation(but);
+        if (heading) {
+            const breadcrumbs = heading.querySelector(".rustdoc-breadcrumbs");
+            if (breadcrumbs) {
+                // @ts-expect-error
+                path = breadcrumbs.innerText;
+                if (path.length > 0) {
+                    path += "::";
+                }
+            }
+
+            // @ts-expect-error
+            path += heading.querySelector("h1 > span").innerText;
+
+            copyContentToClipboard(path);
+            copyButtonAnimation(but);
+        }
     };
 
     /**
@@ -2136,7 +2151,15 @@ function preLoadCss(cssUrl) {
             // Should never happen, but the world is a dark and dangerous place.
             return;
         }
-        copyContentToClipboard(codeElem.textContent);
+        let content = "";
+        for (const node of codeElem.childNodes) {
+            // We exclude line numbers.
+            if (node instanceof HTMLElement && node.hasAttribute("data-nosnippet")) {
+                continue;
+            }
+            content += node.textContent;
+        }
+        copyContentToClipboard(content);
     }
 
     /**
@@ -2225,44 +2248,5 @@ function preLoadCss(cssUrl) {
     onEachLazy(document.querySelectorAll(".docblock .example-wrap"), elem => {
         elem.addEventListener("mouseover", addCopyButton);
         elem.addEventListener("click", showHideCodeExampleButtons);
-    });
-}());
-
-
-// Workaround for browser-specific bugs when copying code snippets.
-//
-// * In Firefox, copying text that includes elements with `user-select: none`
-//   inserts extra blank lines.
-//   - Firefox issue: https://bugzilla.mozilla.org/show_bug.cgi?id=1273836
-//   - Rust issue: https://github.com/rust-lang/rust/issues/141464
-//
-// * In Chromium-based browsers, `document.getSelection()` includes elements
-//   with `user-select: none`, causing unwanted line numbers to be copied.
-//   - Chromium issue: https://issues.chromium.org/issues/446539520
-//   - Rust issue: https://github.com/rust-lang/rust/issues/146816
-(function() {
-    document.body.addEventListener("copy", event => {
-        let target = nonnull(event.target);
-        let isInsideCode = false;
-        while (target && target !== document.body) {
-            // @ts-expect-error
-            if (target.tagName === "CODE") {
-                isInsideCode = true;
-                break;
-            }
-            // @ts-expect-error
-            target = target.parentElement;
-        }
-        if (!isInsideCode) {
-            return;
-        }
-        const selection = nonnull(document.getSelection());
-        const text = Array.from({ length: selection.rangeCount }, (_, i) => {
-            const fragment = selection.getRangeAt(i).cloneContents();
-            fragment.querySelectorAll("[data-nosnippet]").forEach(el => el.remove());
-            return fragment.textContent;
-        }).join("");
-        nonnull(event.clipboardData).setData("text/plain", text);
-        event.preventDefault();
     });
 }());

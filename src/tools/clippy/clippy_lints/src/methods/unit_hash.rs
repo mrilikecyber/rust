@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::source::snippet;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
@@ -19,7 +19,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, recv: &'
                 diag.span_suggestion(
                     expr.span,
                     "remove the call to `hash` or consider using",
-                    format!("0_u8.hash({})", snippet(cx, arg.span, ".."),),
+                    format!("0_u8.hash({})", snippet(cx, arg.span, "..")),
                     Applicability::MaybeIncorrect,
                 );
                 diag.note("the implementation of `Hash` for `()` is a no-op");

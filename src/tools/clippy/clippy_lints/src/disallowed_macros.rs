@@ -10,9 +10,8 @@ use rustc_hir::{
     AmbigArg, Expr, ExprKind, ForeignItem, HirId, ImplItem, ImplItemImplKind, Item, ItemKind, OwnerId, Pat, Path, Stmt,
     TraitItem, Ty,
 };
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
 use rustc_span::{ExpnId, MacroKind, Span};
 
 use crate::utils::attr_collector::AttrStorage;
@@ -62,6 +61,8 @@ declare_clippy_lint! {
     style,
     "use of a disallowed macro"
 }
+
+impl_lint_pass!(DisallowedMacros => [DISALLOWED_MACROS]);
 
 pub struct DisallowedMacros {
     disallowed: DefIdMap<(&'static str, &'static DisallowedPath)>,
@@ -124,8 +125,6 @@ impl DisallowedMacros {
         }
     }
 }
-
-impl_lint_pass!(DisallowedMacros => [DISALLOWED_MACROS]);
 
 impl LateLintPass<'_> for DisallowedMacros {
     fn check_crate(&mut self, cx: &LateContext<'_>) {

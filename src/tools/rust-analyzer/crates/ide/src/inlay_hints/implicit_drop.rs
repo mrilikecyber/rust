@@ -7,8 +7,9 @@
 //! ```
 use hir::{
     DefWithBody,
-    db::{DefDatabase as _, HirDatabase as _},
+    db::HirDatabase as _,
     mir::{MirSpan, TerminatorKind},
+    name,
 };
 use ide_db::{FileRange, famous_defs::FamousDefs};
 
@@ -34,7 +35,8 @@ pub(super) fn hints(
     let def = sema.to_def(node)?;
     let def: DefWithBody = def.into();
 
-    let (hir, source_map) = sema.db.body_with_source_map(def.into());
+    let def = def.try_into().ok()?;
+    let (hir, source_map) = hir::Body::with_source_map(sema.db, def);
 
     let mir = sema.db.mir_body(def.into()).ok()?;
 
@@ -42,11 +44,11 @@ pub(super) fn hints(
 
     for (_, bb) in mir.basic_blocks.iter() {
         let terminator = bb.terminator.as_ref()?;
-        if let TerminatorKind::Drop { place, .. } = terminator.kind {
+        if let TerminatorKind::Drop { place, .. } = &terminator.kind {
             if !place.projection.is_empty() {
                 continue; // Ignore complex cases for now
             }
-            if mir.locals[place.local].ty.as_adt().is_none() {
+            if mir.locals[place.local].ty.as_ref().as_adt().is_none() {
                 continue; // Arguably only ADTs have significant drop impls
             }
             let Some(&binding_idx) = local_to_binding.get(place.local) else {
@@ -94,7 +96,7 @@ pub(super) fn hints(
             };
             let binding = &hir[binding_idx];
             let name = binding.name.display_no_db(display_target.edition).to_smolstr();
-            if name.starts_with("<ra@") {
+            if name::is_generated(&name) {
                 continue; // Ignore desugared variables
             }
             let mut label = InlayHintLabel::simple(

@@ -1,98 +1,36 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
 
-use std::cell::LazyCell;
+use std::iter::Enumerate;
 
-use base_db::{
-    Crate,
-    target::{self, TargetData},
-};
+use base_db::target::{self, TargetData};
 use hir_def::{
-    EnumId, EnumVariantId, FunctionId, Lookup, TraitId,
-    db::DefDatabase,
-    hir::generics::WherePredicate,
-    lang_item::LangItem,
-    resolver::{HasResolver, TypeNs},
-    type_ref::{TraitBoundModifier, TypeRef},
+    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, lang_item::LangItems,
+    signatures::FunctionSignature,
 };
-use intern::sym;
 use rustc_abi::TargetDataLayout;
-use smallvec::{SmallVec, smallvec};
 use span::Edition;
 
 use crate::{
     TargetFeatures,
     db::HirDatabase,
     layout::{Layout, TagEncoding},
-    mir::pad16,
+    lower::SupertraitsInfo,
+    mir::{IsSigned, pad16},
 };
 
-pub(crate) fn fn_traits(db: &dyn DefDatabase, krate: Crate) -> impl Iterator<Item = TraitId> + '_ {
-    [LangItem::Fn, LangItem::FnMut, LangItem::FnOnce]
-        .into_iter()
-        .filter_map(move |lang| lang.resolve_trait(db, krate))
+pub(crate) fn fn_traits(lang_items: &LangItems) -> impl Iterator<Item = TraitId> + '_ {
+    [lang_items.Fn, lang_items.FnMut, lang_items.FnOnce].into_iter().flatten()
 }
 
 /// Returns an iterator over the direct super traits (including the trait itself).
-pub fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
-    let mut result = smallvec![trait_];
-    direct_super_traits_cb(db, trait_, |tt| {
-        if !result.contains(&tt) {
-            result.push(tt);
-        }
-    });
-    result
+pub fn direct_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+    &SupertraitsInfo::query(db, trait_).direct_supertraits
 }
 
-/// Returns an iterator over the whole super trait hierarchy (including the
-/// trait itself).
-pub fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
-    // we need to take care a bit here to avoid infinite loops in case of cycles
-    // (i.e. if we have `trait A: B; trait B: A;`)
-
-    let mut result = smallvec![trait_];
-    let mut i = 0;
-    while let Some(&t) = result.get(i) {
-        // yeah this is quadratic, but trait hierarchies should be flat
-        // enough that this doesn't matter
-        direct_super_traits_cb(db, t, |tt| {
-            if !result.contains(&tt) {
-                result.push(tt);
-            }
-        });
-        i += 1;
-    }
-    result
-}
-
-fn direct_super_traits_cb(db: &dyn DefDatabase, trait_: TraitId, cb: impl FnMut(TraitId)) {
-    let resolver = LazyCell::new(|| trait_.resolver(db));
-    let (generic_params, store) = db.generic_params_and_store(trait_.into());
-    let trait_self = generic_params.trait_self_param();
-    generic_params
-        .where_predicates()
-        .iter()
-        .filter_map(|pred| match pred {
-            WherePredicate::ForLifetime { target, bound, .. }
-            | WherePredicate::TypeBound { target, bound } => {
-                let is_trait = match &store[*target] {
-                    TypeRef::Path(p) => p.is_self_type(),
-                    TypeRef::TypeParam(p) => Some(p.local_id()) == trait_self,
-                    _ => false,
-                };
-                match is_trait {
-                    true => bound.as_path(&store),
-                    false => None,
-                }
-            }
-            WherePredicate::Lifetime { .. } => None,
-        })
-        .filter(|(_, bound_modifier)| matches!(bound_modifier, TraitBoundModifier::None))
-        .filter_map(|(path, _)| match resolver.resolve_path_in_type_ns_fully(db, path) {
-            Some(TypeNs::TraitId(t)) => Some(t),
-            _ => None,
-        })
-        .for_each(cb);
+/// Returns the whole super trait hierarchy (including the trait itself).
+pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+    &SupertraitsInfo::query(db, trait_).all_supertraits
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,19 +57,18 @@ pub fn target_feature_is_safe_in_target(target: &TargetData) -> TargetFeatureIsS
 pub fn is_fn_unsafe_to_call(
     db: &dyn HirDatabase,
     func: FunctionId,
-    caller_target_features: &TargetFeatures,
+    caller_target_features: &TargetFeatures<'_>,
     call_edition: Edition,
     target_feature_is_safe: TargetFeatureIsSafeInTarget,
 ) -> Unsafety {
-    let data = db.function_signature(func);
+    let data = FunctionSignature::of(db, func);
     if data.is_unsafe() {
         return Unsafety::Unsafe;
     }
 
     if data.has_target_feature() && target_feature_is_safe == TargetFeatureIsSafeInTarget::No {
         // RFC 2396 <https://rust-lang.github.io/rfcs/2396-target-feature-1.1.html>.
-        let callee_target_features =
-            TargetFeatures::from_attrs_no_implications(&db.attrs(func.into()));
+        let callee_target_features = TargetFeatures::from_fn_no_implications(db, func);
         if !caller_target_features.enabled.is_superset(&callee_target_features.enabled) {
             return Unsafety::Unsafe;
         }
@@ -147,21 +84,10 @@ pub fn is_fn_unsafe_to_call(
 
     let loc = func.lookup(db);
     match loc.container {
-        hir_def::ItemContainerId::ExternBlockId(block) => {
-            let is_intrinsic_block = block.abi(db) == Some(sym::rust_dash_intrinsic);
-            if is_intrinsic_block {
-                // legacy intrinsics
-                // extern "rust-intrinsic" intrinsics are unsafe unless they have the rustc_safe_intrinsic attribute
-                if db.attrs(func.into()).by_key(sym::rustc_safe_intrinsic).exists() {
-                    Unsafety::Safe
-                } else {
-                    Unsafety::Unsafe
-                }
-            } else {
-                // Function in an `extern` block are always unsafe to call, except when
-                // it is marked as `safe`.
-                if data.is_safe() { Unsafety::Safe } else { Unsafety::Unsafe }
-            }
+        hir_def::ItemContainerId::ExternBlockId(_) => {
+            // Function in an `extern` block are always unsafe to call, except when
+            // it is marked as `safe`.
+            if data.is_safe() { Unsafety::Safe } else { Unsafety::Unsafe }
         }
         _ => Unsafety::Safe,
     }
@@ -182,7 +108,7 @@ pub(crate) fn detect_variant_from_bytes<'a>(
         hir_def::layout::Variants::Multiple { tag, tag_encoding, variants, .. } => {
             let size = tag.size(target_data_layout).bytes_usize();
             let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
-            let tag = i128::from_le_bytes(pad16(&b[offset..offset + size], false));
+            let tag = i128::from_le_bytes(pad16(&b[offset..offset + size], IsSigned::No));
             match tag_encoding {
                 TagEncoding::Direct => {
                     let (var_idx, layout) =
@@ -206,4 +132,55 @@ pub(crate) fn detect_variant_from_bytes<'a>(
         }
     };
     Some((var_id, var_layout))
+}
+
+pub(crate) struct EnumerateAndAdjust<I> {
+    enumerate: Enumerate<I>,
+    gap_pos: usize,
+    gap_len: usize,
+}
+
+impl<I> Iterator for EnumerateAndAdjust<I>
+where
+    I: Iterator,
+{
+    type Item = (usize, <I as Iterator>::Item);
+
+    fn next(&mut self) -> Option<(usize, <I as Iterator>::Item)> {
+        self.enumerate
+            .next()
+            .map(|(i, elem)| (if i < self.gap_pos { i } else { i + self.gap_len }, elem))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.enumerate.size_hint()
+    }
+}
+
+pub(crate) trait EnumerateAndAdjustIterator {
+    fn enumerate_and_adjust(
+        self,
+        expected_len: usize,
+        gap_pos: Option<u32>,
+    ) -> EnumerateAndAdjust<Self>
+    where
+        Self: Sized;
+}
+
+impl<T: ExactSizeIterator> EnumerateAndAdjustIterator for T {
+    fn enumerate_and_adjust(
+        self,
+        expected_len: usize,
+        gap_pos: Option<u32>,
+    ) -> EnumerateAndAdjust<Self>
+    where
+        Self: Sized,
+    {
+        let actual_len = self.len();
+        EnumerateAndAdjust {
+            enumerate: self.enumerate(),
+            gap_pos: gap_pos.map(|it| it as usize).unwrap_or(expected_len),
+            gap_len: expected_len - actual_len,
+        }
+    }
 }

@@ -4,6 +4,7 @@ use rustc_type_ir::{TypeVisitableExt, fold_regions};
 use tracing::{debug, instrument};
 
 use crate::{
+    Span,
     infer::InferenceContext,
     next_solver::{
         EarlyBinder, OpaqueTypeKey, SolverDefId, TypingMode,
@@ -11,7 +12,7 @@ use crate::{
     },
 };
 
-impl<'db> InferenceContext<'_, 'db> {
+impl<'db> InferenceContext<'db> {
     /// This takes all the opaque type uses during HIR typeck. It first computes
     /// the concrete hidden type by iterating over all defining uses.
     ///
@@ -62,19 +63,19 @@ impl<'db> UsageKind<'db> {
     }
 }
 
-impl<'db> InferenceContext<'_, 'db> {
+impl<'db> InferenceContext<'db> {
     fn compute_definition_site_hidden_types(
         &mut self,
         mut opaque_types: Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>,
     ) {
         for entry in opaque_types.iter_mut() {
-            *entry = self.table.infer_ctxt.resolve_vars_if_possible(*entry);
+            *entry = self.resolve_vars_if_possible(*entry);
         }
         debug!(?opaque_types);
 
         let interner = self.interner();
         let TypingMode::Analysis { defining_opaque_types_and_generators } =
-            self.table.infer_ctxt.typing_mode()
+            self.table.infer_ctxt.typing_mode_raw()
         else {
             unreachable!();
         };
@@ -107,17 +108,18 @@ impl<'db> InferenceContext<'_, 'db> {
                         continue;
                     }
 
-                    let expected =
-                        EarlyBinder::bind(ty.ty).instantiate(interner, opaque_type_key.args);
-                    self.demand_eqtype(expected, hidden_type.ty);
+                    let expected = EarlyBinder::bind(ty.ty)
+                        .instantiate(interner, opaque_type_key.args)
+                        .skip_norm_wip();
+                    _ = self.demand_eqtype_fixme_no_diag(expected, hidden_type.ty);
                 }
 
-                self.result.type_of_opaque.insert(def_id, ty.ty);
+                self.result.type_of_opaque.insert(def_id, ty.ty.store());
 
                 continue;
             }
 
-            self.result.type_of_opaque.insert(def_id, self.types.error);
+            self.result.type_of_opaque.insert(def_id, self.types.types.error.store());
         }
     }
 
@@ -135,13 +137,15 @@ impl<'db> InferenceContext<'_, 'db> {
             return UsageKind::UnconstrainedHiddenType(hidden_type);
         }
 
-        let cause = ObligationCause::new();
-        let at = self.table.infer_ctxt.at(&cause, self.table.trait_env.env);
+        // FIXME: This should not use a dummy span.
+        let cause = ObligationCause::new(Span::Dummy);
+        let at = self.table.infer_ctxt.at(&cause, self.table.param_env);
         let hidden_type = match at.deeply_normalize(hidden_type) {
             Ok(hidden_type) => hidden_type,
-            Err(_errors) => OpaqueHiddenType { ty: self.types.error },
+            Err(_errors) => OpaqueHiddenType { ty: self.types.types.error },
         };
-        let hidden_type = fold_regions(self.interner(), hidden_type, |_, _| self.types.re_erased);
+        let hidden_type =
+            fold_regions(self.interner(), hidden_type, |_, _| self.types.regions.erased);
         UsageKind::HasDefiningUse(hidden_type)
     }
 }

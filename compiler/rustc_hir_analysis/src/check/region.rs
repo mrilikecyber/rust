@@ -11,14 +11,15 @@ use std::mem;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Arm, Block, Expr, LetStmt, Pat, PatKind, Stmt};
 use rustc_index::Idx;
+use rustc_lint_defs::LintId;
+use rustc_lint_defs::builtin::TAIL_EXPR_DROP_ORDER;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::lint;
-use rustc_span::source_map;
+use rustc_span::Spanned;
 use tracing::debug;
 
 #[derive(Debug, Copy, Clone)]
@@ -99,7 +100,7 @@ fn resolve_block<'tcx>(
         for (i, statement) in blk.stmts.iter().enumerate() {
             match statement.kind {
                 hir::StmtKind::Let(LetStmt { els: Some(els), .. }) => {
-                    // Let-else has a special lexical structure for variables.
+                    // let-else has a special lexical structure for variables.
                     // First we take a checkpoint of the current scope context here.
                     let mut prev_cx = visitor.cx;
 
@@ -146,10 +147,7 @@ fn resolve_block<'tcx>(
             let edition = blk.span.edition();
             let terminating = edition.at_least_rust_2024();
             if !terminating
-                && !visitor
-                    .tcx
-                    .lints_that_dont_need_to_run(())
-                    .contains(&lint::LintId::of(lint::builtin::TAIL_EXPR_DROP_ORDER))
+                && !visitor.tcx.skippable_lints(()).contains(&LintId::of(TAIL_EXPR_DROP_ORDER))
             {
                 // If this temporary scope will be changing once the codebase adopts Rust 2024,
                 // and we are linting about possible semantic changes that would result,
@@ -181,7 +179,7 @@ fn resolve_cond<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, cond: &'tcx hi
         // operands will be terminated). Any temporaries that would need to be dropped will be
         // dropped before we leave this operator's scope; terminating them here would be redundant.
         hir::ExprKind::Binary(
-            source_map::Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+            Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
             _,
             _,
         ) => false,
@@ -264,7 +262,7 @@ fn resolve_expr<'tcx>(
         // scopes, meaning that temporaries cannot outlive them.
         // This ensures fixed size stacks.
         hir::ExprKind::Binary(
-            source_map::Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+            Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
             left,
             right,
         ) => {
@@ -293,7 +291,7 @@ fn resolve_expr<'tcx>(
                 // This is purely an optimization to reduce the number of
                 // terminating scopes.
                 hir::ExprKind::Binary(
-                    source_map::Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+                    Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
                     ..,
                 ) => false,
                 // otherwise: mark it as terminating
@@ -587,9 +585,7 @@ fn resolve_local<'tcx>(
             | PatKind::TupleStruct(_, subpats, _)
             | PatKind::Tuple(subpats, _) => subpats.iter().any(|p| is_binding_pat(p)),
 
-            PatKind::Box(subpat) | PatKind::Deref(subpat) | PatKind::Guard(subpat, _) => {
-                is_binding_pat(subpat)
-            }
+            PatKind::Deref(subpat) | PatKind::Guard(subpat, _) => is_binding_pat(subpat),
 
             PatKind::Ref(_, _, _)
             | PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), ..)
@@ -701,31 +697,25 @@ fn resolve_local<'tcx>(
 /// Note: ET is intended to match "rvalues or places based on rvalues".
 fn record_subexpr_extended_temp_scopes(
     scope_tree: &mut ScopeTree,
-    mut expr: &hir::Expr<'_>,
+    expr: &hir::Expr<'_>,
     lifetime: Option<Scope>,
 ) {
-    debug!(?expr, ?lifetime);
+    // Note: give all the expressions matching `ET` with the
+    // extended temporary lifetime, not just the innermost rvalue,
+    // because in MIR building if we must compile e.g., `*rvalue()`
+    // into a temporary, we request the temporary scope of the
+    // outer expression.
 
-    loop {
-        // Note: give all the expressions matching `ET` with the
-        // extended temporary lifetime, not just the innermost rvalue,
-        // because in MIR building if we must compile e.g., `*rvalue()`
-        // into a temporary, we request the temporary scope of the
-        // outer expression.
+    scope_tree.record_extended_temp_scope(expr.hir_id.local_id, lifetime);
 
-        scope_tree.record_extended_temp_scope(expr.hir_id.local_id, lifetime);
-
-        match expr.kind {
-            hir::ExprKind::AddrOf(_, _, subexpr)
-            | hir::ExprKind::Unary(hir::UnOp::Deref, subexpr)
-            | hir::ExprKind::Field(subexpr, _)
-            | hir::ExprKind::Index(subexpr, _, _) => {
-                expr = subexpr;
-            }
-            _ => {
-                return;
-            }
+    match expr.kind {
+        hir::ExprKind::AddrOf(_, _, subexpr)
+        | hir::ExprKind::Unary(hir::UnOp::Deref, subexpr)
+        | hir::ExprKind::Field(subexpr, _)
+        | hir::ExprKind::Index(subexpr, _, _) => {
+            record_subexpr_extended_temp_scopes(scope_tree, subexpr, lifetime);
         }
+        _ => {}
     }
 }
 
@@ -855,13 +845,13 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
 /// re-use in incremental scenarios. We may sometimes need to rerun the
 /// type checker even when the HIR hasn't changed, and in those cases
 /// we can avoid reconstructing the region scope tree.
-pub(crate) fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
-    let typeck_root_def_id = tcx.typeck_root_def_id(def_id);
+pub(crate) fn region_scope_tree(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &ScopeTree {
+    let typeck_root_def_id = tcx.typeck_root_def_id_local(def_id);
     if typeck_root_def_id != def_id {
         return tcx.region_scope_tree(typeck_root_def_id);
     }
 
-    let scope_tree = if let Some(body) = tcx.hir_maybe_body_owned_by(def_id.expect_local()) {
+    let scope_tree = if let Some(body) = tcx.hir_maybe_body_owned_by(def_id) {
         let mut visitor = ScopeResolutionVisitor {
             tcx,
             scope_tree: ScopeTree::default(),

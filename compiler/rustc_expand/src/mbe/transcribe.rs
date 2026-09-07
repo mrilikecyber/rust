@@ -6,19 +6,22 @@ use rustc_ast::token::{
 use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
 use rustc_ast::{ExprKind, StmtKind, TyKind, UnOp};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Diag, DiagCtxtHandle, PResult, pluralize};
+use rustc_errors::{Diag, DiagCtxtHandle, PResult, listify, pluralize};
 use rustc_parse::lexer::nfc_normalize;
 use rustc_parse::parser::ParseNtResult;
 use rustc_session::parse::ParseSess;
 use rustc_span::hygiene::{LocalExpnId, Transparency};
 use rustc_span::{
-    Ident, MacroRulesNormalizedIdent, Span, Symbol, SyntaxContext, sym, with_metavar_spans,
+    BytePos, Ident, MacroRulesNormalizedIdent, Span, Symbol, SyntaxContext, kw, sym,
+    with_metavar_spans,
 };
 use smallvec::{SmallVec, smallvec};
 
-use crate::errors::{
-    CountRepetitionMisplaced, MacroVarStillRepeating, MetaVarsDifSeqMatchers, MustRepeatOnce,
-    MveUnrecognizedVar, NoSyntaxVarsExprRepeat,
+use crate::diagnostics::{
+    ConcatInvalidIdent, CountRepetitionMisplaced, InvalidIdentReason, MacroVarStillRepeating,
+    MetaVarsDifSeqMatchers, MustRepeatOnce, MveUnrecognizedVar, NoRepeatableVar,
+    NoSyntaxVarsExprRepeat, VarNoTypo, VarTypoSuggestionRepeatable, VarTypoSuggestionUnrepeatable,
+    VarTypoSuggestionUnrepeatableLabel,
 };
 use crate::mbe::macro_parser::NamedMatch;
 use crate::mbe::macro_parser::NamedMatch::*;
@@ -246,7 +249,7 @@ pub(super) fn transcribe<'a>(
         match tree {
             // Replace the sequence with its expansion.
             seq @ mbe::TokenTree::Sequence(_, seq_rep) => {
-                transcribe_sequence(&mut tscx, seq, seq_rep)?;
+                transcribe_sequence(&mut tscx, seq, seq_rep, interp)?;
             }
 
             // Replace the meta-var with the matched token tree from the invocation.
@@ -293,6 +296,8 @@ fn transcribe_sequence<'tx, 'itp>(
     tscx: &mut TranscrCtx<'tx, 'itp>,
     seq: &mbe::TokenTree,
     seq_rep: &'itp mbe::SequenceRepetition,
+    // Used only for better diagnostics in the face of typos.
+    interp: &FxHashMap<MacroRulesNormalizedIdent, NamedMatch>,
 ) -> PResult<'tx, ()> {
     let dcx = tscx.psess.dcx();
 
@@ -301,7 +306,66 @@ fn transcribe_sequence<'tx, 'itp>(
     // macro writer has made a mistake.
     match lockstep_iter_size(seq, tscx.interp, &tscx.repeats) {
         LockstepIterSize::Unconstrained => {
-            return Err(dcx.create_err(NoSyntaxVarsExprRepeat { span: seq.span() }));
+            let mut repeatables = Vec::new();
+            let mut non_repeatables = Vec::new();
+
+            #[allow(rustc::potential_query_instability)]
+            for (name, matcher) in interp.iter() {
+                if matcher.is_repeatable() {
+                    repeatables.push(name);
+                } else {
+                    non_repeatables.push(name);
+                }
+            }
+
+            let repeatable_names: Vec<Symbol> =
+                repeatables.iter().map(|&name| name.symbol()).collect();
+            let non_repeatable_names: Vec<Symbol> =
+                non_repeatables.iter().map(|&name| name.symbol()).collect();
+            let mut meta_vars = vec![];
+            seq.meta_vars(&mut meta_vars);
+            let mut typo_repeatable = None;
+            let mut typo_unrepeatable = None;
+            let mut typo_unrepeatable_label = None;
+            let mut var_no_typo = None;
+            let mut no_repeatable_var = None;
+
+            for ident in meta_vars {
+                if let Some(name) = rustc_span::edit_distance::find_best_match_for_name(
+                    &repeatable_names[..],
+                    ident.name,
+                    None,
+                ) {
+                    typo_repeatable = Some(VarTypoSuggestionRepeatable { span: ident.span, name });
+                } else if let Some(name) = rustc_span::edit_distance::find_best_match_for_name(
+                    &non_repeatable_names[..],
+                    ident.name,
+                    None,
+                ) {
+                    typo_unrepeatable = Some(VarTypoSuggestionUnrepeatable { span: ident.span });
+                    if let Some(&orig_ident) = non_repeatables.iter().find(|n| n.symbol() == name) {
+                        typo_unrepeatable_label = Some(VarTypoSuggestionUnrepeatableLabel {
+                            span: orig_ident.ident().span,
+                        });
+                    }
+                } else {
+                    if !repeatable_names.is_empty()
+                        && let Some(msg) = listify(&repeatable_names, |s| format!("`${s}`"))
+                    {
+                        var_no_typo = Some(VarNoTypo { span: ident.span, msg });
+                    } else {
+                        no_repeatable_var = Some(NoRepeatableVar { span: ident.span });
+                    }
+                }
+            }
+            return Err(dcx.create_err(NoSyntaxVarsExprRepeat {
+                span: seq.span(),
+                typo_unrepeatable,
+                typo_repeatable,
+                typo_unrepeatable_label,
+                var_no_typo,
+                no_repeatable_var,
+            }));
         }
 
         LockstepIterSize::Contradiction(msg) => {
@@ -333,7 +397,7 @@ fn transcribe_sequence<'tx, 'itp>(
                 // The first time we encounter the sequence we push it to the stack. It
                 // then gets reused (see the beginning of the loop) until we are done
                 // repeating.
-                tscx.stack.push(Frame::new_sequence(seq_rep, seq.separator.clone(), seq.kleene.op));
+                tscx.stack.push(Frame::new_sequence(seq_rep, seq.separator, seq.kleene.op));
             }
         }
     }
@@ -441,7 +505,7 @@ fn transcribe_pnr<'tx>(
             mk_delimited(item.span, MetaVarKind::Item, TokenStream::from_ast(item))
         }
         ParseNtResult::Block(block) => {
-            mk_delimited(block.span, MetaVarKind::Block, TokenStream::from_ast(block))
+            mk_delimited(block.node.span, MetaVarKind::Block, TokenStream::from_ast(block))
         }
         ParseNtResult::Stmt(stmt) => {
             let stream = if let StmtKind::Empty = stmt.kind {
@@ -453,7 +517,7 @@ fn transcribe_pnr<'tx>(
             mk_delimited(stmt.span, MetaVarKind::Stmt, stream)
         }
         ParseNtResult::Pat(pat, pat_kind) => {
-            mk_delimited(pat.span, MetaVarKind::Pat(*pat_kind), TokenStream::from_ast(pat))
+            mk_delimited(pat.node.span, MetaVarKind::Pat(*pat_kind), TokenStream::from_ast(pat))
         }
         ParseNtResult::Expr(expr, kind) => {
             let (can_begin_literal_maybe_minus, can_begin_string_literal) = match &expr.kind {
@@ -477,22 +541,38 @@ fn transcribe_pnr<'tx>(
             mk_delimited(lit.span, MetaVarKind::Literal, TokenStream::from_ast(lit))
         }
         ParseNtResult::Ty(ty) => {
-            let is_path = matches!(&ty.kind, TyKind::Path(None, _path));
-            mk_delimited(ty.span, MetaVarKind::Ty { is_path }, TokenStream::from_ast(ty))
+            let is_path = matches!(&ty.node.kind, TyKind::Path(None, _path));
+            mk_delimited(ty.node.span, MetaVarKind::Ty { is_path }, TokenStream::from_ast(ty))
         }
         ParseNtResult::Meta(attr_item) => {
-            let has_meta_form = attr_item.meta_kind().is_some();
+            let has_meta_form = attr_item.node.meta_kind().is_some();
             mk_delimited(
-                attr_item.span(),
+                attr_item.node.span,
                 MetaVarKind::Meta { has_meta_form },
                 TokenStream::from_ast(attr_item),
             )
         }
         ParseNtResult::Path(path) => {
-            mk_delimited(path.span, MetaVarKind::Path, TokenStream::from_ast(path))
+            mk_delimited(path.node.span, MetaVarKind::Path, TokenStream::from_ast(path))
         }
         ParseNtResult::Vis(vis) => {
-            mk_delimited(vis.span, MetaVarKind::Vis, TokenStream::from_ast(vis))
+            mk_delimited(vis.node.span, MetaVarKind::Vis, TokenStream::from_ast(vis))
+        }
+        ParseNtResult::Guard(guard) => {
+            // FIXME(macro_guard_matcher):
+            // Perhaps it would be better to treat the leading `if` as part of `ast::Guard` during parsing?
+            // Currently they are separate, but in macros we match and emit the leading `if` for `:guard` matchers, which creates some inconsistency.
+
+            let leading_if_span =
+                guard.span_with_leading_if.with_hi(guard.span_with_leading_if.lo() + BytePos(2));
+            let ts = std::iter::once(TokenTree::token_alone(
+                token::Ident(kw::If, IdentIsRaw::No),
+                leading_if_span,
+            ))
+            .chain(TokenStream::from_ast(&guard.cond).iter().cloned())
+            .collect();
+
+            mk_delimited(guard.span_with_leading_if, MetaVarKind::Guard, ts)
         }
     };
 
@@ -553,29 +633,24 @@ fn metavar_expr_concat<'tx>(
 ) -> PResult<'tx, TokenTree> {
     let dcx = tscx.psess.dcx();
     let mut concatenated = String::new();
-    for element in elements.into_iter() {
+    for element in elements {
         let symbol = match element {
             MetaVarExprConcatElem::Ident(elem) => elem.name,
             MetaVarExprConcatElem::Literal(elem) => *elem,
             MetaVarExprConcatElem::Var(ident) => {
-                match matched_from_ident(dcx, *ident, tscx.interp)? {
-                    NamedMatch::MatchedSeq(named_matches) => {
-                        let Some((curr_idx, _)) = tscx.repeats.last() else {
-                            return Err(dcx.struct_span_err(dspan.entire(), "invalid syntax"));
-                        };
-                        match &named_matches[*curr_idx] {
-                            // FIXME(c410-f3r) Nested repetitions are unimplemented
-                            MatchedSeq(_) => {
-                                return Err(dcx.struct_span_err(
-                                    ident.span,
-                                    "nested repetitions with `${concat(...)}` metavariable expressions are not yet supported",
-                                ));
-                            }
-                            MatchedSingle(pnr) => extract_symbol_from_pnr(dcx, pnr, ident.span)?,
-                        }
-                    }
-                    NamedMatch::MatchedSingle(pnr) => {
+                let key = MacroRulesNormalizedIdent::new(*ident);
+                match lookup_cur_matched(key, tscx.interp, &tscx.repeats) {
+                    Some(NamedMatch::MatchedSingle(pnr)) => {
                         extract_symbol_from_pnr(dcx, pnr, ident.span)?
+                    }
+                    Some(NamedMatch::MatchedSeq(..)) => {
+                        return Err(dcx.struct_span_err(
+                            ident.span,
+                            "`${concat(...)}` variable is still repeating at this depth",
+                        ));
+                    }
+                    None => {
+                        return Err(dcx.create_err(MveUnrecognizedVar { span: ident.span, key }));
                     }
                 }
             }
@@ -585,10 +660,10 @@ fn metavar_expr_concat<'tx>(
     let symbol = nfc_normalize(&concatenated);
     let concatenated_span = tscx.visited_dspan(dspan);
     if !rustc_lexer::is_ident(symbol.as_str()) {
-        return Err(dcx.struct_span_err(
-            concatenated_span,
-            "`${concat(..)}` is not generating a valid identifier",
-        ));
+        return Err(dcx.create_err(ConcatInvalidIdent {
+            span: concatenated_span,
+            reason: InvalidIdentReason::new(symbol),
+        }));
     }
     tscx.psess.symbol_gallery.insert(symbol, concatenated_span);
 
@@ -676,7 +751,7 @@ fn maybe_use_metavar_location(
         TokenTree::Token(Token { kind, span }, spacing) => {
             let span = metavar_span.with_ctxt(span.ctxt());
             with_metavar_spans(|mspans| mspans.insert(span, metavar_span));
-            TokenTree::Token(Token { kind: kind.clone(), span }, *spacing)
+            TokenTree::Token(Token { kind: *kind, span }, *spacing)
         }
         TokenTree::Delimited(dspan, dspacing, delimiter, tts) => {
             let open = metavar_span.with_ctxt(dspan.open.ctxt());

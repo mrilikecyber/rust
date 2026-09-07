@@ -7,12 +7,16 @@ LL |     vec![(), ()].iter().sum::<i32>();
    |                         required by a bound introduced by this call
    |
    = help: the trait `Sum<&()>` is not implemented for `i32`
-help: the following other types implement trait `Sum<A>`
+help: `i32` implements trait `Sum<A>`
   --> $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
    |
-   = note: `i32` implements `Sum<&i32>`
+   = note: `Sum`
+  ::: $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
    |
-   = note: `i32` implements `Sum`
+   = note: `Sum<&i32>`
+  ::: $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
+   |
+   = note: in this macro invocation
 note: the method call chain might not have had the expected associated types
   --> $DIR/sum.rs:4:18
    |
@@ -33,12 +37,16 @@ LL |     vec![(), ()].iter().product::<i32>();
    |                         required by a bound introduced by this call
    |
    = help: the trait `Product<&()>` is not implemented for `i32`
-help: the following other types implement trait `Product<A>`
+help: `i32` implements trait `Product<A>`
   --> $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
    |
-   = note: `i32` implements `Product<&i32>`
+   = note: `Product`
+  ::: $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
    |
-   = note: `i32` implements `Product`
+   = note: `Product<&i32>`
+  ::: $SRC_DIR/core/src/iter/traits/accum.rs:LL:COL
+   |
+   = note: in this macro invocation
 note: the method call chain might not have had the expected associated types
   --> $DIR/sum.rs:7:18
    |

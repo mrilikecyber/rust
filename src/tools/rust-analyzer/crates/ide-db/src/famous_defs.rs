@@ -222,7 +222,7 @@ impl FamousDefs<'_, '_> {
         Some(res)
     }
 
-    fn find_def(&self, path: &str) -> Option<ScopeDef> {
+    fn find_def(&self, path: &str) -> Option<ScopeDef<'_>> {
         let db = self.0.db;
         let mut path = path.split(':');
         let trait_ = path.next_back()?;
@@ -232,7 +232,7 @@ impl FamousDefs<'_, '_> {
             lang_crate => lang_crate,
         };
         let std_crate = self.find_lang_crate(lang_crate)?;
-        let mut module = std_crate.root_module();
+        let mut module = std_crate.root_module(db);
         for segment in path {
             module = module.children(db).find_map(|child| {
                 let name = child.name(db)?;

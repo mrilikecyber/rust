@@ -1,4 +1,4 @@
-#![allow(non_fmt_panics, clippy::needless_bool, clippy::eq_op)]
+#![expect(clippy::eq_op, clippy::manual_assert_eq)]
 
 macro_rules! assert_const {
     ($len:expr) => {
@@ -95,4 +95,9 @@ fn _f3() {
 fn _f4() {
     assert!(C);
     //~^ assertions_on_constants
+}
+
+fn issue_16242(var: bool) {
+    // should not lint
+    assert!(cfg!(feature = "hey") && var);
 }

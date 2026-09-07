@@ -1,13 +1,15 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::{implements_trait, peel_and_count_ty_refs, should_call_clone_as_function};
 use clippy_utils::{get_parent_expr, peel_blocks, strip_pat_refs};
 use rustc_errors::Applicability;
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::{self as hir, Node};
 use rustc_lint::LateContext;
-use rustc_middle::ty::adjustment::Adjust;
-use rustc_middle::ty::{Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
+use rustc_middle::ty::{Ty, TyCtxt, TypeSuperVisitable as _, TypeVisitable as _, TypeVisitor};
 use rustc_span::{Span, Symbol, sym};
 
 use core::ops::ControlFlow;
@@ -69,14 +71,37 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, call_name: Symbo
                 }
             }
 
+            // Add `*` derefs if the expr is used in a ctor, because automatic derefs don't apply in that case.
+            let deref = if rcv_depth > res_depth {
+                let parent = cx.tcx.parent_hir_node(expr.hir_id);
+                match parent {
+                    Node::ExprField(_) => "*".repeat(rcv_depth - res_depth),
+                    Node::Expr(parent)
+                        if let hir::ExprKind::Call(func, _) = parent.kind
+                            && let (_, Some(path)) = func.opt_res_path()
+                            && matches!(path.res, Res::Def(DefKind::Ctor(_, _), _) | Res::SelfCtor(_)) =>
+                    {
+                        "*".repeat(rcv_depth - res_depth)
+                    },
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
             let mut applicability = Applicability::MachineApplicable;
+            let suggestion = format!(
+                "{deref}{}",
+                snippet_with_applicability(cx, recvr.span, "..", &mut applicability)
+            );
+
             span_lint_and_sugg(
                 cx,
                 USELESS_ASREF,
                 expr.span,
                 format!("this call to `{call_name}` does nothing"),
                 "try",
-                snippet_with_applicability(cx, recvr.span, "..", &mut applicability).to_string(),
+                suggestion,
                 applicability,
             );
         }
@@ -137,7 +162,7 @@ fn is_calling_clone(cx: &LateContext<'_>, arg: &hir::Expr<'_>) -> bool {
                         && cx.tcx.lang_items().clone_trait().is_some_and(|id| id == trait_id)
                         // no autoderefs
                         && !cx.typeck_results().expr_adjustments(obj).iter()
-                            .any(|a| matches!(a.kind, Adjust::Deref(Some(..))))
+                            .any(|a| matches!(a.kind, Adjust::Deref(DerefAdjustKind::Overloaded(..))))
                         && obj.res_local_id() == Some(local_id)
                     {
                         true

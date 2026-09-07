@@ -2,8 +2,7 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_with_applicability;
 use rustc_ast::ast::{BindingMode, ByRef, Lifetime, Param, PatKind, TyKind};
 use rustc_errors::Applicability;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, declare_lint_pass};
 use rustc_span::symbol::kw;
 
 declare_clippy_lint! {
@@ -117,7 +116,7 @@ impl EarlyLintPass for NeedlessArbitrarySelfType {
                     if !add.is_empty() {
                         sugg.push((p.span.shrink_to_lo(), add));
                     }
-                    diag.multipart_suggestion_verbose("remove the type", sugg, applicability);
+                    diag.multipart_suggestion("remove the type", sugg, applicability);
                 },
             );
         }

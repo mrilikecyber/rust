@@ -2,32 +2,30 @@ use std::any::Any;
 use std::hash::Hash;
 
 use rustc_ast::expand::allocator::AllocatorMethod;
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::{DynSend, DynSync};
 use rustc_metadata::EncodedMetadata;
 use rustc_metadata::creader::MetadataLoaderDyn;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
-use rustc_session::Session;
-use rustc_session::config::{self, CrateType, OutputFilenames, PrintRequest};
+use rustc_session::config::{OutputFilenames, PrintRequest};
+use rustc_session::{IncrCompSession, Session};
 use rustc_span::Symbol;
+use rustc_structures::CrateType;
 
 use super::CodegenObject;
-use super::write::WriteBackendMethods;
 use crate::back::archive::ArArchiveBuilderBuilder;
 use crate::back::link::link_binary;
-use crate::back::write::TargetMachineFactoryFn;
-use crate::{CodegenResults, ModuleCodegen, TargetConfig};
+use crate::{CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
 
 pub trait BackendTypes {
-    type Value: CodegenObject + PartialEq;
-    type Metadata: CodegenObject;
     type Function: CodegenObject;
-
     type BasicBlock: Copy;
-    type Type: CodegenObject + PartialEq;
     type Funclet;
+
+    type Value: CodegenObject + PartialEq;
+    type Type: CodegenObject + PartialEq;
+    type FunctionSignature: CodegenObject + PartialEq;
 
     // FIXME(eddyb) find a common convention for all of the debuginfo-related
     // names (choose between `Dbg`, `Debug`, `DebugInfo`, `DI` etc.).
@@ -37,10 +35,6 @@ pub trait BackendTypes {
 }
 
 pub trait CodegenBackend {
-    /// Locale resources for diagnostic messages - a string the content of the Fluent resource.
-    /// Called before `init` so that all other functions are able to emit translatable diagnostics.
-    fn locale_resource(&self) -> &'static str;
-
     fn name(&self) -> &'static str;
 
     fn init(&self, _sess: &Session) {}
@@ -51,8 +45,7 @@ pub trait CodegenBackend {
     /// `target_feature` and support for unstable float types.
     fn target_config(&self, _sess: &Session) -> TargetConfig {
         TargetConfig {
-            target_features: vec![],
-            unstable_target_features: vec![],
+            internal_target_features: Default::default(),
             // `true` is used as a default so backends need to acknowledge when they do not
             // support the float types, rather than accidentally quietly skipping all tests.
             has_reliable_f16: true,
@@ -67,7 +60,7 @@ pub trait CodegenBackend {
             CrateType::Executable,
             CrateType::Dylib,
             CrateType::Rlib,
-            CrateType::Staticlib,
+            CrateType::StaticLib,
             CrateType::Cdylib,
             CrateType::ProcMacro,
             CrateType::Sdylib,
@@ -78,6 +71,39 @@ pub trait CodegenBackend {
 
     fn print_version(&self) {}
 
+    /// Returns a list of all intrinsics that this backend definitely
+    /// replaces, which means their fallback bodies do not need to be monomorphized.
+    fn replaced_intrinsics(&self) -> Vec<Symbol> {
+        vec![]
+    }
+
+    /// Returns a list of all intrinsics that this backend definitely
+    /// does *not* replace, which means their fallback bodies can be MIR-inlined.
+    fn fallback_intrinsics(&self) -> Vec<Symbol> {
+        vec![]
+    }
+
+    /// Is ThinLTO supported by this backend?
+    fn thin_lto_supported(&self) -> bool {
+        true
+    }
+
+    /// Value printed by `--print=backend-has-zstd`.
+    ///
+    /// Used by compiletest to determine whether tests involving zstd compression
+    /// (e.g. `-Zdebuginfo-compression=zstd`) should be executed or skipped.
+    fn has_zstd(&self) -> bool {
+        false
+    }
+
+    /// Value printed by `--print=backend-has-mnemonic:...`.
+    ///
+    /// Used by compiletest to determine whether tests involving `asm!()` should
+    /// be executed or skipped.
+    fn has_mnemonic(&self, _sess: &Session, _mnemonic: &str) -> bool {
+        false
+    }
+
     /// The metadata loader used to load rlib and dylib metadata.
     ///
     /// Alternative codegen backends may want to use different rlib or dylib formats than the
@@ -87,6 +113,8 @@ pub trait CodegenBackend {
     }
 
     fn provide(&self, _providers: &mut Providers) {}
+
+    fn target_cpu(&self, sess: &Session) -> String;
 
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any>;
 
@@ -99,21 +127,33 @@ pub trait CodegenBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
+        incr_comp_session: Option<&IncrCompSession>,
         outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>);
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap);
 
-    /// This is called on the returned [`CodegenResults`] from [`join_codegen`](Self::join_codegen).
+    fn print_pass_timings(&self) {}
+
+    fn print_statistics(&self) {}
+
+    fn print_statistics_json(&self) -> String {
+        String::new()
+    }
+
+    /// This is called on the returned [`CompiledModules`] from [`join_codegen`](Self::join_codegen).
     fn link(
         &self,
         sess: &Session,
-        codegen_results: CodegenResults,
+        compiled_modules: CompiledModules,
+        crate_info: CrateInfo,
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
         link_binary(
             sess,
             &ArArchiveBuilderBuilder,
-            codegen_results,
+            compiled_modules,
+            crate_info,
             metadata,
             outputs,
             self.name(),
@@ -121,9 +161,9 @@ pub trait CodegenBackend {
     }
 }
 
-pub trait ExtraBackendMethods:
-    CodegenBackend + WriteBackendMethods + Sized + Send + Sync + DynSend + DynSync
-{
+pub trait ExtraBackendMethods: Send + Sync + DynSend + DynSync {
+    type Module;
+
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -138,31 +178,4 @@ pub trait ExtraBackendMethods:
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
     ) -> (ModuleCodegen<Self::Module>, u64);
-
-    fn target_machine_factory(
-        &self,
-        sess: &Session,
-        opt_level: config::OptLevel,
-        target_features: &[String],
-    ) -> TargetMachineFactoryFn<Self>;
-
-    fn spawn_named_thread<F, T>(
-        _time_trace: bool,
-        name: String,
-        f: F,
-    ) -> std::io::Result<std::thread::JoinHandle<T>>
-    where
-        F: FnOnce() -> T,
-        F: Send + 'static,
-        T: Send + 'static,
-    {
-        std::thread::Builder::new().name(name).spawn(f)
-    }
-
-    /// Returns `true` if this backend can be safely called from multiple threads.
-    ///
-    /// Defaults to `true`.
-    fn supports_parallel(&self) -> bool {
-        true
-    }
 }

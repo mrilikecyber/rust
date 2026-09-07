@@ -16,14 +16,14 @@ use crate::io;
 use crate::os::hermit::io::OwnedFd;
 #[cfg(all(not(target_os = "hermit"), not(target_os = "motor")))]
 use crate::os::raw;
-#[cfg(all(doc, not(target_arch = "wasm32")))]
+#[cfg(all(doc, not(any(target_arch = "wasm32", target_env = "sgx", target_os = "l4re"))))]
 use crate::os::unix::io::AsFd;
 #[cfg(unix)]
 use crate::os::unix::io::OwnedFd;
 #[cfg(target_os = "wasi")]
 use crate::os::wasi::io::OwnedFd;
 #[cfg(not(target_os = "trusty"))]
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner};
 
 /// Raw file descriptors.
 #[stable(feature = "rust1", since = "1.0.0")]

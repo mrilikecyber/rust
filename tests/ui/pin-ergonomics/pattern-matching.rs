@@ -1,7 +1,7 @@
 //@ revisions: pin_ergonomics normal
 //@ edition:2024
 #![cfg_attr(pin_ergonomics, feature(pin_ergonomics))]
-#![feature(if_let_guard, negative_impls)]
+#![feature(negative_impls)]
 #![allow(incomplete_features)]
 
 use std::pin::Pin;
@@ -9,13 +9,13 @@ use std::pin::Pin;
 // This test verifies that a `&pin mut T` can be projected to a pinned
 // reference field `&pin mut T.U` when `T` is marked with `#[pin_v2]`.
 
-#[pin_v2] //[normal]~ ERROR the `#[pin_v2]` attribute is an experimental feature
+#[pin_v2] //[normal]~ ERROR the `pin_v2` attribute is an experimental feature
 struct Foo<T, U> {
     x: T,
     y: U,
 }
 
-#[pin_v2] //[normal]~ ERROR the `#[pin_v2]` attribute is an experimental feature
+#[pin_v2] //[normal]~ ERROR the `pin_v2` attribute is an experimental feature
 enum Bar<T, U> {
     Foo(T, U),
     Bar { x: T, y: U },

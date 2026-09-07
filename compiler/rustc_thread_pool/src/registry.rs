@@ -153,8 +153,8 @@ pub struct Registry {
     terminate_count: AtomicUsize,
 }
 
-/// ////////////////////////////////////////////////////////////////////////
-/// Initialization
+///////////////////////////////////////////////////////////////////////////
+// Initialization
 
 static mut THE_REGISTRY: Option<Arc<Registry>> = None;
 static THE_REGISTRY_SET: Once = Once::new();
@@ -407,12 +407,12 @@ impl Registry {
         }
     }
 
-    /// ////////////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////
     /// MAIN LOOP
     ///
     /// So long as all of the worker threads are hanging out in their
     /// top-level loop, there is no work to be done.
-
+    ///
     /// Push a job into the given `registry`. If we are running on a
     /// worker thread for the registry, this will push onto the
     /// deque. Else, it will inject from the outside (which is slower).
@@ -524,7 +524,7 @@ impl Registry {
         OP: FnOnce(&WorkerThread, bool) -> R + Send,
         R: Send,
     {
-        thread_local!(static LOCK_LATCH: LockLatch = LockLatch::new());
+        thread_local!(static LOCK_LATCH: LockLatch = const { LockLatch::new() });
 
         LOCK_LATCH.with(|l| {
             // This thread isn't a member of *any* thread pool, so just block.
@@ -615,14 +615,17 @@ impl Registry {
 }
 
 /// Mark a Rayon worker thread as blocked. This triggers the deadlock handler
-/// if no other worker thread is active
+/// if no other worker thread is active. Then wait for the user-specified condition.
 #[inline]
-pub fn mark_blocked() {
+pub fn mark_blocked_and_wait(wait: impl FnOnce()) {
     let worker_thread = WorkerThread::current();
     assert!(!worker_thread.is_null());
     unsafe {
         let registry = &(*worker_thread).registry;
-        registry.sleep.mark_blocked(&registry.deadlock_handler)
+        registry.sleep.mark_blocked(&registry.deadlock_handler);
+        registry.release_thread();
+        wait();
+        registry.acquire_thread();
     }
 }
 
@@ -668,8 +671,8 @@ impl ThreadInfo {
     }
 }
 
-/// ////////////////////////////////////////////////////////////////////////
-/// WorkerThread identifiers
+///////////////////////////////////////////////////////////////////////////
+// WorkerThread identifiers
 
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
@@ -1018,8 +1021,6 @@ impl WorkerThread {
         }
     }
 }
-
-/// ////////////////////////////////////////////////////////////////////////
 
 unsafe fn main_loop(thread: ThreadBuilder) {
     let worker_thread = &WorkerThread::from(thread);

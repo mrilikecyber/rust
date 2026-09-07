@@ -6,16 +6,13 @@ mod tests;
 use std::{iter, ops::Not};
 
 use either::Either;
-use hir::{
-    DisplayTarget, GenericDef, GenericSubstitution, HasCrate, HasSource, LangItem, Semantics,
-    db::DefDatabase,
-};
+use hir::{DisplayTarget, GenericDef, GenericSubstitution, HasCrate, HasSource, Semantics};
 use ide_db::{
-    FileRange, FxIndexSet, MiniCore, Ranker, RootDatabase,
+    FileRange, FxIndexSet, Ranker, RootDatabase,
     defs::{Definition, IdentClass, NameRefClass, OperatorClass},
     famous_defs::FamousDefs,
     helpers::pick_best_token,
-    ra_fixture::UpmapFromRaFixture,
+    ra_fixture::{RaFixtureConfig, UpmapFromRaFixture},
 };
 use itertools::{Itertools, multizip};
 use macros::UpmapFromRaFixture;
@@ -47,7 +44,7 @@ pub struct HoverConfig<'a> {
     pub max_enum_variants_count: Option<usize>,
     pub max_subst_ty_len: SubstTyLen,
     pub show_drop_glue: bool,
-    pub minicore: MiniCore<'a>,
+    pub ra_fixture: RaFixtureConfig<'a>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,8 +135,7 @@ pub(crate) fn hover(
 ) -> Option<RangeInfo<HoverResult>> {
     let sema = &hir::Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
+    let edition = sema.attach_first_edition(file_id).edition(db);
     let display_target = sema.first_crate(file_id)?.to_display_target(db);
     let mut res = if range.is_empty() {
         hover_offset(
@@ -225,7 +221,7 @@ fn hover_offset(
 
     if let Some(literal) = ast::String::cast(original_token.clone())
         && let Some((analysis, fixture_analysis)) =
-            Analysis::from_ra_fixture(sema, literal.clone(), &literal, config.minicore)
+            Analysis::from_ra_fixture(sema, literal.clone(), &literal, &config.ra_fixture)
     {
         let (virtual_file_id, virtual_offset) = fixture_analysis.map_offset_down(offset)?;
         return analysis
@@ -426,7 +422,7 @@ fn hover_ranged(
         Either::Left(ast::Expr::Literal(literal)) => {
             if let Some(literal) = ast::String::cast(literal.token())
                 && let Some((analysis, fixture_analysis)) =
-                    Analysis::from_ra_fixture(sema, literal.clone(), &literal, config.minicore)
+                    Analysis::from_ra_fixture(sema, literal.clone(), &literal, &config.ra_fixture)
             {
                 let (virtual_file_id, virtual_range) = fixture_analysis.map_range_down(range)?;
                 return analysis
@@ -454,7 +450,7 @@ fn hover_ranged(
 pub(crate) fn hover_for_definition(
     sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
-    def: Definition,
+    def: Definition<'_>,
     subst: Option<GenericSubstitution<'_>>,
     scope_node: &SyntaxNode,
     macro_arm: Option<u32>,
@@ -473,7 +469,7 @@ pub(crate) fn hover_for_definition(
         Definition::Local(it) => Some(it.ty(db)),
         Definition::GenericParam(hir::GenericParam::ConstParam(it)) => Some(it.ty(db)),
         Definition::GenericParam(hir::GenericParam::TypeParam(it)) => Some(it.ty(db)),
-        Definition::Field(field) => Some(field.ty(db).to_type(db)),
+        Definition::Field(field) => Some(field.ty(db)),
         Definition::TupleField(it) => Some(it.ty(db)),
         Definition::Function(it) => Some(it.ty(db)),
         Definition::Adt(it) => Some(it.ty(db)),
@@ -485,6 +481,10 @@ pub(crate) fn hover_for_definition(
     };
     let notable_traits = def_ty.map(|ty| notable_traits(db, &ty)).unwrap_or_default();
     let subst_types = subst.map(|subst| subst.types(db));
+    let render_private_fields = sema.scope(scope_node).is_some_and(|scope| {
+        def.krate(db)
+            .is_some_and(|def_crate| should_render_private_fields(db, def_crate, scope.krate()))
+    });
 
     let (markup, range_map) = render::definition(
         sema.db,
@@ -493,6 +493,7 @@ pub(crate) fn hover_for_definition(
         &notable_traits,
         macro_arm,
         render_extras,
+        render_private_fields,
         subst_types.as_ref(),
         config,
         edition,
@@ -512,6 +513,27 @@ pub(crate) fn hover_for_definition(
     }
 }
 
+/// | Hover location | Definition location | Render private fields? |
+/// |---|---:|---:|
+/// | Workspace crate | Workspace crate | Yes |
+/// | Workspace crate | External/library crate | No |
+/// | External/library crate | Same external/library crate | Yes |
+/// | External/library crate | Different external/library crate | No |
+/// | Anywhere | Same crate as definition | Yes |
+fn should_render_private_fields(
+    db: &RootDatabase,
+    def_crate: hir::Crate,
+    hover_crate: hir::Crate,
+) -> bool {
+    let is_workspace_crate = |db: &RootDatabase, krate: hir::Crate| {
+        let origin = krate.origin(db);
+        !origin.is_lib() && !origin.is_lang()
+    };
+
+    def_crate == hover_crate
+        || is_workspace_crate(db, def_crate) && is_workspace_crate(db, hover_crate)
+}
+
 fn notable_traits<'db>(
     db: &'db RootDatabase,
     ty: &hir::Type<'db>,
@@ -522,9 +544,8 @@ fn notable_traits<'db>(
         return Vec::new();
     }
 
-    db.notable_traits_in_deps(ty.krate(db).into())
-        .iter()
-        .flat_map(|it| &**it)
+    ty.krate(db)
+        .notable_traits_in_deps(db)
         .filter_map(move |&trait_| {
             let trait_ = trait_.into();
             ty.impls_trait(db, trait_, &[]).then(|| {
@@ -547,7 +568,7 @@ fn notable_traits<'db>(
 
 fn show_implementations_action(
     sema: &Semantics<'_, RootDatabase>,
-    def: Definition,
+    def: Definition<'_>,
 ) -> Option<HoverAction> {
     fn to_action(nav_target: NavigationTarget) -> HoverAction {
         HoverAction::Implementation(FilePosition {
@@ -569,7 +590,7 @@ fn show_implementations_action(
 
 fn show_fn_references_action(
     sema: &Semantics<'_, RootDatabase>,
-    def: Definition,
+    def: Definition<'_>,
 ) -> Option<HoverAction> {
     match def {
         Definition::Function(it) => {
@@ -586,7 +607,7 @@ fn show_fn_references_action(
 
 fn runnable_action(
     sema: &hir::Semantics<'_, RootDatabase>,
-    def: Definition,
+    def: Definition<'_>,
     file_id: FileId,
 ) -> Option<HoverAction> {
     match def {
@@ -607,7 +628,7 @@ fn runnable_action(
 
 fn goto_type_action_for_def(
     sema: &Semantics<'_, RootDatabase>,
-    def: Definition,
+    def: Definition<'_>,
     notable_traits: &[(hir::Trait, Vec<(Option<hir::Type<'_>>, hir::Name)>)],
     subst_types: Option<Vec<(hir::Symbol, hir::Type<'_>)>>,
     edition: Edition,
@@ -635,7 +656,7 @@ fn goto_type_action_for_def(
 
     let ty = match def {
         Definition::Local(it) => Some(it.ty(db)),
-        Definition::Field(field) => Some(field.ty(db).to_type(db)),
+        Definition::Field(field) => Some(field.ty(db)),
         Definition::TupleField(field) => Some(field.ty(db)),
         Definition::Const(it) => Some(it.ty(db)),
         Definition::Static(it) => Some(it.ty(db)),
@@ -677,10 +698,10 @@ fn walk_and_push_ty(
         } else if let Some(trait_) = t.as_associated_type_parent_trait(db) {
             push_new_def(trait_.into());
         } else if let Some(tp) = t.as_type_param(db) {
-            let sized_trait = LangItem::Sized.resolve_trait(db, t.krate(db).into());
+            let sized_trait = hir::Trait::lang(db, t.krate(db), hir::LangItem::Sized);
             tp.trait_bounds(db)
                 .into_iter()
-                .filter(|&it| Some(it.into()) != sized_trait)
+                .filter(|&it| Some(it) != sized_trait)
                 .for_each(|it| push_new_def(it.into()));
         }
     });

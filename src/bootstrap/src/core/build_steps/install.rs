@@ -8,12 +8,12 @@ use std::{env, fs};
 
 use crate::core::build_steps::dist;
 use crate::core::build_steps::tool::RustcPrivateCompilers;
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::core::builder::{Builder, CommandLineStep, Kind, RunConfig, ShouldRun};
+use crate::core::compiler::Compiler;
 use crate::core::config::{Config, TargetSelection};
 use crate::utils::exec::command;
 use crate::utils::helpers::t;
 use crate::utils::tarball::GeneratedTarball;
-use crate::{Compiler, Kind};
 
 #[cfg(target_os = "illumos")]
 const SHELL: &str = "bash";
@@ -178,15 +178,18 @@ macro_rules! install {
             }
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
-            const DEFAULT: bool = true;
             const IS_HOST: bool = $IS_HOST;
             $(const $c: bool = true;)*
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                let $_config = &run.builder.config;
-                run.$condition_name($path_or_alias).default_condition($default_cond)
+                run.$condition_name($path_or_alias)
+            }
+
+            fn is_default_step(builder: &Builder<'_>) -> bool {
+                let $_config = &builder.config;
+                $default_cond
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -276,6 +279,17 @@ install!((self, builder, _config),
         });
         install_sh(builder, "rustc", self.build_compiler, Some(self.target), &tarball);
     };
+    RustcDev, alias = "rustc-dev", Self::should_build(_config), IS_HOST: true, {
+        if let Some(tarball) = builder.ensure(dist::RustcDev {
+            build_compiler: self.build_compiler, target: self.target
+        }) {
+            install_sh(builder, "rustc-dev", self.build_compiler, Some(self.target), &tarball);
+        } else {
+            builder.info(
+                &format!("skipping Install RustcDev stage{} ({})", self.build_compiler.stage + 1, self.target),
+            );
+        }
+    };
     RustcCodegenCranelift, alias = "rustc-codegen-cranelift", Self::should_build(_config), IS_HOST: true, {
         if let Some(tarball) = builder.ensure(dist::CraneliftCodegenBackend {
             compilers: RustcPrivateCompilers::from_build_compiler(builder, self.build_compiler, self.target),
@@ -305,15 +319,17 @@ pub struct Src {
     stage: u32,
 }
 
-impl Step for Src {
+impl CommandLineStep for Src {
     type Output = ();
-    const DEFAULT: bool = true;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let config = &run.builder.config;
-        let cond = config.extended && config.tools.as_ref().is_none_or(|t| t.contains("src"));
-        run.path("src").default_condition(cond)
+        run.path("src")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        let config = &builder.config;
+        config.extended && config.tools.as_ref().is_none_or(|t| t.contains("src"))
     }
 
     fn make_run(run: RunConfig<'_>) {

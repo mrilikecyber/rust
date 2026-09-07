@@ -3,9 +3,9 @@ mod serde;
 
 use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
-use std::io;
 use std::path::Path;
 use std::string::FromUtf8Error;
+use std::{io, iter};
 
 use ::serde::de::{self, Deserializer, Error as _};
 use ::serde::ser::{SerializeSeq, Serializer};
@@ -13,7 +13,7 @@ use ::serde::{Deserialize, Serialize};
 use rustc_ast::join_path_syms;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::thin_vec::ThinVec;
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def_id::{CrateNum, DefIndex, LOCAL_CRATE};
 use rustc_hir::find_attr;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::DefId;
@@ -23,12 +23,15 @@ use stringdex::internals as stringdex_internals;
 use tracing::instrument;
 
 use crate::clean::types::{Function, Generics, ItemId, Type, WherePredicate};
-use crate::clean::{self, utils};
+use crate::clean::{self, ExternalLocation, utils};
+use crate::config::ShouldMerge;
 use crate::error::Error;
 use crate::formats::cache::{Cache, OrphanImplItem};
 use crate::formats::item_type::ItemType;
 use crate::html::markdown::short_markdown_summary;
-use crate::html::render::{self, IndexItem, IndexItemFunctionType, RenderType, RenderTypeId};
+use crate::html::render::{
+    self, IndexItem, IndexItemFunctionType, IndexItemInfo, RenderType, RenderTypeId,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SerializedSearchIndex {
@@ -256,10 +259,14 @@ impl SerializedSearchIndex {
     /// The returned ID can be used to attach more data to the search result.
     fn add_entry(&mut self, name: Symbol, entry_data: EntryData, desc: String) -> usize {
         let fqp = if let Some(module_path_index) = entry_data.module_path {
-            let mut fqp = self.path_data[module_path_index].as_ref().unwrap().module_path.clone();
-            fqp.push(Symbol::intern(&self.names[module_path_index]));
-            fqp.push(name);
-            fqp
+            self.path_data[module_path_index]
+                .as_ref()
+                .unwrap()
+                .module_path
+                .iter()
+                .copied()
+                .chain([Symbol::intern(&self.names[module_path_index]), name])
+                .collect()
         } else {
             vec![name]
         };
@@ -306,13 +313,13 @@ impl SerializedSearchIndex {
 
     pub(crate) fn union(mut self, other: &SerializedSearchIndex) -> SerializedSearchIndex {
         let other_entryid_offset = self.names.len();
-        let mut map_other_pathid_to_self_pathid: Vec<usize> = Vec::new();
+        let mut map_other_pathid_to_self_pathid = Vec::new();
         let mut skips = FxHashSet::default();
         for (other_pathid, other_path_data) in other.path_data.iter().enumerate() {
             if let Some(other_path_data) = other_path_data {
-                let mut fqp = other_path_data.module_path.clone();
                 let name = Symbol::intern(&other.names[other_pathid]);
-                fqp.push(name);
+                let fqp =
+                    other_path_data.module_path.iter().copied().chain(iter::once(name)).collect();
                 let self_pathid = other_entryid_offset + other_pathid;
                 let self_pathid = match self.crate_paths_index.entry((other_path_data.ty, fqp)) {
                     Entry::Vacant(slot) => {
@@ -458,7 +465,7 @@ impl SerializedSearchIndex {
                     other.descs[other_entryid].clone(),
                     other.function_data[other_entryid].clone().map(|mut func| {
                         fn map_fn_sig_item(
-                            map_other_pathid_to_self_pathid: &mut Vec<usize>,
+                            map_other_pathid_to_self_pathid: &Vec<usize>,
                             ty: &mut RenderType,
                         ) {
                             match ty.id {
@@ -501,14 +508,14 @@ impl SerializedSearchIndex {
                             }
                         }
                         for input in &mut func.inputs {
-                            map_fn_sig_item(&mut map_other_pathid_to_self_pathid, input);
+                            map_fn_sig_item(&map_other_pathid_to_self_pathid, input);
                         }
                         for output in &mut func.output {
-                            map_fn_sig_item(&mut map_other_pathid_to_self_pathid, output);
+                            map_fn_sig_item(&map_other_pathid_to_self_pathid, output);
                         }
                         for clause in &mut func.where_clause {
                             for entry in clause {
-                                map_fn_sig_item(&mut map_other_pathid_to_self_pathid, entry);
+                                map_fn_sig_item(&map_other_pathid_to_self_pathid, entry);
                             }
                         }
                         func
@@ -555,19 +562,19 @@ impl SerializedSearchIndex {
                 );
             }
         }
-        for (i, other_generic_inverted_index) in other.generic_inverted_index.iter().enumerate() {
-            for (size, other_list) in other_generic_inverted_index.iter().enumerate() {
-                let self_generic_inverted_index = match self.generic_inverted_index.get_mut(i) {
-                    Some(self_generic_inverted_index) => self_generic_inverted_index,
-                    None => {
-                        self.generic_inverted_index.push(Vec::new());
-                        self.generic_inverted_index.last_mut().unwrap()
-                    }
-                };
-                while self_generic_inverted_index.len() <= size {
-                    self_generic_inverted_index.push(Vec::new());
-                }
-                self_generic_inverted_index[size].extend(
+        if other.generic_inverted_index.len() > self.generic_inverted_index.len() {
+            self.generic_inverted_index.resize(other.generic_inverted_index.len(), Vec::new());
+        }
+        for (other_generic_inverted_index, self_generic_inverted_index) in
+            iter::zip(&other.generic_inverted_index, &mut self.generic_inverted_index)
+        {
+            if other_generic_inverted_index.len() > self_generic_inverted_index.len() {
+                self_generic_inverted_index.resize(other_generic_inverted_index.len(), Vec::new());
+            }
+            for (other_list, self_list) in
+                iter::zip(other_generic_inverted_index, self_generic_inverted_index)
+            {
+                self_list.extend(
                     other_list
                         .iter()
                         .copied()
@@ -611,7 +618,9 @@ impl SerializedSearchIndex {
                          parent,
                          trait_parent,
                          deprecated,
-                         associated_item_disambiguator,
+                         unstable,
+                         associated_item_disambiguator_or_extern_crate_url:
+                             associated_item_disambiguator,
                      }| EntryData {
                         krate: *map.get(krate).unwrap(),
                         ty: *ty,
@@ -621,7 +630,9 @@ impl SerializedSearchIndex {
                         parent: parent.and_then(|path_id| map.get(&path_id).copied()),
                         trait_parent: trait_parent.and_then(|path_id| map.get(&path_id).copied()),
                         deprecated: *deprecated,
-                        associated_item_disambiguator: associated_item_disambiguator.clone(),
+                        unstable: *unstable,
+                        associated_item_disambiguator_or_extern_crate_url:
+                            associated_item_disambiguator.clone(),
                     },
                 ),
                 self.descs[id].clone(),
@@ -717,7 +728,9 @@ impl SerializedSearchIndex {
                         }
                     },
                 ),
-                self.alias_pointers[id].and_then(|alias| map.get(&alias).copied()),
+                self.alias_pointers[id].and_then(|alias| {
+                    if self.names[alias].is_empty() { None } else { map.get(&alias).copied() }
+                }),
             );
         }
         new.generic_inverted_index = self
@@ -889,7 +902,8 @@ struct EntryData {
     parent: Option<usize>,
     trait_parent: Option<usize>,
     deprecated: bool,
-    associated_item_disambiguator: Option<String>,
+    unstable: bool,
+    associated_item_disambiguator_or_extern_crate_url: Option<String>,
 }
 
 impl Serialize for EntryData {
@@ -905,7 +919,8 @@ impl Serialize for EntryData {
         seq.serialize_element(&self.parent.map(|id| id + 1).unwrap_or(0))?;
         seq.serialize_element(&self.trait_parent.map(|id| id + 1).unwrap_or(0))?;
         seq.serialize_element(&if self.deprecated { 1 } else { 0 })?;
-        if let Some(disambig) = &self.associated_item_disambiguator {
+        seq.serialize_element(&if self.unstable { 1 } else { 0 })?;
+        if let Some(disambig) = &self.associated_item_disambiguator_or_extern_crate_url {
             seq.serialize_element(&disambig)?;
         }
         seq.end()
@@ -939,6 +954,7 @@ impl<'de> Deserialize<'de> for EntryData {
                     v.next_element()?.ok_or_else(|| A::Error::missing_field("trait_parent"))?;
 
                 let deprecated: u32 = v.next_element()?.unwrap_or(0);
+                let unstable: u32 = v.next_element()?.unwrap_or(0);
                 let associated_item_disambiguator: Option<String> = v.next_element()?;
                 Ok(EntryData {
                     krate,
@@ -949,7 +965,9 @@ impl<'de> Deserialize<'de> for EntryData {
                     parent: Option::<i32>::from(parent).map(|path| path as usize),
                     trait_parent: Option::<i32>::from(trait_parent).map(|path| path as usize),
                     deprecated: deprecated != 0,
-                    associated_item_disambiguator,
+                    unstable: unstable != 0,
+                    associated_item_disambiguator_or_extern_crate_url:
+                        associated_item_disambiguator,
                 })
             }
         }
@@ -1244,6 +1262,7 @@ pub(crate) fn build_index(
     tcx: TyCtxt<'_>,
     doc_root: &Path,
     resource_suffix: &str,
+    should_merge: &ShouldMerge,
 ) -> Result<SerializedSearchIndex, Error> {
     let mut search_index = std::mem::take(&mut cache.search_index);
 
@@ -1253,28 +1272,25 @@ pub(crate) fn build_index(
         &cache.orphan_impl_items
     {
         if let Some((fqp, _)) = cache.paths.get(&parent) {
-            let desc = short_markdown_summary(&item.doc_value(), &item.link_names(cache));
+            let info = IndexItemInfo::new(
+                tcx,
+                cache,
+                item,
+                Some(parent),
+                impl_generics.as_ref(),
+                item.type_(),
+            );
             search_index.push(IndexItem {
-                ty: item.type_(),
                 defid: item.item_id.as_def_id(),
                 name: item.name.unwrap(),
                 module_path: fqp[..fqp.len() - 1].to_vec(),
-                desc,
                 parent: Some(parent),
                 parent_idx: None,
                 trait_parent,
                 trait_parent_idx: None,
                 exact_module_path: None,
                 impl_id,
-                search_type: get_function_type_for_search(
-                    item,
-                    tcx,
-                    impl_generics.as_ref(),
-                    Some(parent),
-                    cache,
-                ),
-                aliases: item.attrs.get_doc_aliases(),
-                deprecation: item.deprecation(tcx),
+                info,
             });
         }
     }
@@ -1283,18 +1299,21 @@ pub(crate) fn build_index(
     search_index.sort_unstable_by(|k1, k2| {
         // `sort_unstable_by_key` produces lifetime errors
         // HACK(rustdoc): should not be sorting `CrateNum` or `DefIndex`, this will soon go away, too
-        let k1 =
-            (&k1.module_path, k1.name.as_str(), &k1.ty, k1.parent.map(|id| (id.index, id.krate)));
-        let k2 =
-            (&k2.module_path, k2.name.as_str(), &k2.ty, k2.parent.map(|id| (id.index, id.krate)));
-        Ord::cmp(&k1, &k2)
+        fn key(i: &IndexItem) -> (&[Symbol], &str, ItemType, Option<(DefIndex, CrateNum)>) {
+            (&i.module_path, i.name.as_str(), i.info.ty, i.parent.map(|id| (id.index, id.krate)))
+        }
+        Ord::cmp(&key(k1), &key(k2))
     });
 
     // Now, convert to an on-disk search index format
     //
     // if there's already a search index, load it into memory and add the new entries to it
     // otherwise, do nothing
-    let mut serialized_index = SerializedSearchIndex::load(doc_root, resource_suffix)?;
+    let mut serialized_index = if should_merge.read_rendered_cci {
+        SerializedSearchIndex::load(doc_root, resource_suffix)?
+    } else {
+        SerializedSearchIndex::default()
+    };
 
     // The crate always goes first in this list
     let crate_name = krate.name(tcx);
@@ -1370,7 +1389,8 @@ pub(crate) fn build_index(
                         parent: None,
                         trait_parent: None,
                         deprecated: false,
-                        associated_item_disambiguator: None,
+                        unstable: false,
+                        associated_item_disambiguator_or_extern_crate_url: None,
                     }),
                     crate_doc,
                     None,
@@ -1443,8 +1463,8 @@ pub(crate) fn build_index(
                     if fqp.last() != Some(&item.name) {
                         return None;
                     }
-                    let path = if item.ty == ItemType::Macro
-                        && find_attr!(tcx.get_all_attrs(defid), AttributeKind::MacroExport { .. })
+                    let path = if item.info.ty == ItemType::Macro
+                        && find_attr!(tcx, defid, MacroExport { .. })
                     {
                         // `#[macro_export]` always exports to the crate root.
                         vec![tcx.crate_name(defid.krate)]
@@ -1478,8 +1498,9 @@ pub(crate) fn build_index(
         if item.impl_id.is_some()
             && let Some(parent_idx) = item.parent_idx
         {
-            let count =
-                associated_item_duplicates.entry((parent_idx, item.ty, item.name)).or_insert(0);
+            let count = associated_item_duplicates
+                .entry((parent_idx, item.info.ty, item.name))
+                .or_insert(0);
             *count += 1;
         }
     }
@@ -1502,32 +1523,45 @@ pub(crate) fn build_index(
         let new_entry_id = serialized_index.add_entry(
             item.name,
             EntryData {
-                ty: item.ty,
+                ty: item.info.ty,
                 parent: item.parent_idx,
                 trait_parent: item.trait_parent_idx,
                 module_path,
                 exact_module_path,
-                deprecated: item.deprecation.is_some(),
-                associated_item_disambiguator: if let Some(impl_id) = item.impl_id
+                deprecated: item
+                    .info
+                    .deprecation
+                    .is_some_and(|deprecation| deprecation.is_in_effect()),
+                unstable: item.info.is_unstable,
+                associated_item_disambiguator_or_extern_crate_url: if let Some(impl_id) =
+                    item.impl_id
                     && let Some(parent_idx) = item.parent_idx
                     && associated_item_duplicates
-                        .get(&(parent_idx, item.ty, item.name))
+                        .get(&(parent_idx, item.info.ty, item.name))
                         .copied()
                         .unwrap_or(0)
                         > 1
                 {
                     Some(render::get_id_for_impl(tcx, ItemId::DefId(impl_id)))
+                } else if item.info.ty == ItemType::ExternCrate
+                    && let Some(local_def_id) = item.defid.and_then(|def_id| def_id.as_local())
+                    && let cnum = tcx.extern_mod_stmt_cnum(local_def_id).unwrap_or(LOCAL_CRATE)
+                    && let Some(ExternalLocation::Remote { url, is_absolute }) =
+                        cache.extern_locations.get(&cnum)
+                    && *is_absolute
+                {
+                    Some(format!("{}{}", url, tcx.crate_name(cnum).as_str()))
                 } else {
                     None
                 },
                 krate: crate_idx,
             },
-            item.desc.to_string(),
+            item.info.desc.to_string(),
         );
 
         // Aliases
         // -------
-        for alias in &item.aliases[..] {
+        for alias in &item.info.aliases {
             serialized_index.push_alias(alias.as_str().to_string(), new_entry_id);
         }
 
@@ -1597,7 +1631,9 @@ pub(crate) fn build_index(
             let Cache { ref paths, ref external_paths, ref exact_paths, .. } = *cache;
             let search_unbox = match id {
                 RenderTypeId::Mut => false,
-                RenderTypeId::DefId(defid) => utils::has_doc_flag(tcx, defid, sym::search_unbox),
+                RenderTypeId::DefId(defid) => {
+                    utils::has_doc_flag(tcx, defid, |d| d.search_unbox.is_some())
+                }
                 RenderTypeId::Primitive(
                     PrimitiveType::Reference | PrimitiveType::RawPointer | PrimitiveType::Tuple,
                 ) => true,
@@ -1735,13 +1771,15 @@ pub(crate) fn build_index(
                 assert!(ty.generics.is_some());
                 return;
             };
-            ty.id = convert_render_type_id(
-                id,
-                cache,
-                serialized_index,
-                used_in_function_signature,
-                tcx,
-            );
+            ty.id = if let RenderTypeId::DefId(def_id) = id
+                && matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::OpaqueTy)
+            {
+                // We exclude opaque types as they cannot have attributes, so no need to call
+                // `convert_render_type_id`.
+                None
+            } else {
+                convert_render_type_id(id, cache, serialized_index, used_in_function_signature, tcx)
+            };
             use crate::clean::PrimitiveType;
             // These cases are added to the inverted index, but not actually included
             // in the signature. There's a matching set of cases in the
@@ -1751,7 +1789,7 @@ pub(crate) fn build_index(
                 RenderTypeId::Primitive(PrimitiveType::Array | PrimitiveType::Slice) => {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("[]")],
+                        &[sym::empty_brackets],
                         None,
                         false,
                         serialized_index,
@@ -1762,7 +1800,7 @@ pub(crate) fn build_index(
                     // typeNameIdOfArrayOrSlice
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("()")],
+                        &[sym::empty_parens],
                         None,
                         false,
                         serialized_index,
@@ -1773,7 +1811,7 @@ pub(crate) fn build_index(
                 RenderTypeId::Primitive(PrimitiveType::Fn) => {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("->")],
+                        &[sym::right_arrow],
                         None,
                         false,
                         serialized_index,
@@ -1787,7 +1825,7 @@ pub(crate) fn build_index(
                 {
                     insert_into_map(
                         ItemType::Primitive,
-                        &[Symbol::intern("->")],
+                        &[sym::right_arrow],
                         None,
                         false,
                         serialized_index,
@@ -1798,7 +1836,7 @@ pub(crate) fn build_index(
                 _ => {}
             }
         }
-        if let Some(search_type) = &mut item.search_type {
+        if let Some(search_type) = &mut item.info.search_type {
             let mut used_in_function_inputs = BTreeSet::new();
             let mut used_in_function_output = BTreeSet::new();
             for item in &mut search_type.inputs {
@@ -1819,20 +1857,23 @@ pub(crate) fn build_index(
                     tcx,
                 );
             }
-            let mut used_in_constraints = Vec::new();
-            for constraint in &mut search_type.where_clause {
-                let mut used_in_constraint = BTreeSet::new();
-                for trait_ in &mut constraint[..] {
-                    convert_render_type(
-                        trait_,
-                        cache,
-                        &mut serialized_index,
-                        &mut used_in_constraint,
-                        tcx,
-                    );
-                }
-                used_in_constraints.push(used_in_constraint);
-            }
+            let used_in_constraints = search_type
+                .where_clause
+                .iter_mut()
+                .map(|constraint| {
+                    let mut used_in_constraint = BTreeSet::new();
+                    for trait_ in constraint {
+                        convert_render_type(
+                            trait_,
+                            cache,
+                            &mut serialized_index,
+                            &mut used_in_constraint,
+                            tcx,
+                        );
+                    }
+                    used_in_constraint
+                })
+                .collect::<Vec<_>>();
             loop {
                 let mut inserted_any = false;
                 for (i, used_in_constraint) in used_in_constraints.iter().enumerate() {
@@ -1862,50 +1903,52 @@ pub(crate) fn build_index(
                 // The number 8 is arbitrary. We want it big, but not enormous,
                 // because the postings list has to fill in an empty array for each
                 // unoccupied size.
-                if item.ty.is_fn_like() { 0 } else { 16 };
+                if item.info.ty.is_fn_like() { 0 } else { 16 };
             serialized_index.function_data[new_entry_id] = Some(search_type.clone());
-            for index in used_in_function_inputs {
-                let postings = if index >= 0 {
-                    assert!(serialized_index.path_data[index as usize].is_some());
-                    &mut serialized_index.type_data[index as usize]
-                        .as_mut()
-                        .unwrap()
-                        .inverted_function_inputs_index
-                } else {
-                    let generic_id = usize::try_from(-index).unwrap() - 1;
-                    for _ in serialized_index.generic_inverted_index.len()..=generic_id {
-                        serialized_index.generic_inverted_index.push(Vec::new());
+
+            #[derive(Clone, Copy)]
+            enum InvertedIndexType {
+                Inputs,
+                Output,
+            }
+            impl InvertedIndexType {
+                fn from_type_data(self, type_data: &mut TypeData) -> &mut Vec<Vec<u32>> {
+                    match self {
+                        Self::Inputs => &mut type_data.inverted_function_inputs_index,
+                        Self::Output => &mut type_data.inverted_function_output_index,
                     }
-                    &mut serialized_index.generic_inverted_index[generic_id]
-                };
-                while postings.len() <= search_type_size {
-                    postings.push(Vec::new());
-                }
-                if postings[search_type_size].last() != Some(&(new_entry_id as u32)) {
-                    postings[search_type_size].push(new_entry_id as u32);
                 }
             }
-            for index in used_in_function_output {
-                let postings = if index >= 0 {
-                    assert!(serialized_index.path_data[index as usize].is_some());
-                    &mut serialized_index.type_data[index as usize]
-                        .as_mut()
-                        .unwrap()
-                        .inverted_function_output_index
-                } else {
-                    let generic_id = usize::try_from(-index).unwrap() - 1;
-                    for _ in serialized_index.generic_inverted_index.len()..=generic_id {
-                        serialized_index.generic_inverted_index.push(Vec::new());
+
+            let mut process_used_in_function =
+                |used_in_function: BTreeSet<isize>, index_type: InvertedIndexType| {
+                    for index in used_in_function {
+                        let postings = if index >= 0 {
+                            assert!(serialized_index.path_data[index as usize].is_some());
+                            index_type.from_type_data(
+                                serialized_index.type_data[index as usize].as_mut().unwrap(),
+                            )
+                        } else {
+                            let generic_id = index.unsigned_abs() - 1;
+                            if generic_id >= serialized_index.generic_inverted_index.len() {
+                                serialized_index
+                                    .generic_inverted_index
+                                    .resize(generic_id + 1, Vec::new());
+                            }
+                            &mut serialized_index.generic_inverted_index[generic_id]
+                        };
+                        if search_type_size >= postings.len() {
+                            postings.resize(search_type_size + 1, Vec::new());
+                        }
+                        let posting = &mut postings[search_type_size];
+                        if posting.last() != Some(&(new_entry_id as u32)) {
+                            posting.push(new_entry_id as u32);
+                        }
                     }
-                    &mut serialized_index.generic_inverted_index[generic_id]
                 };
-                while postings.len() <= search_type_size {
-                    postings.push(Vec::new());
-                }
-                if postings[search_type_size].last() != Some(&(new_entry_id as u32)) {
-                    postings[search_type_size].push(new_entry_id as u32);
-                }
-            }
+
+            process_used_in_function(used_in_function_inputs, InvertedIndexType::Inputs);
+            process_used_in_function(used_in_function_output, InvertedIndexType::Output);
         }
     }
 
@@ -1949,7 +1992,7 @@ pub(crate) fn get_function_type_for_search(
         clean::ForeignFunctionItem(ref f, _)
         | clean::FunctionItem(ref f)
         | clean::MethodItem(ref f, _)
-        | clean::RequiredMethodItem(ref f) => {
+        | clean::RequiredMethodItem(ref f, _) => {
             get_fn_inputs_and_outputs(f, tcx, impl_or_trait_generics, cache)
         }
         clean::ConstantItem(ref c) => make_nullary_fn(&c.type_),
@@ -2022,6 +2065,7 @@ fn get_index_type_id(
         }
         // Not supported yet
         clean::Type::Pat(..)
+        | clean::Type::FieldOf(..)
         | clean::Generic(_)
         | clean::SelfTy
         | clean::ImplTrait(_)
@@ -2050,22 +2094,21 @@ enum SimplifiedParam {
 /// not be added to the map.
 ///
 /// This function also works recursively.
-#[instrument(level = "trace", skip(tcx, res, rgen, cache))]
+#[instrument(level = "trace", skip(tcx, rgen, cache))]
 fn simplify_fn_type<'a, 'tcx>(
     self_: Option<&'a Type>,
     generics: &Generics,
     arg: &'a Type,
     tcx: TyCtxt<'tcx>,
     recurse: usize,
-    res: &mut Vec<RenderType>,
     rgen: &mut FxIndexMap<SimplifiedParam, (isize, Vec<RenderType>)>,
     is_return: bool,
     cache: &Cache,
-) {
+) -> Option<RenderType> {
     if recurse >= 10 {
         // FIXME: remove this whole recurse thing when the recursion bug is fixed
         // See #59502 for the original issue.
-        return;
+        return None;
     }
 
     // First, check if it's "Self".
@@ -2082,179 +2125,120 @@ fn simplify_fn_type<'a, 'tcx>(
     match *arg {
         Type::Generic(arg_s) => {
             // First we check if the bounds are in a `where` predicate...
-            let mut type_bounds = Vec::new();
-            for where_pred in generics.where_predicates.iter().filter(|g| match g {
-                WherePredicate::BoundPredicate { ty, .. } => *ty == *arg,
-                _ => false,
-            }) {
-                let bounds = where_pred.get_bounds().unwrap_or(&[]);
-                for bound in bounds.iter() {
-                    if let Some(path) = bound.get_trait_path() {
-                        let ty = Type::Path { path };
-                        simplify_fn_type(
-                            self_,
-                            generics,
-                            &ty,
-                            tcx,
-                            recurse + 1,
-                            &mut type_bounds,
-                            rgen,
-                            is_return,
-                            cache,
-                        );
+            let where_bounds = generics
+                .where_predicates
+                .iter()
+                .filter_map(|g| {
+                    if let WherePredicate::BoundPredicate { ty, bounds, .. } = g
+                        && *ty == *arg
+                    {
+                        Some(bounds)
+                    } else {
+                        None
                     }
-                }
-            }
+                })
+                .flatten();
             // Otherwise we check if the trait bounds are "inlined" like `T: Option<u32>`...
-            if let Some(bound) = generics.params.iter().find(|g| g.is_type() && g.name == arg_s) {
-                for bound in bound.get_bounds().unwrap_or(&[]) {
-                    if let Some(path) = bound.get_trait_path() {
-                        let ty = Type::Path { path };
-                        simplify_fn_type(
-                            self_,
-                            generics,
-                            &ty,
-                            tcx,
-                            recurse + 1,
-                            &mut type_bounds,
-                            rgen,
-                            is_return,
-                            cache,
-                        );
-                    }
-                }
-            }
-            if let Some((idx, _)) = rgen.get(&SimplifiedParam::Symbol(arg_s)) {
-                res.push(RenderType {
-                    id: Some(RenderTypeId::Index(*idx)),
-                    generics: None,
-                    bindings: None,
-                });
+            let inline_bounds = generics
+                .params
+                .iter()
+                .find(|g| g.is_type() && g.name == arg_s)
+                .and_then(|bound| bound.get_bounds())
+                .into_iter()
+                .flatten();
+
+            let type_bounds = where_bounds
+                .chain(inline_bounds)
+                .filter_map(
+                    |bound| if let Some(path) = bound.get_trait_path() { Some(path) } else { None },
+                )
+                .filter_map(|path| {
+                    let ty = Type::Path { path };
+                    simplify_fn_type(self_, generics, &ty, tcx, recurse + 1, rgen, is_return, cache)
+                })
+                .collect();
+
+            Some(if let Some((idx, _)) = rgen.get(&SimplifiedParam::Symbol(arg_s)) {
+                RenderType { id: Some(RenderTypeId::Index(*idx)), generics: None, bindings: None }
             } else {
                 let idx = -isize::try_from(rgen.len() + 1).unwrap();
                 rgen.insert(SimplifiedParam::Symbol(arg_s), (idx, type_bounds));
-                res.push(RenderType {
-                    id: Some(RenderTypeId::Index(idx)),
-                    generics: None,
-                    bindings: None,
-                });
-            }
+                RenderType { id: Some(RenderTypeId::Index(idx)), generics: None, bindings: None }
+            })
         }
         Type::ImplTrait(ref bounds) => {
-            let mut type_bounds = Vec::new();
-            for bound in bounds {
-                if let Some(path) = bound.get_trait_path() {
+            let type_bounds = bounds
+                .iter()
+                .filter_map(|bound| bound.get_trait_path())
+                .filter_map(|path| {
                     let ty = Type::Path { path };
-                    simplify_fn_type(
-                        self_,
-                        generics,
-                        &ty,
-                        tcx,
-                        recurse + 1,
-                        &mut type_bounds,
-                        rgen,
-                        is_return,
-                        cache,
-                    );
-                }
-            }
-            if is_return && !type_bounds.is_empty() {
+                    simplify_fn_type(self_, generics, &ty, tcx, recurse + 1, rgen, is_return, cache)
+                })
+                .collect::<Vec<_>>();
+            Some(if is_return && !type_bounds.is_empty() {
                 // In return position, `impl Trait` is a unique thing.
-                res.push(RenderType { id: None, generics: Some(type_bounds), bindings: None });
+                RenderType { id: None, generics: Some(type_bounds), bindings: None }
             } else {
                 // In parameter position, `impl Trait` is the same as an unnamed generic parameter.
                 let idx = -isize::try_from(rgen.len() + 1).unwrap();
                 rgen.insert(SimplifiedParam::Anonymous(idx), (idx, type_bounds));
-                res.push(RenderType {
-                    id: Some(RenderTypeId::Index(idx)),
-                    generics: None,
-                    bindings: None,
-                });
-            }
+                RenderType { id: Some(RenderTypeId::Index(idx)), generics: None, bindings: None }
+            })
         }
         Type::Slice(ref ty) => {
-            let mut ty_generics = Vec::new();
-            simplify_fn_type(
-                self_,
-                generics,
-                ty,
-                tcx,
-                recurse + 1,
-                &mut ty_generics,
-                rgen,
-                is_return,
-                cache,
-            );
-            res.push(get_index_type(arg, ty_generics, rgen));
+            let ty_generics =
+                simplify_fn_type(self_, generics, ty, tcx, recurse + 1, rgen, is_return, cache)
+                    .into_iter()
+                    .collect();
+            Some(get_index_type(arg, ty_generics, rgen))
         }
         Type::Array(ref ty, _) => {
-            let mut ty_generics = Vec::new();
-            simplify_fn_type(
-                self_,
-                generics,
-                ty,
-                tcx,
-                recurse + 1,
-                &mut ty_generics,
-                rgen,
-                is_return,
-                cache,
-            );
-            res.push(get_index_type(arg, ty_generics, rgen));
+            let ty_generics =
+                simplify_fn_type(self_, generics, ty, tcx, recurse + 1, rgen, is_return, cache)
+                    .into_iter()
+                    .collect();
+            Some(get_index_type(arg, ty_generics, rgen))
         }
         Type::Tuple(ref tys) => {
-            let mut ty_generics = Vec::new();
-            for ty in tys {
-                simplify_fn_type(
-                    self_,
-                    generics,
-                    ty,
-                    tcx,
-                    recurse + 1,
-                    &mut ty_generics,
-                    rgen,
-                    is_return,
-                    cache,
-                );
-            }
-            res.push(get_index_type(arg, ty_generics, rgen));
+            let ty_generics = tys
+                .iter()
+                .filter_map(|ty| {
+                    simplify_fn_type(self_, generics, ty, tcx, recurse + 1, rgen, is_return, cache)
+                })
+                .collect();
+            Some(get_index_type(arg, ty_generics, rgen))
         }
         Type::BareFunction(ref bf) => {
-            let mut ty_generics = Vec::new();
-            for ty in bf.decl.inputs.iter().map(|arg| &arg.type_) {
-                simplify_fn_type(
-                    self_,
-                    generics,
-                    ty,
-                    tcx,
-                    recurse + 1,
-                    &mut ty_generics,
-                    rgen,
-                    is_return,
-                    cache,
-                );
-            }
+            let ty_generics = bf
+                .decl
+                .inputs
+                .iter()
+                .map(|arg| &arg.type_)
+                .filter_map(|ty| {
+                    simplify_fn_type(self_, generics, ty, tcx, recurse + 1, rgen, is_return, cache)
+                })
+                .collect();
             // The search index, for simplicity's sake, represents fn pointers and closures
             // the same way: as a tuple for the parameters, and an associated type for the
             // return type.
-            let mut ty_output = Vec::new();
-            simplify_fn_type(
+            let ty_output = simplify_fn_type(
                 self_,
                 generics,
                 &bf.decl.output,
                 tcx,
                 recurse + 1,
-                &mut ty_output,
                 rgen,
                 is_return,
                 cache,
-            );
+            )
+            .into_iter()
+            .collect();
             let ty_bindings = vec![(RenderTypeId::AssociatedType(sym::Output), ty_output)];
-            res.push(RenderType {
+            Some(RenderType {
                 id: get_index_type_id(arg, rgen),
                 bindings: Some(ty_bindings),
                 generics: Some(ty_generics),
-            });
+            })
         }
         Type::BorrowedRef { lifetime: _, mutability, ref type_ }
         | Type::RawPointer(mutability, ref type_) => {
@@ -2266,18 +2250,12 @@ fn simplify_fn_type<'a, 'tcx>(
                     bindings: None,
                 });
             }
-            simplify_fn_type(
-                self_,
-                generics,
-                type_,
-                tcx,
-                recurse + 1,
-                &mut ty_generics,
-                rgen,
-                is_return,
-                cache,
-            );
-            res.push(get_index_type(arg, ty_generics, rgen));
+            if let Some(ty) =
+                simplify_fn_type(self_, generics, type_, tcx, recurse + 1, rgen, is_return, cache)
+            {
+                ty_generics.push(ty);
+            }
+            Some(get_index_type(arg, ty_generics, rgen))
         }
         _ => {
             // This is not a type parameter. So for example if we have `T, U: Option<T>`, and we're
@@ -2288,22 +2266,25 @@ fn simplify_fn_type<'a, 'tcx>(
             let mut ty_generics = Vec::new();
             let mut ty_constraints = Vec::new();
             if let Some(arg_generics) = arg.generic_args() {
-                for ty in arg_generics.into_iter().filter_map(|param| match param {
-                    clean::GenericArg::Type(ty) => Some(ty),
-                    _ => None,
-                }) {
-                    simplify_fn_type(
-                        self_,
-                        generics,
-                        &ty,
-                        tcx,
-                        recurse + 1,
-                        &mut ty_generics,
-                        rgen,
-                        is_return,
-                        cache,
-                    );
-                }
+                ty_generics = arg_generics
+                    .into_iter()
+                    .filter_map(|param| match param {
+                        clean::GenericArg::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .filter_map(|ty| {
+                        simplify_fn_type(
+                            self_,
+                            generics,
+                            &ty,
+                            tcx,
+                            recurse + 1,
+                            rgen,
+                            is_return,
+                            cache,
+                        )
+                    })
+                    .collect();
                 for constraint in arg_generics.constraints() {
                     simplify_fn_constraint(
                         self_,
@@ -2350,9 +2331,10 @@ fn simplify_fn_type<'a, 'tcx>(
                             // Can't just pass stored_bounds to simplify_fn_type,
                             // because it also accepts rgen as a parameter.
                             // Instead, have it fill in this local, then copy it into the map afterward.
-                            let mut type_bounds = Vec::new();
-                            for bound in bounds {
-                                if let Some(path) = bound.get_trait_path() {
+                            let type_bounds = bounds
+                                .iter()
+                                .filter_map(|bound| bound.get_trait_path())
+                                .filter_map(|path| {
                                     let ty = Type::Path { path };
                                     simplify_fn_type(
                                         self_,
@@ -2360,13 +2342,12 @@ fn simplify_fn_type<'a, 'tcx>(
                                         &ty,
                                         tcx,
                                         recurse + 1,
-                                        &mut type_bounds,
                                         rgen,
                                         is_return,
                                         cache,
-                                    );
-                                }
-                            }
+                                    )
+                                })
+                                .collect();
                             let stored_bounds = &mut rgen
                                 .get_mut(&SimplifiedParam::AssociatedType(def_id, name))
                                 .unwrap()
@@ -2388,11 +2369,13 @@ fn simplify_fn_type<'a, 'tcx>(
             }
             let id = get_index_type_id(arg, rgen);
             if id.is_some() || !ty_generics.is_empty() {
-                res.push(RenderType {
+                Some(RenderType {
                     id,
                     bindings: if ty_constraints.is_empty() { None } else { Some(ty_constraints) },
                     generics: if ty_generics.is_empty() { None } else { Some(ty_generics) },
-                });
+                })
+            } else {
+                None
             }
         }
     }
@@ -2413,17 +2396,18 @@ fn simplify_fn_constraint<'a>(
     let ty_constrained_assoc = RenderTypeId::AssociatedType(constraint.assoc.name);
     for param in &constraint.assoc.args {
         match param {
-            clean::GenericArg::Type(arg) => simplify_fn_type(
-                self_,
-                generics,
-                &arg,
-                tcx,
-                recurse + 1,
-                &mut ty_constraints,
-                rgen,
-                is_return,
-                cache,
-            ),
+            clean::GenericArg::Type(arg) => {
+                ty_constraints.extend(simplify_fn_type(
+                    self_,
+                    generics,
+                    &arg,
+                    tcx,
+                    recurse + 1,
+                    rgen,
+                    is_return,
+                    cache,
+                ));
+            }
             clean::GenericArg::Lifetime(_)
             | clean::GenericArg::Const(_)
             | clean::GenericArg::Infer => {}
@@ -2445,34 +2429,32 @@ fn simplify_fn_constraint<'a>(
     match &constraint.kind {
         clean::AssocItemConstraintKind::Equality { term } => {
             if let clean::Term::Type(arg) = &term {
-                simplify_fn_type(
+                ty_constraints.extend(simplify_fn_type(
                     self_,
                     generics,
                     arg,
                     tcx,
                     recurse + 1,
-                    &mut ty_constraints,
                     rgen,
                     is_return,
                     cache,
-                );
+                ));
             }
         }
         clean::AssocItemConstraintKind::Bound { bounds } => {
             for bound in &bounds[..] {
                 if let Some(path) = bound.get_trait_path() {
                     let ty = Type::Path { path };
-                    simplify_fn_type(
+                    ty_constraints.extend(simplify_fn_type(
                         self_,
                         generics,
                         &ty,
                         tcx,
                         recurse + 1,
-                        &mut ty_constraints,
                         rgen,
                         is_return,
                         cache,
-                    );
+                    ));
                 }
             }
         }
@@ -2528,23 +2510,17 @@ fn get_fn_inputs_and_outputs(
         (None, &func.generics)
     };
 
-    let mut param_types = Vec::new();
-    for param in decl.inputs.iter() {
-        simplify_fn_type(
-            self_,
-            generics,
-            &param.type_,
-            tcx,
-            0,
-            &mut param_types,
-            &mut rgen,
-            false,
-            cache,
-        );
-    }
+    let param_types = decl
+        .inputs
+        .iter()
+        .filter_map(|param| {
+            simplify_fn_type(self_, generics, &param.type_, tcx, 0, &mut rgen, false, cache)
+        })
+        .collect();
 
-    let mut ret_types = Vec::new();
-    simplify_fn_type(self_, generics, &decl.output, tcx, 0, &mut ret_types, &mut rgen, true, cache);
+    let ret_types = simplify_fn_type(self_, generics, &decl.output, tcx, 0, &mut rgen, true, cache)
+        .into_iter()
+        .collect();
 
     let mut simplified_params = rgen.into_iter().collect::<Vec<_>>();
     simplified_params.sort_by_key(|(_, (idx, _))| -idx);

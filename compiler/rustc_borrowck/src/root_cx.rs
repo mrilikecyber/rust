@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::mem;
 use std::rc::Rc;
 
 use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_errors::DiagCtxtHandle;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::ty::{self, TyCtxt};
@@ -10,10 +12,12 @@ use rustc_span::ErrorGuaranteed;
 use smallvec::SmallVec;
 
 use crate::consumers::BorrowckConsumer;
+use crate::diagnostics::BorrowckDiagnosticsBuffer;
 use crate::nll::compute_closure_requirements_modulo_opaques;
 use crate::region_infer::opaque_types::{
-    apply_definition_site_hidden_types, clone_and_resolve_opaque_types,
+    UnexpectedHiddenRegion, apply_definition_site_hidden_types, clone_and_resolve_opaque_types,
     compute_definition_site_hidden_types, detect_opaque_types_added_while_handling_opaque_types,
+    handle_unconstrained_hidden_type_errors,
 };
 use crate::type_check::{Locations, constraint_conversion};
 use crate::{
@@ -23,35 +27,42 @@ use crate::{
 
 /// The shared context used by both the root as well as all its nested
 /// items.
-pub(super) struct BorrowCheckRootCtxt<'tcx> {
+pub(super) struct BorrowCheckRootCtxt<'diag, 'tcx: 'diag> {
     pub tcx: TyCtxt<'tcx>,
     root_def_id: LocalDefId,
+    /// This contains fully resolved hidden types or `ty::Error`.
     hidden_types: FxIndexMap<LocalDefId, ty::DefinitionSiteHiddenType<'tcx>>,
+    /// This contains unconstrained regions in hidden types.
+    /// Only used for deferred error reporting. See
+    /// [`crate::region_infer::opaque_types::handle_unconstrained_hidden_type_errors`]
+    unconstrained_hidden_type_errors: Vec<UnexpectedHiddenRegion<'tcx>>,
     /// The region constraints computed by [borrowck_collect_region_constraints]. This uses
     /// an [FxIndexMap] to guarantee that iterating over it visits nested bodies before
     /// their parents.
     collect_region_constraints_results:
         FxIndexMap<LocalDefId, CollectRegionConstraintsResult<'tcx>>,
     propagated_borrowck_results: FxHashMap<LocalDefId, PropagatedBorrowCheckResults<'tcx>>,
-    tainted_by_errors: Option<ErrorGuaranteed>,
+    tainted_by_errors: &'diag Cell<Option<ErrorGuaranteed>>,
     /// This should be `None` during normal compilation. See [`crate::consumers`] for more
     /// information on how this is used.
     pub consumer: Option<BorrowckConsumer<'tcx>>,
 }
 
-impl<'tcx> BorrowCheckRootCtxt<'tcx> {
+impl<'diag, 'tcx> BorrowCheckRootCtxt<'diag, 'tcx> {
     pub(super) fn new(
         tcx: TyCtxt<'tcx>,
         root_def_id: LocalDefId,
         consumer: Option<BorrowckConsumer<'tcx>>,
-    ) -> BorrowCheckRootCtxt<'tcx> {
+        tainted_by_errors: &'diag Cell<Option<ErrorGuaranteed>>,
+    ) -> BorrowCheckRootCtxt<'diag, 'tcx> {
         BorrowCheckRootCtxt {
             tcx,
             root_def_id,
             hidden_types: Default::default(),
+            unconstrained_hidden_type_errors: Default::default(),
             collect_region_constraints_results: Default::default(),
             propagated_borrowck_results: Default::default(),
-            tainted_by_errors: None,
+            tainted_by_errors,
             consumer,
         }
     }
@@ -60,12 +71,16 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
         self.root_def_id
     }
 
-    pub(super) fn set_tainted_by_errors(&mut self, guar: ErrorGuaranteed) {
-        self.tainted_by_errors = Some(guar);
+    pub(super) fn set_tainted_by_errors(&self, guar: ErrorGuaranteed) {
+        self.tainted_by_errors.set(Some(guar));
+    }
+
+    pub(super) fn dcx(&self) -> DiagCtxtHandle<'diag> {
+        self.tcx.dcx().taintable_handle(&self.tainted_by_errors)
     }
 
     pub(super) fn used_mut_upvars(
-        &mut self,
+        &self,
         nested_body_def_id: LocalDefId,
     ) -> &SmallVec<[FieldIdx; 8]> {
         &self.propagated_borrowck_results[&nested_body_def_id].used_mut_upvars
@@ -75,7 +90,7 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
         self,
     ) -> Result<&'tcx FxIndexMap<LocalDefId, ty::DefinitionSiteHiddenType<'tcx>>, ErrorGuaranteed>
     {
-        if let Some(guar) = self.tainted_by_errors {
+        if let Some(guar) = self.tainted_by_errors.get() {
             Err(guar)
         } else {
             Ok(self.tcx.arena.alloc(self.hidden_types))
@@ -84,22 +99,31 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
 
     fn handle_opaque_type_uses(&mut self) {
         let mut per_body_info = Vec::new();
-        for input in self.collect_region_constraints_results.values_mut() {
+        for (def_id, input) in &mut self.collect_region_constraints_results {
             let (num_entries, opaque_types) = clone_and_resolve_opaque_types(
                 &input.infcx,
                 &input.universal_region_relations,
                 &mut input.constraints,
             );
             input.deferred_opaque_type_errors = compute_definition_site_hidden_types(
+                *def_id,
                 &input.infcx,
                 &input.universal_region_relations,
                 &input.constraints,
                 Rc::clone(&input.location_map),
                 &mut self.hidden_types,
+                &mut self.unconstrained_hidden_type_errors,
                 &opaque_types,
             );
             per_body_info.push((num_entries, opaque_types));
         }
+
+        handle_unconstrained_hidden_type_errors(
+            self.tcx,
+            &mut self.hidden_types,
+            &mut self.unconstrained_hidden_type_errors,
+            &mut self.collect_region_constraints_results,
+        );
 
         for (input, (opaque_types_storage_num_entries, opaque_types)) in
             self.collect_region_constraints_results.values_mut().zip(per_body_info)
@@ -141,7 +165,10 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
     /// which don't depend on opaque types. In this case they get removed from
     /// `collect_region_constraints_results` and the final result gets put into
     /// `propagated_borrowck_results`.
-    fn apply_closure_requirements_modulo_opaques(&mut self) {
+    fn apply_closure_requirements_modulo_opaques(
+        &mut self,
+        diags_buffer: &mut BorrowckDiagnosticsBuffer<'diag, 'tcx>,
+    ) {
         let mut closure_requirements_modulo_opaques = FxHashMap::default();
         // We need to `mem::take` both `self.collect_region_constraints_results` and
         // `input.deferred_closure_requirements` as we otherwise can't iterate over
@@ -199,7 +226,7 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
                 self.collect_region_constraints_results.insert(def_id, input);
             } else {
                 assert!(input.deferred_closure_requirements.is_empty());
-                let result = borrowck_check_region_constraints(self, input);
+                let result = borrowck_check_region_constraints(self, diags_buffer, input);
                 self.propagated_borrowck_results.insert(def_id, result);
             }
         }
@@ -254,14 +281,16 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
             self.collect_region_constraints_results.insert(def_id, result);
         }
 
+        let diags_buffer = &mut BorrowckDiagnosticsBuffer::default();
+
         // We now apply the closure requirements of nested bodies modulo
-        // regions. In case a body does not depend on opaque types, we
+        // opaques. In case a body does not depend on opaque types, we
         // eagerly check its region constraints and use the final closure
         // requirements.
         //
         // We eagerly finish borrowck for bodies which don't depend on
         // opaques.
-        self.apply_closure_requirements_modulo_opaques();
+        self.apply_closure_requirements_modulo_opaques(diags_buffer);
 
         // We handle opaque type uses for all bodies together.
         self.handle_opaque_type_uses();
@@ -287,8 +316,9 @@ impl<'tcx> BorrowCheckRootCtxt<'tcx> {
                 );
             }
 
-            let result = borrowck_check_region_constraints(self, input);
+            let result = borrowck_check_region_constraints(self, diags_buffer, input);
             self.propagated_borrowck_results.insert(def_id, result);
         }
+        diags_buffer.emit_errors();
     }
 }

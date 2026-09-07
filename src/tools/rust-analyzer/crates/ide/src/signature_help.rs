@@ -31,7 +31,7 @@ use crate::RootDatabase;
 /// edited.
 #[derive(Debug)]
 pub struct SignatureHelp {
-    pub doc: Option<Documentation>,
+    pub doc: Option<Documentation<'static>>,
     pub signature: String,
     pub active_parameter: Option<usize>,
     parameters: Vec<TextRange>,
@@ -84,8 +84,7 @@ pub(crate) fn signature_help(
         // this prevents us from leaving the CallExpression
         .and_then(|tok| algo::skip_trivia_token(tok, Direction::Prev))?;
     let token = sema.descend_into_macros_single_exact(token);
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
+    let edition = sema.attach_first_edition(file_id).edition(db);
     let display_target = sema.first_crate(file_id)?.to_display_target(db);
 
     for node in token.parent_ancestors() {
@@ -174,9 +173,15 @@ fn signature_help_for_call(
     let mut fn_params = None;
     match callable.kind() {
         hir::CallableKind::Function(func) => {
-            res.doc = func.docs(db);
+            res.doc = func.docs(db).map(Documentation::into_owned);
+            if func.is_const(db) {
+                format_to!(res.signature, "const ");
+            }
             if func.is_async(db) {
                 format_to!(res.signature, "async ");
+            }
+            if func.is_unsafe(db) {
+                format_to!(res.signature, "unsafe ");
             }
             format_to!(res.signature, "fn {}", func.name(db).display(db, edition));
 
@@ -199,7 +204,7 @@ fn signature_help_for_call(
             });
         }
         hir::CallableKind::TupleStruct(strukt) => {
-            res.doc = strukt.docs(db);
+            res.doc = strukt.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "struct {}", strukt.name(db).display(db, edition));
 
             let generic_params = GenericDef::Adt(strukt.into())
@@ -212,7 +217,7 @@ fn signature_help_for_call(
             }
         }
         hir::CallableKind::TupleEnumVariant(variant) => {
-            res.doc = variant.docs(db);
+            res.doc = variant.docs(db).map(Documentation::into_owned);
             format_to!(
                 res.signature,
                 "enum {}",
@@ -269,12 +274,12 @@ fn signature_help_for_call(
             // In that case, fall back to render definitions of the respective parameters.
             // This is overly conservative: we do not substitute known type vars
             // (see FIXME in tests::impl_trait) and falling back on any unknowns.
-            hir::attach_db(db, || match (p.ty().contains_unknown(), fn_params.as_deref()) {
+            match (p.ty().contains_unknown(), fn_params.as_deref()) {
                 (true, Some(fn_params)) => {
                     format_to!(buf, "{}", fn_params[idx].ty().display(db, display_target))
                 }
                 _ => format_to!(buf, "{}", p.ty().display(db, display_target)),
-            });
+            }
             res.push_call_param(&buf);
         }
     }
@@ -320,33 +325,33 @@ fn signature_help_for_generics(
     let db = sema.db;
     match generics_def {
         hir::GenericDef::Function(it) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "fn {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Adt(hir::Adt::Enum(it)) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "enum {}", it.name(db).display(db, edition));
             if let Some(variant) = variant {
                 // In paths, generics of an enum can be specified *after* one of its variants.
                 // eg. `None::<u8>`
                 // We'll use the signature of the enum, but include the docs of the variant.
-                res.doc = variant.docs(db);
+                res.doc = variant.docs(db).map(Documentation::into_owned);
             }
         }
         hir::GenericDef::Adt(hir::Adt::Struct(it)) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "struct {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Adt(hir::Adt::Union(it)) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "union {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Trait(it) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "trait {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::TypeAlias(it) => {
-            res.doc = it.docs(db);
+            res.doc = it.docs(db).map(Documentation::into_owned);
             format_to!(res.signature, "type {}", it.name(db).display(db, edition));
         }
         // These don't have generic args that can be specified
@@ -382,8 +387,7 @@ fn signature_help_for_generics(
                 }
             }
             GenericParam::ConstParam(param) => {
-                if let Some(expr) = param.default(db, display_target).and_then(|konst| konst.expr())
-                {
+                if let Some(expr) = param.default(db, display_target) {
                     format_to!(buf, " = {}", expr);
                 }
             }
@@ -498,10 +502,10 @@ fn signature_help_for_tuple_struct_pat(
     };
     let db = sema.db;
 
-    let fields: Vec<_> = if let PathResolution::Def(ModuleDef::Variant(variant)) = path_res {
+    let fields: Vec<_> = if let PathResolution::Def(ModuleDef::EnumVariant(variant)) = path_res {
         let en = variant.parent_enum(db);
 
-        res.doc = en.docs(db);
+        res.doc = en.docs(db).map(Documentation::into_owned);
         format_to!(
             res.signature,
             "enum {}::{} (",
@@ -518,7 +522,7 @@ fn signature_help_for_tuple_struct_pat(
 
         match adt {
             hir::Adt::Struct(it) => {
-                res.doc = it.docs(db);
+                res.doc = it.docs(db).map(Documentation::into_owned);
                 format_to!(res.signature, "struct {} (", it.name(db).display(db, edition));
                 it.fields(db)
             }
@@ -531,7 +535,7 @@ fn signature_help_for_tuple_struct_pat(
         pat.syntax(),
         token,
         pat.fields(),
-        fields.into_iter().map(|it| it.ty(db).to_type(db)),
+        fields.into_iter().map(|it| it.ty(db)),
         display_target,
     ))
 }
@@ -624,11 +628,11 @@ fn signature_help_for_record_<'db>(
 
     let db = sema.db;
     let path_res = sema.resolve_path(path)?;
-    if let PathResolution::Def(ModuleDef::Variant(variant)) = path_res {
+    if let PathResolution::Def(ModuleDef::EnumVariant(variant)) = path_res {
         fields = variant.fields(db);
         let en = variant.parent_enum(db);
 
-        res.doc = en.docs(db);
+        res.doc = en.docs(db).map(Documentation::into_owned);
         format_to!(
             res.signature,
             "enum {}::{} {{ ",
@@ -645,12 +649,12 @@ fn signature_help_for_record_<'db>(
         match adt {
             hir::Adt::Struct(it) => {
                 fields = it.fields(db);
-                res.doc = it.docs(db);
+                res.doc = it.docs(db).map(Documentation::into_owned);
                 format_to!(res.signature, "struct {} {{ ", it.name(db).display(db, edition));
             }
             hir::Adt::Union(it) => {
                 fields = it.fields(db);
-                res.doc = it.docs(db);
+                res.doc = it.docs(db).map(Documentation::into_owned);
                 format_to!(res.signature, "union {} {{ ", it.name(db).display(db, edition));
             }
             _ => return None,
@@ -746,12 +750,12 @@ mod tests {
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (RootDatabase, FilePosition) {
         let mut database = RootDatabase::default();
-        let change_fixture = ChangeFixture::parse(&database, ra_fixture);
+        let change_fixture = ChangeFixture::parse(ra_fixture);
         database.apply_change(change_fixture.change);
         let (file_id, range_or_offset) =
             change_fixture.file_position.expect("expected a marker ($0)");
         let offset = range_or_offset.expect_offset();
-        let position = FilePosition { file_id: file_id.file_id(&database), offset };
+        let position = FilePosition { file_id: file_id.file_id(), offset };
         (database, position)
     }
 
@@ -2663,6 +2667,78 @@ fn main() {
             expect![[r#"
                 async fn conn_mut<F: FnOnce() -> T, T>(f: F) -> Result<T, i32>
                                                        ^^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_const_function() {
+        check(
+            r#"
+//- minicore: sized, fn
+pub const fn foo(x: u32, y: u32) -> u32 { x + y }
+
+fn main() {
+    foo($0)
+}
+            "#,
+            expect![[r#"
+                const fn foo(x: u32, y: u32) -> u32
+                             ^^^^^^  ------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_unsafe_function() {
+        check(
+            r#"
+//- minicore: sized, fn
+pub unsafe fn foo(x: u32, y: u32) -> u32 { x + y }
+
+fn main() {
+    unsafe { foo($0) }
+}
+            "#,
+            expect![[r#"
+                unsafe fn foo(x: u32, y: u32) -> u32
+                              ^^^^^^  ------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_const_unsafe_function() {
+        check(
+            r#"
+//- minicore: sized, fn
+pub const unsafe fn foo(x: u32, y: u32) -> u32 { x + y }
+
+fn main() {
+    unsafe { foo($0) }
+}
+            "#,
+            expect![[r#"
+                const unsafe fn foo(x: u32, y: u32) -> u32
+                                    ^^^^^^  ------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_async_unsafe_function() {
+        check(
+            r#"
+//- minicore: sized, fn, future
+pub async unsafe fn foo(x: u32, y: u32) -> u32 { x + y }
+
+fn main() {
+    unsafe { foo($0) }
+}
+            "#,
+            expect![[r#"
+                async unsafe fn foo(x: u32, y: u32) -> u32
+                                    ^^^^^^  ------
             "#]],
         );
     }

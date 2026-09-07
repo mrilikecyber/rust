@@ -1,9 +1,6 @@
 //! Print diagnostics to explain why values are borrowed.
 
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use rustc_errors::{Applicability, Diag, EmissionGuarantee};
 use rustc_hir as hir;
@@ -15,7 +12,7 @@ use rustc_middle::mir::{
     Operand, Place, Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{self, RegionVid, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{DesugaringKind, Span, kw, sym};
 use rustc_trait_selection::error_reporting::traits::FindExprBySpan;
 use rustc_trait_selection::error_reporting::traits::call_kind::CallKind;
@@ -25,7 +22,7 @@ use super::{RegionName, UseSpans, find_use};
 use crate::borrow_set::BorrowData;
 use crate::constraints::OutlivesConstraint;
 use crate::nll::ConstraintDescription;
-use crate::region_infer::{BlameConstraint, Cause};
+use crate::region_infer::{BestBlame, Cause};
 use crate::{MirBorrowckCtxt, WriteKind};
 
 #[derive(Debug)]
@@ -38,12 +35,9 @@ pub(crate) enum BorrowExplanation<'tcx> {
         should_note_order: bool,
     },
     MustBeValidFor {
-        category: ConstraintCategory<'tcx>,
-        from_closure: bool,
-        span: Span,
+        best_blame: BestBlame<'tcx>,
         region_name: RegionName,
         opt_place_desc: Option<String>,
-        path: Vec<OutlivesConstraint<'tcx>>,
     },
     Unexplained,
 }
@@ -379,13 +373,13 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 }
             }
             BorrowExplanation::MustBeValidFor {
-                category,
-                span,
+                ref best_blame,
                 ref region_name,
                 ref opt_place_desc,
-                from_closure: _,
-                ref path,
             } => {
+                let OutlivesConstraint { category, span, .. } = *best_blame.constraint();
+                let path = best_blame.path();
+
                 region_name.highlight_region_name(err);
 
                 if let Some(desc) = opt_place_desc {
@@ -406,10 +400,11 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     );
                 };
 
-                cx.add_placeholder_from_predicate_note(err, &path);
-                cx.add_sized_or_copy_bound_info(err, category, &path);
+                cx.add_placeholder_from_predicate_note(err, path);
+                cx.add_sized_or_copy_bound_info(err, category, path);
 
                 if let ConstraintCategory::Cast {
+                    is_raw_ptr_dyn_type_cast: _,
                     is_implicit_coercion: true,
                     unsize_to: Some(unsize_ty),
                 } = category
@@ -576,24 +571,6 @@ fn suggest_rewrite_if_let<G: EmissionGuarantee>(
 }
 
 impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
-    fn free_region_constraint_info(
-        &self,
-        borrow_region: RegionVid,
-        outlived_region: RegionVid,
-    ) -> (ConstraintCategory<'tcx>, bool, Span, Option<RegionName>, Vec<OutlivesConstraint<'tcx>>)
-    {
-        let (blame_constraint, path) = self.regioncx.best_blame_constraint(
-            borrow_region,
-            NllRegionVariableOrigin::FreeRegion,
-            outlived_region,
-        );
-        let BlameConstraint { category, from_closure, cause, .. } = blame_constraint;
-
-        let outlived_fr_name = self.give_region_a_name(outlived_region);
-
-        (category, from_closure, cause.span, outlived_fr_name, path)
-    }
-
     /// Returns structured explanation for *why* the borrow contains the
     /// point from `location`. This is key for the "3-point errors"
     /// [described in the NLL RFC][d].
@@ -652,8 +629,8 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // We want to focus on relevant live locals in diagnostics, so when polonius is enabled, we
         // ensure that we don't emit live boring locals as explanations.
         let is_local_boring = |local| {
-            if let Some(polonius_diagnostics) = self.polonius_diagnostics {
-                polonius_diagnostics.boring_nll_locals.contains(&local)
+            if let Some(polonius_context) = self.polonius_context {
+                polonius_context.boring_nll_locals.contains(&local)
             } else {
                 assert!(!tcx.sess.opts.unstable_opts.polonius.is_next_enabled());
 
@@ -708,18 +685,19 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
             Some(Cause::LiveVar(..) | Cause::DropVar(..)) | None => {
                 // Here, under NLL: no cause was found. Under polonius: no cause was found, or a
                 // boring local was found, which we ignore like NLLs do to match its diagnostics.
-                if let Some(region) = self.to_error_region_vid(borrow_region_vid) {
-                    let (category, from_closure, span, region_name, path) =
-                        self.free_region_constraint_info(borrow_region_vid, region);
-                    if let Some(region_name) = region_name {
+                if let Some(region) = self.regioncx.to_error_region_vid(borrow_region_vid) {
+                    let best_blame = self.regioncx.best_blame_constraint(
+                        borrow_region_vid,
+                        NllRegionVariableOrigin::FreeRegion,
+                        region,
+                    );
+
+                    if let Some(region_name) = self.give_region_a_name(region) {
                         let opt_place_desc = self.describe_place(borrow.borrowed_place.as_ref());
                         BorrowExplanation::MustBeValidFor {
-                            category,
-                            from_closure,
-                            span,
+                            best_blame,
                             region_name,
                             opt_place_desc,
-                            path,
                         }
                     } else {
                         debug!("Could not generate a region name");
@@ -763,6 +741,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 {
                     // Just point to the function, to reduce the chance of overlapping spans.
                     let function_span = match func {
+                        Operand::RuntimeChecks(_) => span,
                         Operand::Constant(c) => c.span,
                         Operand::Copy(place) | Operand::Move(place) => {
                             if let Some(l) = place.as_local() {
@@ -788,7 +767,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 let block = &self.body.basic_blocks[location.block];
 
                 let kind = if let Some(&Statement {
-                    kind: StatementKind::FakeRead(box (FakeReadCause::ForLet(_), place)),
+                    kind: StatementKind::FakeRead((FakeReadCause::ForLet(_), place)),
                     ..
                 }) = block.statements.get(location.statement_index)
                 {
@@ -808,6 +787,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     {
                         // Just point to the function, to reduce the chance of overlapping spans.
                         let function_span = match func {
+                            Operand::RuntimeChecks(_) => span,
                             Operand::Constant(c) => c.span,
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(l) = place.as_local() {
@@ -849,16 +829,10 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // will only ever have one item at any given time, but by using a vector, we can pop from
         // it which simplifies the termination logic.
         let mut queue = vec![location];
-        let mut target =
-            if let Some(Statement { kind: StatementKind::Assign(box (place, _)), .. }) = stmt {
-                if let Some(local) = place.as_local() {
-                    local
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            };
+        let Some(Statement { kind: StatementKind::Assign((place, _)), .. }) = stmt else {
+            return false;
+        };
+        let Some(mut target) = place.as_local() else { return false };
 
         debug!("was_captured_by_trait: target={:?} queue={:?}", target, queue);
         while let Some(current_location) = queue.pop() {
@@ -871,7 +845,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 debug!("was_captured_by_trait_object: stmt={:?}", stmt);
 
                 // The only kind of statement that we care about is assignments...
-                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
                     let Some(into) = place.local_or_deref_local() else {
                         // Continue at the next location.
                         queue.push(current_location.successor_within_block());
@@ -881,7 +855,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     match rvalue {
                         // If we see a use, we should check whether it is our data, and if so
                         // update the place that we're looking for to that new place.
-                        Rvalue::Use(operand) => match operand {
+                        Rvalue::Use(operand, _) => match operand {
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(from) = place.as_local() {
                                     if from == target {

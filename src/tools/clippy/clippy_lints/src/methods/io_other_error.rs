@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::{MaybeDef, MaybeQPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _};
 use clippy_utils::{expr_or_init, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, QPath};
@@ -24,7 +24,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, path: &Expr<'_>, args
             expr.span,
             "this can be `std::io::Error::other(_)`",
             |diag| {
-                diag.multipart_suggestion_verbose(
+                diag.multipart_suggestion(
                     "use `std::io::Error::other`",
                     vec![
                         (new_segment.ident.span, "other".to_owned()),

@@ -5,11 +5,11 @@ use crate::{db::HirDatabase, setup_tracing, test_db::TestDB};
 fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let _tracing = setup_tracing();
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    crate::attach_db(&db, || {
+    crate::attach_db(db.as_dyn(), || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
-        let scope = &def_map[module_id.local_id].scope;
+        let scope = &def_map[module_id].scope;
         let funcs = scope.declarations().filter_map(|x| match x {
             hir_def::ModuleDefId::FunctionId(it) => Some(it),
             _ => None,
@@ -47,5 +47,21 @@ fn foo() {
     (|deserializer| Box::new(())) as DeserializeFn<<dyn CustomValue as Strictest>::Object>;
 }
     "#,
+    );
+}
+
+#[test]
+fn ref_pattern_on_unresolved_alias() {
+    lower_mir(
+        r#"
+//- minicore: sized
+trait Tr {
+    type A;
+}
+
+fn f<T: Tr>(x: T::A) {
+    let &() = x;
+}
+"#,
     );
 }

@@ -1,10 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::snippet_with_context;
 use rustc_errors::Applicability;
 use rustc_hir::{BorrowKind, Expr, ExprKind, Mutability, UnOp};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::{Span, SyntaxContext, sym};
 
 declare_clippy_lint! {
@@ -36,6 +35,7 @@ declare_clippy_lint! {
     suspicious,
     "call to `mem::swap` using pointer derived references"
 }
+
 declare_lint_pass!(SwapPtrToRef => [SWAP_PTR_TO_REF]);
 
 impl LateLintPass<'_> for SwapPtrToRef {

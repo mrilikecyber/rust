@@ -27,7 +27,7 @@ declare global {
         /** Make the current theme easy to find */
         currentTheme: HTMLLinkElement|null;
         /** Generated in `render/context.rs` */
-        SIDEBAR_ITEMS?: { [key: string]: string[] };
+        SIDEBAR_ITEMS?: { [key: string]: Array<string | string[]> };
         /** Notable trait data */
         NOTABLE_TRAITS?: { [key: string]: string };
         CURRENT_TOOLTIP_ELEMENT?: HTMLElement & { TOOLTIP_BASE: HTMLElement };
@@ -137,6 +137,8 @@ declare namespace rustdoc {
         loadDesc: function({descShard: SearchDescShard, descIndex: number}): Promise<string|null>;
         loadedDescShard: function(string, number, string);
         isDisplayed: function(): boolean;
+        searchLoaded: boolean;
+        loadSearch: function();
     }
 
     interface SearchDescShard {
@@ -148,7 +150,7 @@ declare namespace rustdoc {
 
     /**
      * A single parsed "atom" in a search query. For example,
-     * 
+     *
      *     std::fmt::Formatter, Write -> Result<()>
      *     ┏━━━━━━━━━━━━━━━━━━  ┌────    ┏━━━━━┅┅┅┅┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
      *     ┃                    │        ┗ QueryElement {          ┊
@@ -243,7 +245,29 @@ declare namespace rustdoc {
         parent: number?,
         traitParent: number?,
         deprecated: boolean,
-        associatedItemDisambiguator: string?,
+        unstable: boolean,
+        associatedItemDisambiguatorOrExternCrateUrl: string?,
+        /**
+         * If `true`, this item is a `macro_rules!` macro that supports
+         * multiple usage syntaxes, as described in RFC 3697 and 3698.
+         * The syntax for such a macro looks like this:
+         *
+         * ```rust
+         * /// Doc Comment.
+         * macro_rules! NAME {
+         *     attr(key = $value:literal) ($attached:item) => { ... };
+         *     derive() ($attached:item) => { ... };
+         *     ($bang:tt) => { ... };
+         *  }
+         * ```
+         *
+         * Each usage syntax gets a separate EntryData---one for the attr,
+         * one for the derive, and one for the bang syntax---with a corresponding
+         * `ty` field that can be used for filtering and presenting results.
+         * But the documentation lives in a single `macro.NAME.html` page, and
+         * this boolean flag is used for generating that HREF.
+         */
+        forceMacroHref: boolean,
     }
 
     /**
@@ -292,6 +316,7 @@ declare namespace rustdoc {
         path: PathData?,
         functionData: FunctionData?,
         deprecated: boolean,
+        unstable: boolean,
         parent: RowParent,
         traitParent: RowParent,
     }
@@ -300,7 +325,7 @@ declare namespace rustdoc {
 
     type ItemType = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
         11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
-        21 | 22 | 23 | 24 | 25 | 26;
+        21 | 22 | 23 | 24 | 25 | 26 | 28 | 29;
 
     /**
      * The viewmodel for the search engine results page.
@@ -488,10 +513,10 @@ declare namespace rustdoc {
 
     /**
      * A decoded function type, made from real objects.
-     * `ty` will be negative for generics, positive for types, and 0 for placeholders.
+     * `ty` will be negative for generics, positive for types, and `null` for placeholders (zero is not used).
      */
     interface FunctionType {
-        id: null|number,
+        id: number|null,
         ty: ItemType,
         name: string|null,
         path: string|null,
@@ -520,11 +545,12 @@ declare namespace rustdoc {
      * Provided by generated `trait.impl` files.
      */
     type Implementors = {
-        [key: string]: Array<[string, number, Array<string>]>
+        [key: string]: Array<[string, 0|1, number, Array<string>]>
     }
 
     type TypeImpls = {
-        [cratename: string]: Array<Array<string|0>>
+        /* [text, traitName (0 if not a trait), ...types] */
+        [cratename: string]: Array<[string, string|0, ...string[]]>
     }
 
     /**
@@ -576,4 +602,16 @@ declare namespace rustdoc {
         "typeNameIdOfHof": number,
         "typeNameIdOfNever": number,
     };
+
+    type VarName = "name"
+        | "root-path"
+        | "static-root-path"
+        | "current-crate"
+        | "themes"
+        | "resource-suffix"
+        | "rustdoc-version"
+        | "channel"
+        | "search-js"
+        | "stringdex-js"
+        | "settings-js";
 }

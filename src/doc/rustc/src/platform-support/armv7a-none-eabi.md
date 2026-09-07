@@ -1,10 +1,13 @@
-# `armv7a-none-eabi` and `armv7a-none-eabihf`
+# `armv7a-none-eabi*` and `thumbv7a-none-eabi*`
 
 * **Tier: 2**
 * **Library Support:** core and alloc (bare-metal, `#![no_std]`)
 
-Bare-metal target for CPUs in the Armv7-A architecture family, supporting
-dual ARM/Thumb mode, with ARM mode as the default.
+Bare-metal target for CPUs in the Armv7-A architecture family, supporting dual
+ARM/Thumb mode. The `armv7a-none-eabi*` targets use Arm mode by default and the
+`thumbv7a-none-eabi` targets use Thumb mode by default. The `-eabi` targets use
+a soft-float ABI and do not require an FPU, while the `-eabihf` targets use a
+hard-float ABI and do require an FPU.
 
 Note, this is for processors running in AArch32 mode. For the AArch64 mode
 added in Armv8-A, see [`aarch64-unknown-none`](aarch64-unknown-none.md) instead.
@@ -19,7 +22,8 @@ See [`arm-none-eabi`](arm-none-eabi.md) for information applicable to all
 ## Target maintainers
 
 - [Rust Embedded Devices Working Group Arm Team]
-- [@rust-lang/arm-maintainers][arm_maintainers] ([rust@arm.com][arm_email])
+- [arm-maintainers][arm_maintainers] ([rust@arm.com][arm_email])
+    - Use `@rustbot ping arm-maintainers` to ping us
 
 [Rust Embedded Devices Working Group Arm Team]: https://github.com/rust-embedded/wg?tab=readme-ov-file#the-arm-team
 [arm_maintainers]: https://github.com/rust-lang/team/blob/master/teams/arm-maintainers.toml
@@ -63,10 +67,10 @@ and disable them via `.cargo/config.toml` file.
 
 ## Start-up and Low-Level Code
 
-The [Rust Embedded Devices Working Group Arm Team] maintain the [`cortex-ar`]
-and [`cortex-a-rt`] crates, which may be useful for writing bare-metal code
-using this target. The [`cortex-ar` repository](https://github.com/rust-embedded/cortex-ar)
-includes several examples which run in QEMU and build using these targets.
+The [Rust Embedded Devices Working Group Arm Team] maintain the [`aarch32-cpu`]
+and [`aarch32-rt`] crates, which may be useful for writing bare-metal code
+using this target. Those crates include several examples which run in QEMU and
+build using these targets.
 
-[`cortex-ar`]: https://docs.rs/cortex-ar
-[`cortex-a-rt`]: https://docs.rs/cortex-a-rt
+[`aarch32-cpu`]: https://docs.rs/aarch32-cpu
+[`aarch32-rt`]: https://docs.rs/aarch32-rt

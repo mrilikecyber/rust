@@ -6,20 +6,18 @@ use rustc_ast::{
     Pinnedness, PolyTraitRef, PreciseCapturingArg, TraitBoundModifiers, TraitObjectSyntax, Ty,
     TyKind, UnsafeBinderTy,
 };
-use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_errors::{Applicability, Diag, PResult};
+use rustc_errors::{Applicability, Diag, E0516, PResult};
 use rustc_span::{ErrorGuaranteed, Ident, Span, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use super::{Parser, PathStyle, SeqSep, TokenType, Trailing};
-use crate::errors::{
+use crate::diagnostics::{
     self, AttributeOnEmptyType, AttributeOnType, DynAfterMut, ExpectedFnPathFoundFnKeyword,
     ExpectedMutOrConstInRawPointerType, FnPtrWithGenerics, FnPtrWithGenericsSugg,
     HelpUseLatestEdition, InvalidCVariadicType, InvalidDynKeyword, LifetimeAfterMut,
     NeedPlusAfterTraitObjectLifetime, NestedCVariadicType, ReturnTypesUseThinArrow,
 };
-use crate::parser::item::FrontMatterParsingMode;
-use crate::parser::{FnContext, FnParseMode};
+use crate::parser::{FnContext, FnParseMode, FrontMatterParsingMode};
 use crate::{exp, maybe_recover_from_interpolated_ty_qpath};
 
 /// Signals whether parsing a type should allow `+`.
@@ -114,17 +112,14 @@ impl<'a> Parser<'a> {
             let kind = TyKind::Err(self.dcx().emit_err(InvalidCVariadicType { span }));
             return Ok(self.mk_ty(span, kind));
         }
-        // Make sure deeply nested types don't overflow the stack.
-        ensure_sufficient_stack(|| {
-            self.parse_ty_common(
-                AllowPlus::Yes,
-                AllowCVariadic::No,
-                RecoverQPath::Yes,
-                RecoverReturnSign::Yes,
-                None,
-                RecoverQuestionMark::Yes,
-            )
-        })
+        self.parse_ty_common(
+            AllowPlus::Yes,
+            AllowCVariadic::No,
+            RecoverQPath::Yes,
+            RecoverReturnSign::Yes,
+            None,
+            RecoverQuestionMark::Yes,
+        )
     }
 
     pub(super) fn parse_ty_with_generics_recovery(
@@ -328,7 +323,9 @@ impl<'a> Parser<'a> {
             self.expect_and()?;
             self.parse_borrowed_pointee()?
         } else if self.eat_keyword_noexpect(kw::Typeof) {
-            self.parse_typeof_ty()?
+            self.parse_typeof_ty(lo)?
+        } else if self.is_builtin() {
+            self.parse_builtin_ty()?
         } else if self.eat_keyword(exp!(Underscore)) {
             // A type to be inferred `_`
             TyKind::Infer
@@ -363,10 +360,10 @@ impl<'a> Parser<'a> {
                         parse_plus,
                         ast::Parens::No,
                     )?;
-                    let err = self.dcx().create_err(errors::TransposeDynOrImpl {
+                    let err = self.dcx().create_err(diagnostics::TransposeDynOrImpl {
                         span: kw.span,
                         kw: kw.name.as_str(),
-                        sugg: errors::TransposeDynOrImplSugg {
+                        sugg: diagnostics::TransposeDynOrImplSugg {
                             removal_span,
                             insertion_span: lo.shrink_to_lo(),
                             kw: kw.name.as_str(),
@@ -574,7 +571,7 @@ impl<'a> Parser<'a> {
             lo.to(self.prev_token.span),
             parens,
         );
-        let bounds = vec![GenericBound::Trait(poly_trait_ref)];
+        let bounds = thin_vec![GenericBound::Trait(poly_trait_ref)];
         self.parse_remaining_bounds(bounds, parse_plus)
     }
 
@@ -594,7 +591,7 @@ impl<'a> Parser<'a> {
     /// Parses a raw pointer with a C-style typo
     fn parse_ty_c_style_pointer(&mut self) -> PResult<'a, TyKind> {
         let kw_span = self.token.span;
-        let mutbl = self.parse_const_or_mut();
+        let mutbl = self.parse_mut_or_const();
 
         if let Some(mutbl) = mutbl
             && self.eat(exp!(Star))
@@ -628,7 +625,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a raw pointer type: `*[const | mut] $type`.
     fn parse_ty_ptr(&mut self) -> PResult<'a, TyKind> {
-        let mutbl = self.parse_const_or_mut().unwrap_or_else(|| {
+        let mutbl = self.parse_mut_or_const().unwrap_or_else(|| {
             let span = self.prev_token.span;
             self.dcx().emit_err(ExpectedMutOrConstInRawPointerType {
                 span,
@@ -659,6 +656,7 @@ impl<'a> Parser<'a> {
 
         let ty = if self.eat(exp!(Semi)) {
             let mut length = self.parse_expr_anon_const()?;
+
             if let Err(e) = self.expect(exp!(CloseBracket)) {
                 // Try to recover from `X<Y, ...>` when `X::<Y, ...>` works
                 self.check_mistyped_turbofish_with_multiple_type_params(e, &mut length.value)?;
@@ -699,6 +697,7 @@ impl<'a> Parser<'a> {
         _ = self.eat(exp!(Comma)) || self.eat(exp!(Colon)) || self.eat(exp!(Star));
         let suggestion_span = self.prev_token.span.with_lo(hi);
 
+        // FIXME(mgca): recovery is broken for `const {` args
         // we first try to parse pattern like `[u8 5]`
         let length = match self.parse_expr_anon_const() {
             Ok(length) => length,
@@ -770,27 +769,82 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses `pin` and `mut` annotations on references, patterns, or borrow modifiers.
+    /// Parse nothing, mutability or `pin` followed by "explicit" mutability.
     ///
-    /// It must be either `pin const`, `pin mut`, `mut`, or nothing (immutable).
+    /// ```ebnf
+    /// PinAndMut = "pin" MutOrConst | "mut"
+    /// ```
     pub(crate) fn parse_pin_and_mut(&mut self) -> (Pinnedness, Mutability) {
-        if self.token.is_ident_named(sym::pin) && self.look_ahead(1, Token::is_mutability) {
+        if self.token.is_keyword(kw::Pin) && self.look_ahead(1, Token::is_mutability) {
             self.psess.gated_spans.gate(sym::pin_ergonomics, self.token.span);
             assert!(self.eat_keyword(exp!(Pin)));
-            let mutbl = self.parse_const_or_mut().unwrap();
+            let mutbl = self.parse_mut_or_const().unwrap();
             (Pinnedness::Pinned, mutbl)
         } else {
             (Pinnedness::Not, self.parse_mutability())
         }
     }
 
-    // Parses the `typeof(EXPR)`.
-    // To avoid ambiguity, the type is surrounded by parentheses.
-    fn parse_typeof_ty(&mut self) -> PResult<'a, TyKind> {
+    /// Parses the `typeof(EXPR)` for better diagnostics before returning
+    /// an error type.
+    fn parse_typeof_ty(&mut self, lo: Span) -> PResult<'a, TyKind> {
         self.expect(exp!(OpenParen))?;
-        let expr = self.parse_expr_anon_const()?;
+        let _expr = self.parse_expr_anon_const()?;
         self.expect(exp!(CloseParen))?;
-        Ok(TyKind::Typeof(expr))
+        let span = lo.to(self.prev_token.span);
+        let guar = self
+            .dcx()
+            .struct_span_err(span, "`typeof` is a reserved keyword but unimplemented")
+            .with_note("consider replacing `typeof(...)` with an actual type")
+            .with_code(E0516)
+            .emit();
+        Ok(TyKind::Err(guar))
+    }
+
+    fn parse_builtin_ty(&mut self) -> PResult<'a, TyKind> {
+        self.parse_builtin(|this, lo, ident| {
+            Ok(match ident.name {
+                sym::field_of => Some(this.parse_ty_field_of(lo)?),
+                _ => None,
+            })
+        })
+    }
+
+    pub(crate) fn parse_ty_field_of(&mut self, _lo: Span) -> PResult<'a, TyKind> {
+        let container = self.parse_ty()?;
+        self.expect(exp!(Comma))?;
+
+        let fields = self.parse_floating_field_access()?;
+        let trailing_comma = self.eat_noexpect(&TokenKind::Comma);
+
+        if let Err(mut e) = self.expect_one_of(&[], &[exp!(CloseParen)]) {
+            if trailing_comma {
+                e.note("unexpected third argument to field_of");
+            } else {
+                e.note("field_of expects dot-separated field and variant names");
+            }
+            e.emit();
+        }
+
+        // Eat tokens until the macro call ends.
+        if self.may_recover() {
+            while !self.token.kind.is_close_delim_or_eof() {
+                self.bump();
+            }
+        }
+
+        match *fields {
+            [] => Err(self.dcx().struct_span_err(
+                self.token.span,
+                "`field_of!` expects dot-separated field and variant names",
+            )),
+            [field] => Ok(TyKind::FieldOf(container, None, field)),
+            [variant, field] => Ok(TyKind::FieldOf(container, Some(variant), field)),
+            _ => Err(self.dcx().struct_span_err(
+                fields.iter().map(|f| f.span).collect::<Vec<_>>(),
+                "`field_of!` only supports a single field or a variant with a field",
+            )),
+        }
     }
 
     /// Parses a function pointer type (`TyKind::FnPtr`).
@@ -812,7 +866,6 @@ impl<'a> Parser<'a> {
         let inherited_vis = rustc_ast::Visibility {
             span: rustc_span::DUMMY_SP,
             kind: rustc_ast::VisibilityKind::Inherited,
-            tokens: None,
         };
         let span_start = self.token.span;
         let ast::FnHeader { ext, safety, .. } = self.parse_fn_front_matter(
@@ -823,9 +876,9 @@ impl<'a> Parser<'a> {
         if self.may_recover() && self.token == TokenKind::Lt {
             self.recover_fn_ptr_with_generics(lo, &mut params, param_insertion_point)?;
         }
-        let mode = crate::parser::item::FnParseMode {
+        let mode = crate::parser::FnParseMode {
             req_name: |_, _| false,
-            context: FnContext::Free,
+            context: FnContext::FunctionPtrType,
             req_body: false,
         };
         let decl = self.parse_fn_decl(&mode, AllowPlus::No, recover_return_sign)?;
@@ -889,7 +942,7 @@ impl<'a> Parser<'a> {
                 if let token::Ident(sym, _) = t.kind {
                     // parse pattern with "'a Sized" we're supposed to give suggestion like
                     // "'a + Sized"
-                    self.dcx().emit_err(errors::MissingPlusBounds {
+                    self.dcx().emit_err(diagnostics::MissingPlusBounds {
                         span: self.token.span,
                         hi: self.token.span.shrink_to_hi(),
                         sym,
@@ -1002,7 +1055,7 @@ impl<'a> Parser<'a> {
     /// Only if `allow_plus` this parses a `+`-separated list of bounds (trailing `+` is admitted).
     /// Otherwise, this only parses a single bound or none.
     fn parse_generic_bounds_common(&mut self, allow_plus: AllowPlus) -> PResult<'a, GenericBounds> {
-        let mut bounds = Vec::new();
+        let mut bounds = ThinVec::new();
 
         // In addition to looping while we find generic bounds:
         // We continue even if we find a keyword. This is necessary for error recovery on,
@@ -1014,7 +1067,7 @@ impl<'a> Parser<'a> {
                 && (self.token.can_begin_type()
                     || (self.token.is_reserved_ident() && !self.token.is_keyword(kw::Where))))
         {
-            if self.token.is_keyword(kw::Dyn) {
+            if self.token.is_keyword(kw::Dyn) && self.token.span.edition().at_least_rust_2018() {
                 // Account for `&dyn Trait + dyn Other`.
                 self.bump();
                 self.dcx().emit_err(InvalidDynKeyword {
@@ -1033,6 +1086,10 @@ impl<'a> Parser<'a> {
 
     /// Can the current token begin a bound?
     fn can_begin_bound(&mut self) -> bool {
+        // NOTE: Tokens `!`, `~`, `const` & `async` which represent the start of currently unstable
+        //       trait bound modifiers are intentionally not included in `Token::can_begin_type` to
+        //       avoid affecting stable macro matching behavior.
+
         self.check_path()
             || self.check_lifetime()
             || self.check(exp!(Bang))
@@ -1115,9 +1172,10 @@ impl<'a> Parser<'a> {
         match constness {
             BoundConstness::Never => {}
             BoundConstness::Always(span) | BoundConstness::Maybe(span) => {
-                return self
-                    .dcx()
-                    .emit_err(errors::ModifierLifetime { span, modifier: constness.as_str() });
+                return self.dcx().emit_err(diagnostics::ModifierLifetime {
+                    span,
+                    modifier: constness.as_str(),
+                });
             }
         }
 
@@ -1126,21 +1184,24 @@ impl<'a> Parser<'a> {
             BoundPolarity::Negative(span) | BoundPolarity::Maybe(span) => {
                 return self
                     .dcx()
-                    .emit_err(errors::ModifierLifetime { span, modifier: polarity.as_str() });
+                    .emit_err(diagnostics::ModifierLifetime { span, modifier: polarity.as_str() });
             }
         }
 
         match asyncness {
             BoundAsyncness::Normal => {}
             BoundAsyncness::Async(span) => {
-                return self
-                    .dcx()
-                    .emit_err(errors::ModifierLifetime { span, modifier: asyncness.as_str() });
+                return self.dcx().emit_err(diagnostics::ModifierLifetime {
+                    span,
+                    modifier: asyncness.as_str(),
+                });
             }
         }
 
         if let Some(span) = binder_span {
-            return self.dcx().emit_err(errors::ModifierLifetime { span, modifier: "for<...>" });
+            return self
+                .dcx()
+                .emit_err(diagnostics::ModifierLifetime { span, modifier: "for<...>" });
         }
 
         unreachable!("lifetime bound intercepted in `parse_generic_ty_bound` but no modifiers?")
@@ -1171,7 +1232,7 @@ impl<'a> Parser<'a> {
             && self.is_kw_followed_by_ident(kw::Async)
         {
             self.bump(); // eat `async`
-            self.dcx().emit_err(errors::AsyncBoundModifierIn2015 {
+            self.dcx().emit_err(diagnostics::AsyncBoundModifierIn2015 {
                 span: self.prev_token.span,
                 help: HelpUseLatestEdition::new(),
             });
@@ -1207,7 +1268,7 @@ impl<'a> Parser<'a> {
                         let glue =
                             if !constness.is_empty() && !asyncness.is_empty() { " " } else { "" };
                         let modifiers_concatenated = format!("{constness}{glue}{asyncness}");
-                        self.dcx().emit_err(errors::PolarityAndModifiers {
+                        self.dcx().emit_err(diagnostics::PolarityAndModifiers {
                             polarity_span,
                             polarity: polarity.as_str(),
                             modifiers_span: modifier_lo.to(modifier_hi),
@@ -1269,7 +1330,7 @@ impl<'a> Parser<'a> {
         if let Some(binder_span) = binder_span {
             match modifiers.polarity {
                 BoundPolarity::Negative(polarity_span) | BoundPolarity::Maybe(polarity_span) => {
-                    self.dcx().emit_err(errors::BinderAndPolarity {
+                    self.dcx().emit_err(diagnostics::BinderAndPolarity {
                         binder_span,
                         polarity_span,
                         polarity: modifiers.polarity.as_str(),
@@ -1288,7 +1349,7 @@ impl<'a> Parser<'a> {
 
         if let (more_bound_vars, Some(binder_span)) = self.parse_higher_ranked_binder()? {
             bound_vars.extend(more_bound_vars);
-            self.dcx().emit_err(errors::BinderBeforeModifiers { binder_span, modifiers_span });
+            self.dcx().emit_err(diagnostics::BinderBeforeModifiers { binder_span, modifiers_span });
         }
 
         let mut path = if self.token.is_keyword(kw::Fn)
@@ -1354,12 +1415,12 @@ impl<'a> Parser<'a> {
             // Someone has written something like `&dyn (Trait + Other)`. The correct code
             // would be `&(dyn Trait + Other)`
             if self.token.is_like_plus() && leading_token.is_keyword(kw::Dyn) {
-                let bounds = vec![];
+                let bounds = thin_vec![];
                 self.parse_remaining_bounds(bounds, true)?;
                 self.expect(exp!(CloseParen))?;
-                self.dcx().emit_err(errors::IncorrectParensTraitBounds {
+                self.dcx().emit_err(diagnostics::IncorrectParensTraitBounds {
                     span: vec![lo, self.prev_token.span],
-                    sugg: errors::IncorrectParensTraitBoundsSugg {
+                    sugg: diagnostics::IncorrectParensTraitBoundsSugg {
                         wrong_span: leading_token.span.shrink_to_hi().to(lo),
                         new_span: leading_token.span.shrink_to_lo(),
                     },
@@ -1393,13 +1454,12 @@ impl<'a> Parser<'a> {
                         args: Some(Box::new(ast::GenericArgs::Parenthesized(
                             ast::ParenthesizedArgs {
                                 span: args_lo.to(self.prev_token.span),
-                                inputs: decl.inputs.iter().map(|a| a.ty.clone()).collect(),
+                                inputs: decl.inputs.iter().map(|a| a.clone()).collect(),
                                 inputs_span: args_lo.until(decl.output.span()),
                                 output: decl.output.clone(),
                             }
                         ))),
                     }],
-                    tokens: None,
                 })
             }
             Err(diag) => {
@@ -1470,14 +1530,43 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
+        let snapshot = if self.parsing_generics {
+            // The snapshot is only relevant if we're parsing the generics of an `fn` to avoid
+            // incorrect recovery.
+            Some(self.create_snapshot_for_diagnostic())
+        } else {
+            None
+        };
         // Parse `(T, U) -> R`.
         let inputs_lo = self.token.span;
         let mode =
             FnParseMode { req_name: |_, _| false, context: FnContext::Free, req_body: false };
-        let inputs: ThinVec<_> =
-            self.parse_fn_params(&mode)?.into_iter().map(|input| input.ty).collect();
+        let inputs = match self.parse_fn_params(&mode) {
+            Ok(params) => params,
+            Err(err) => {
+                if let Some(snapshot) = snapshot {
+                    self.restore_snapshot(snapshot);
+                    err.cancel();
+                    return Ok(());
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         let inputs_span = inputs_lo.to(self.prev_token.span);
-        let output = self.parse_ret_ty(AllowPlus::No, RecoverQPath::No, RecoverReturnSign::No)?;
+        let output = match self.parse_ret_ty(AllowPlus::No, RecoverQPath::No, RecoverReturnSign::No)
+        {
+            Ok(output) => output,
+            Err(err) => {
+                if let Some(snapshot) = snapshot {
+                    self.restore_snapshot(snapshot);
+                    err.cancel();
+                    return Ok(());
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         let args = ast::ParenthesizedArgs {
             span: fn_path_segment.span().to(self.prev_token.span),
             inputs,
@@ -1485,6 +1574,17 @@ impl<'a> Parser<'a> {
             output,
         }
         .into();
+
+        if let Some(snapshot) = snapshot
+            && ![token::Comma, token::Gt, token::Plus].contains(&self.token.kind)
+        {
+            // We would expect another bound or the end of type params by now. Most likely we've
+            // encountered a `(` *not* representing `Trait()`, but rather the start of the `fn`'s
+            // argument list where the generic param list wasn't properly closed.
+            self.restore_snapshot(snapshot);
+            return Ok(());
+        }
+
         *fn_path_segment = ast::PathSegment {
             ident: fn_path_segment.ident,
             args: Some(args),
@@ -1498,7 +1598,7 @@ impl<'a> Parser<'a> {
                 id: lt.id,
                 ident: lt.ident,
                 attrs: ast::AttrVec::new(),
-                bounds: Vec::new(),
+                bounds: ThinVec::new(),
                 is_placeholder: false,
                 kind: ast::GenericParamKind::Lifetime,
                 colon_span: None,
@@ -1531,10 +1631,8 @@ impl<'a> Parser<'a> {
     /// Parses a single lifetime `'a` or panics.
     pub(super) fn expect_lifetime(&mut self) -> Lifetime {
         if let Some((ident, is_raw)) = self.token.lifetime() {
-            if matches!(is_raw, IdentIsRaw::No)
-                && ident.without_first_quote().is_reserved_lifetime()
-            {
-                self.dcx().emit_err(errors::KeywordLifetime { span: ident.span });
+            if is_raw == IdentIsRaw::No && ident.without_first_quote().is_reserved_lifetime() {
+                self.dcx().emit_err(diagnostics::KeywordLifetime { span: ident.span });
             }
 
             self.bump();
@@ -1545,6 +1643,6 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn mk_ty(&self, span: Span, kind: TyKind) -> Box<Ty> {
-        Box::new(Ty { kind, span, id: ast::DUMMY_NODE_ID, tokens: None })
+        Box::new(Ty { kind, span, id: ast::DUMMY_NODE_ID })
     }
 }

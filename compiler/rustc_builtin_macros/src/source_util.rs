@@ -9,19 +9,19 @@ use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{join_path_idents, token};
 use rustc_ast_pretty::pprust;
 use rustc_expand::base::{
-    DummyResult, ExpandResult, ExtCtxt, MacEager, MacResult, MacroExpanderResult, resolve_path,
+    DummyResult, ExpandResult, ExtCtxt, MacEager, MacResult, MacroExpanderResult,
 };
 use rustc_expand::module::DirOwnership;
+use rustc_lint_defs::builtin::INCOMPLETE_INCLUDE;
 use rustc_parse::lexer::StripTokens;
-use rustc_parse::parser::ForceCollect;
+use rustc_parse::parser::{AllowConstBlockItems, ForceCollect};
 use rustc_parse::{new_parser_from_file, unwrap_or_emit_fatal, utf8_error};
-use rustc_session::lint::builtin::INCOMPLETE_INCLUDE;
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{ByteSymbol, Pos, Span, Symbol};
 use smallvec::SmallVec;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{
     check_zero_tts, get_single_str_from_tts, get_single_str_spanned_from_tts, parse_expr,
 };
@@ -68,13 +68,10 @@ pub(crate) fn expand_file(
     let topmost = cx.expansion_cause().unwrap_or(sp);
     let loc = cx.source_map().lookup_char_pos(topmost.lo());
 
-    use rustc_session::RemapFileNameExt;
-    use rustc_session::config::RemapPathScopeComponents;
+    use rustc_span::RemapPathScopeComponents;
     ExpandResult::Ready(MacEager::expr(cx.expr_str(
         topmost,
-        Symbol::intern(
-            &loc.file.name.for_scope(cx.sess, RemapPathScopeComponents::MACRO).to_string_lossy(),
-        ),
+        Symbol::intern(&loc.file.name.display(RemapPathScopeComponents::MACRO).to_string_lossy()),
     )))
 }
 
@@ -120,7 +117,7 @@ pub(crate) fn expand_include<'cx>(
         Err(guar) => return ExpandResult::Ready(DummyResult::any(sp, guar)),
     };
     // The file will be added to the code map by the parser
-    let path = match resolve_path(&cx.sess, path.as_str(), sp) {
+    let path = match cx.sess.resolve_path(path.as_str(), sp) {
         Ok(path) => path,
         Err(err) => {
             let guar = err.emit();
@@ -147,9 +144,7 @@ pub(crate) fn expand_include<'cx>(
             let mut p = unwrap_or_emit_fatal(new_parser_from_file(
                 self.psess,
                 &self.path,
-                // Don't strip frontmatter for backward compatibility, `---` may be the start of a
-                // manifold negation. FIXME: Ideally, we wouldn't strip shebangs here either.
-                StripTokens::Shebang,
+                StripTokens::Nothing,
                 Some(self.span),
             ));
             let expr = parse_expr(&mut p).ok()?;
@@ -158,7 +153,7 @@ pub(crate) fn expand_include<'cx>(
                     INCOMPLETE_INCLUDE,
                     p.token.span,
                     self.node_id,
-                    errors::IncompleteInclude,
+                    diagnostics::IncompleteInclude,
                 );
             }
             Some(expr)
@@ -173,7 +168,7 @@ pub(crate) fn expand_include<'cx>(
             ));
             let mut ret = SmallVec::new();
             loop {
-                match p.parse_item(ForceCollect::No) {
+                match p.parse_item(ForceCollect::No, AllowConstBlockItems::Yes) {
                     Err(err) => {
                         err.emit();
                         break;
@@ -181,7 +176,7 @@ pub(crate) fn expand_include<'cx>(
                     Ok(Some(item)) => ret.push(item),
                     Ok(None) => {
                         if p.token != token::Eof {
-                            p.dcx().emit_err(errors::ExpectedItem {
+                            p.dcx().emit_err(diagnostics::ExpectedItem {
                                 span: p.token.span,
                                 token: &pprust::token_to_string(&p.token),
                             });
@@ -272,7 +267,7 @@ fn load_binary_file(
     macro_span: Span,
     path_span: Span,
 ) -> Result<(Arc<[u8]>, Span), Box<dyn MacResult>> {
-    let resolved_path = match resolve_path(&cx.sess, original_path, macro_span) {
+    let resolved_path = match cx.sess.resolve_path(original_path, macro_span) {
         Ok(path) => path,
         Err(err) => {
             let guar = err.emit();
@@ -280,7 +275,14 @@ fn load_binary_file(
         }
     };
     match cx.source_map().load_binary_file(&resolved_path) {
-        Ok(data) => Ok(data),
+        Ok(data) => {
+            cx.sess
+                .file_depinfo
+                .borrow_mut()
+                .insert(Symbol::intern(&resolved_path.to_string_lossy()));
+
+            Ok(data)
+        }
         Err(io_err) => {
             let mut err = cx.dcx().struct_span_err(
                 macro_span,
@@ -324,7 +326,7 @@ fn find_path_suggestion(
             break;
         }
         // base_dir may be absolute
-        while let Some(base_next) = base_c.next() {
+        for base_next in base_c.by_ref() {
             if base_next == wanted_next {
                 without_base = Some(wanted_c.as_path());
                 break;
@@ -369,5 +371,5 @@ fn find_path_suggestion(
     root_absolute
         .chain(add)
         .chain(remove)
-        .find(|new_path| source_map.file_exists(&base_dir.join(&new_path)))
+        .find(|new_path| source_map.file_exists(&base_dir.join(new_path)))
 }

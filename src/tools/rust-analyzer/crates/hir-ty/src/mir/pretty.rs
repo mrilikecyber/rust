@@ -5,15 +5,22 @@ use std::{
     mem,
 };
 
-use either::Either;
-use hir_def::{expr_store::Body, hir::BindingId};
+use hir_def::{
+    HasModule, VariantId,
+    expr_store::ExpressionStore,
+    hir::BindingId,
+    signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
+};
 use hir_expand::{Lookup, name::Name};
 use la_arena::ArenaMap;
+use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
+    InferBodyId,
     db::{HirDatabase, InternedClosureId},
     display::{ClosureStyle, DisplayTarget, HirDisplay},
-    mir::{PlaceElem, ProjectionElem, StatementKind, TerminatorKind},
+    mir::{PlaceElem, PlaceTy, ProjectionElem, StatementKind, TerminatorKind},
+    next_solver::{DbInterner, TyKind, infer::DbInternerInferExt},
 };
 
 use super::{
@@ -36,21 +43,21 @@ macro_rules! wln {
     };
 }
 
-impl<'db> MirBody<'db> {
-    pub fn pretty_print(&self, db: &'db dyn HirDatabase, display_target: DisplayTarget) -> String {
-        let hir_body = db.body(self.owner);
-        let mut ctx = MirPrettyCtx::new(self, &hir_body, db, display_target);
+impl MirBody<'_> {
+    pub fn pretty_print(&self, db: &dyn HirDatabase, display_target: DisplayTarget) -> String {
+        let hir_body = ExpressionStore::of(db, self.owner.expression_store_owner(db));
+        let mut ctx = MirPrettyCtx::new(self, hir_body, db, display_target);
         ctx.for_body(|this| match ctx.body.owner {
-            hir_def::DefWithBodyId::FunctionId(id) => {
-                let data = db.function_signature(id);
+            InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(id)) => {
+                let data = FunctionSignature::of(db, id);
                 w!(this, "fn {}() ", data.name.display(db, this.display_target.edition));
             }
-            hir_def::DefWithBodyId::StaticId(id) => {
-                let data = db.static_signature(id);
+            InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::StaticId(id)) => {
+                let data = StaticSignature::of(db, id);
                 w!(this, "static {}: _ = ", data.name.display(db, this.display_target.edition));
             }
-            hir_def::DefWithBodyId::ConstId(id) => {
-                let data = db.const_signature(id);
+            InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::ConstId(id)) => {
+                let data = ConstSignature::of(db, id);
                 w!(
                     this,
                     "const {}: _ = ",
@@ -60,13 +67,13 @@ impl<'db> MirBody<'db> {
                         .display(db, this.display_target.edition)
                 );
             }
-            hir_def::DefWithBodyId::VariantId(id) => {
+            InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::VariantId(id)) => {
                 let loc = id.lookup(db);
                 let edition = this.display_target.edition;
                 w!(
                     this,
                     "enum {}::{} = ",
-                    db.enum_signature(loc.parent).name.display(db, edition),
+                    EnumSignature::of(db, loc.parent).name.display(db, edition),
                     loc.parent
                         .enum_variants(db)
                         .variant_name_by_id(id)
@@ -74,13 +81,14 @@ impl<'db> MirBody<'db> {
                         .display(db, edition),
                 )
             }
+            InferBodyId::AnonConstId(_) => w!(this, "{{const}}"),
         });
         ctx.result
     }
 
     // String with lines is rendered poorly in `dbg` macros, which I use very much, so this
     // function exists to solve that.
-    pub fn dbg(&self, db: &'db dyn HirDatabase, display_target: DisplayTarget) -> impl Debug {
+    pub fn dbg(&self, db: &dyn HirDatabase, display_target: DisplayTarget) -> impl Debug {
         struct StringDbg(String);
         impl Debug for StringDbg {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,11 +101,11 @@ impl<'db> MirBody<'db> {
 
 struct MirPrettyCtx<'a, 'db> {
     body: &'a MirBody<'db>,
-    hir_body: &'a Body,
+    hir_body: &'a ExpressionStore,
     db: &'db dyn HirDatabase,
     result: String,
     indent: String,
-    local_to_binding: ArenaMap<LocalId<'db>, BindingId>,
+    local_to_binding: ArenaMap<LocalId, BindingId>,
     display_target: DisplayTarget,
 }
 
@@ -113,12 +121,12 @@ impl Write for MirPrettyCtx<'_, '_> {
     }
 }
 
-enum LocalName<'db> {
-    Unknown(LocalId<'db>),
-    Binding(Name, LocalId<'db>),
+enum LocalName {
+    Unknown(LocalId),
+    Binding(Name, LocalId),
 }
 
-impl<'db> HirDisplay<'db> for LocalName<'db> {
+impl<'db> HirDisplay<'db> for LocalName {
     fn hir_fmt(
         &self,
         f: &mut crate::display::HirFormatter<'_, 'db>,
@@ -145,7 +153,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
         }
     }
 
-    fn for_closure(&mut self, closure: InternedClosureId) {
+    fn for_closure(&mut self, closure: InternedClosureId<'db>) {
         let body = match self.db.mir_body_for_closure(closure) {
             Ok(it) => it,
             Err(e) => {
@@ -156,7 +164,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
         let result = mem::take(&mut self.result);
         let indent = mem::take(&mut self.indent);
         let mut ctx = MirPrettyCtx {
-            body: &body,
+            body,
             local_to_binding: body.local_to_binding_map(),
             result,
             indent,
@@ -180,7 +188,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
 
     fn new(
         body: &'a MirBody<'db>,
-        hir_body: &'a Body,
+        hir_body: &'a ExpressionStore,
         db: &'db dyn HirDatabase,
         display_target: DisplayTarget,
     ) -> Self {
@@ -211,19 +219,19 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self,
                 "let {}: {};",
                 self.local_name(id).display_test(self.db, self.display_target),
-                self.hir_display(&local.ty)
+                self.hir_display(&local.ty.as_ref())
             );
         }
     }
 
-    fn local_name(&self, local: LocalId<'db>) -> LocalName<'db> {
+    fn local_name(&self, local: LocalId) -> LocalName {
         match self.local_to_binding.get(local) {
             Some(b) => LocalName::Binding(self.hir_body[*b].name.clone(), local),
             None => LocalName::Unknown(local),
         }
     }
 
-    fn basic_block_id(&self, basic_block_id: BasicBlockId<'db>) -> String {
+    fn basic_block_id(&self, basic_block_id: BasicBlockId) -> String {
         format!("'bb{}", u32::from(basic_block_id.into_raw()))
     }
 
@@ -311,12 +319,8 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
         }
     }
 
-    fn place(&mut self, p: &Place<'db>) {
-        fn f<'db>(
-            this: &mut MirPrettyCtx<'_, 'db>,
-            local: LocalId<'db>,
-            projections: &[PlaceElem<'db>],
-        ) {
+    fn place(&mut self, p: &Place) {
+        fn f<'db>(this: &mut MirPrettyCtx<'_, 'db>, local: LocalId, projections: &[PlaceElem]) {
             let Some((last, head)) = projections.split_last() else {
                 // no projection
                 w!(this, "{}", this.local_name(local).display_test(this.db, this.display_target));
@@ -328,36 +332,57 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                     f(this, local, head);
                     w!(this, ")");
                 }
-                ProjectionElem::Field(Either::Left(field)) => {
-                    let variant_fields = field.parent.fields(this.db);
-                    let name = &variant_fields.fields()[field.local_id].name;
-                    match field.parent {
-                        hir_def::VariantId::EnumVariantId(e) => {
-                            w!(this, "(");
-                            f(this, local, head);
-                            let loc = e.lookup(this.db);
-                            w!(
-                                this,
-                                " as {}).{}",
-                                loc.parent.enum_variants(this.db).variants[loc.index as usize]
-                                    .1
-                                    .display(this.db, this.display_target.edition),
-                                name.display(this.db, this.display_target.edition)
-                            );
-                        }
-                        hir_def::VariantId::StructId(_) | hir_def::VariantId::UnionId(_) => {
-                            f(this, local, head);
-                            w!(this, ".{}", name.display(this.db, this.display_target.edition));
-                        }
+                ProjectionElem::Downcast(variant_id) => match variant_id {
+                    hir_def::VariantId::EnumVariantId(e) => {
+                        w!(this, "(");
+                        f(this, local, head);
+                        let loc = e.lookup(this.db);
+                        w!(this, " as {})", loc.name.display(this.db, this.display_target.edition),);
                     }
-                }
-                ProjectionElem::Field(Either::Right(field)) => {
+                    _ => {
+                        f(this, local, head);
+                        w!(this, ".{:?}", last);
+                    }
+                },
+                ProjectionElem::Field(field) => {
                     f(this, local, head);
-                    w!(this, ".{}", field.index);
-                }
-                ProjectionElem::ClosureField(it) => {
-                    f(this, local, head);
-                    w!(this, ".{}", it);
+
+                    // we need to get the base type to decide how to display the field / get the field name
+                    let infcx = DbInterner::new_with(this.db, this.body.owner.krate(this.db))
+                        .infer_ctxt()
+                        .build(rustc_type_ir::TypingMode::PostAnalysis);
+                    let env = this.db.trait_environment(this.body.owner.generic_def(this.db));
+                    let place_ty = PlaceTy::from_ty(this.body.locals[local].ty.as_ref())
+                        .multi_projection_ty(&infcx, env, projections);
+                    if let Some(variant_id) = place_ty.variant_id {
+                        let variant_fields = variant_id.fields(this.db);
+                        w!(
+                            this,
+                            ".{}",
+                            variant_fields.fields()[field.to_local_field_id()]
+                                .name
+                                .display(this.db, this.display_target.edition)
+                        );
+                    } else {
+                        match place_ty.ty.kind() {
+                            TyKind::Adt(adt_def, _) if !adt_def.is_enum() => {
+                                let variant_id =
+                                    VariantId::from_non_enum(adt_def.def_id()).unwrap();
+                                let fields = variant_id.fields(this.db);
+                                w!(
+                                    this,
+                                    ".{}",
+                                    fields.fields()[field.to_local_field_id()]
+                                        .name
+                                        .display(this.db, this.display_target.edition)
+                                );
+                            }
+                            TyKind::Tuple(_) | TyKind::Closure(..) => w!(this, ".{}", field.0),
+                            _ => {
+                                w!(this, ".{:?}", last);
+                            }
+                        }
+                    };
                 }
                 ProjectionElem::Index(l) => {
                     f(this, local, head);
@@ -373,22 +398,27 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 }
             }
         }
-        f(self, p.local, p.projection.lookup(&self.body.projection_store));
+        f(self, p.local, p.projection.lookup());
     }
 
-    fn operand(&mut self, r: &Operand<'db>) {
+    fn operand(&mut self, r: &Operand) {
         match &r.kind {
             OperandKind::Copy(p) | OperandKind::Move(p) => {
                 // MIR at the time of writing doesn't have difference between move and copy, so we show them
                 // equally. Feel free to change it.
                 self.place(p);
             }
-            OperandKind::Constant { konst, .. } => w!(self, "Const({})", self.hir_display(konst)),
+            OperandKind::Constant { konst, .. } => {
+                w!(self, "Const({})", self.hir_display(&konst.as_ref()))
+            }
             OperandKind::Static(s) => w!(self, "Static({:?})", s),
+            OperandKind::Allocation { allocation } => {
+                w!(self, "Allocation({})", self.hir_display(&allocation.as_ref()))
+            }
         }
     }
 
-    fn rvalue(&mut self, r: &Rvalue<'db>) {
+    fn rvalue(&mut self, r: &Rvalue) {
         match r {
             Rvalue::Use(op) => self.operand(op),
             Rvalue::Ref(r, p) => {
@@ -415,7 +445,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
             Rvalue::Repeat(op, len) => {
                 w!(self, "[");
                 self.operand(op);
-                w!(self, "; {}]", len.display_test(self.db, self.display_target));
+                w!(self, "; {}]", len.as_ref().display_test(self.db, self.display_target));
             }
             Rvalue::Aggregate(AggregateKind::Adt(_, _), it) => {
                 w!(self, "Adt(");
@@ -440,7 +470,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
             Rvalue::Cast(ck, op, ty) => {
                 w!(self, "Cast({ck:?}, ");
                 self.operand(op);
-                w!(self, ", {})", self.hir_display(ty));
+                w!(self, ", {})", self.hir_display(&ty.as_ref()));
             }
             Rvalue::CheckedBinaryOp(b, o1, o2) => {
                 self.operand(o1);
@@ -460,12 +490,6 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.place(p);
                 w!(self, ")");
             }
-            Rvalue::ShallowInitBoxWithAlloc(_) => w!(self, "ShallowInitBoxWithAlloc"),
-            Rvalue::ShallowInitBox(op, _) => {
-                w!(self, "ShallowInitBox(");
-                self.operand(op);
-                w!(self, ")");
-            }
             Rvalue::CopyForDeref(p) => {
                 w!(self, "CopyForDeref(");
                 self.place(p);
@@ -478,7 +502,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
         }
     }
 
-    fn operand_list(&mut self, it: &[Operand<'db>]) {
+    fn operand_list(&mut self, it: &[Operand]) {
         let mut it = it.iter();
         if let Some(first) = it.next() {
             self.operand(first);

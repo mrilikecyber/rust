@@ -3,9 +3,8 @@ use clippy_utils::{return_ty, sym};
 use rustc_hir::{
     Body, BodyOwnerKind, Expr, ExprKind, FnSig, ImplItem, ImplItemKind, Item, ItemKind, OwnerId, PathSegment, QPath,
 };
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::Ty;
-use rustc_session::impl_lint_pass;
 use rustc_span::{Ident, Span, Symbol};
 
 declare_clippy_lint! {
@@ -56,7 +55,7 @@ declare_clippy_lint! {
     "functions of type `Result<..>` or `Option`<...> that contain `expect()` or `unwrap()`"
 }
 
-impl_lint_pass!(UnwrapInResult=> [UNWRAP_IN_RESULT]);
+impl_lint_pass!(UnwrapInResult => [UNWRAP_IN_RESULT]);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum OptionOrResult {

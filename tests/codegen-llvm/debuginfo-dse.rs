@@ -2,7 +2,7 @@
 //@ revisions: CODEGEN OPTIMIZED
 //@[CODEGEN] compile-flags: -Cno-prepopulate-passes
 //@ only-64bit
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 
 #![crate_type = "lib"]
 #![feature(repr_simd, rustc_attrs)]
@@ -148,7 +148,7 @@ fn direct(
 // Arguments are passed through registers, the final values are poison.
 #[unsafe(no_mangle)]
 fn cast(aggregate_4xi8: Aggregate_4xi8) {
-    // CHECK-LABEL: define{{( dso_local)?}} void @cast(i32 %0)
+    // CHECK-LABEL: define{{( dso_local)?}} void @cast(i32 noundef %0)
     // CHECK: call void @opaque_fn()
     opaque_fn();
     // The temporary allocated variable is eliminated.

@@ -18,8 +18,10 @@
 //! [canonicalized]: https://rustc-dev-guide.rust-lang.org/solve/canonicalization.html
 
 use derive_where::derive_where;
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
+use thin_vec::ThinVec;
 
+use crate::search_graph::RequiredDepth;
 use crate::solve::{CandidateSource, Certainty, Goal, GoalSource, QueryResult};
 use crate::{Canonical, CanonicalVarValues, Interner};
 
@@ -31,7 +33,7 @@ use crate::{Canonical, CanonicalVarValues, Interner};
 /// inference variables from a nested `InferCtxt`.
 #[derive_where(Clone, PartialEq, Hash, Debug; I: Interner, T)]
 #[derive_where(Copy; I: Interner, T: Copy)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub struct State<I: Interner, T> {
     pub var_values: CanonicalVarValues<I>,
     pub data: T,
@@ -48,9 +50,10 @@ pub type CanonicalState<I, T> = Canonical<I, State<I, T>>;
 #[derive_where(PartialEq, Eq, Hash; I: Interner)]
 pub struct GoalEvaluation<I: Interner> {
     pub uncanonicalized_goal: Goal<I, I::Predicate>,
-    pub orig_values: Vec<I::GenericArg>,
+    pub orig_values: ThinVec<I::GenericArg>,
     pub final_revision: I::Probe,
     pub result: QueryResult<I>,
+    pub required_depth: RequiredDepth,
 }
 
 /// A self-contained computation during trait solving. This either
@@ -87,7 +90,7 @@ pub enum ProbeStep<I: Interner> {
 /// the final result of the current goal - via [ProbeKind::Root] - we also
 /// store the [QueryResult].
 #[derive_where(Clone, Copy, PartialEq, Eq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub enum ProbeKind<I: Interner> {
     /// The root inference context while proving a goal.
     Root { result: QueryResult<I> },

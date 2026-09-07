@@ -8,6 +8,7 @@ use core::fmt;
 use std::{env, fs, ops::Not, path::Path, process::Command};
 
 use anyhow::{Result, format_err};
+use base_db::Env;
 use itertools::Itertools;
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rustc_hash::FxHashMap;
@@ -172,6 +173,36 @@ impl Sysroot {
         }
     }
 
+    pub fn tool_path(&self, tool: Tool, current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
+        match self.root() {
+            Some(root) => {
+                let mut cmd = toolchain::command(
+                    Tool::Rustup.path(),
+                    current_dir,
+                    &envs
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), Some(v.clone())))
+                        .collect::<FxHashMap<_, _>>(),
+                );
+                if !envs.contains_key("RUSTUP_TOOLCHAIN")
+                    && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
+                {
+                    cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(root));
+                }
+
+                cmd.arg("which");
+                cmd.arg(tool.name());
+                (|| {
+                    Some(Utf8PathBuf::from(
+                        String::from_utf8(cmd.output().ok()?.stdout).ok()?.trim_end(),
+                    ))
+                })()
+                .unwrap_or_else(|| Utf8PathBuf::from(tool.name()))
+            }
+            _ => tool.path(),
+        }
+    }
+
     pub fn discover_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {
         let root = self.root()?;
         Some(
@@ -244,7 +275,10 @@ impl Sysroot {
             }
             tracing::debug!("Stitching sysroot library: {src_root}");
 
-            let mut stitched = stitched::Stitched { crates: Default::default() };
+            let mut stitched = stitched::Stitched {
+                crates: Default::default(),
+                edition: span::Edition::Edition2024,
+            };
 
             for path in stitched::SYSROOT_CRATES.trim().lines() {
                 let name = path.split('/').next_back().unwrap();
@@ -480,6 +514,7 @@ pub(crate) mod stitched {
     #[derive(Debug, Clone, Eq, PartialEq)]
     pub struct Stitched {
         pub(super) crates: Arena<RustLibSrcCrateData>,
+        pub(crate) edition: span::Edition,
     }
 
     impl ops::Index<RustLibSrcCrate> for Stitched {

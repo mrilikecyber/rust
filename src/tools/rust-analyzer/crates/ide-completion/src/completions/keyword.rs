@@ -6,7 +6,7 @@ use crate::{CompletionContext, Completions};
 
 pub(crate) fn complete_for_and_where(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     keyword_item: &ast::Item,
 ) {
     let mut add_keyword = |kw, snippet| acc.add_keyword_snippet(ctx, kw, snippet);
@@ -338,6 +338,60 @@ fn main() {
             r#"
 fn main() {
     let x = loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = &$0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = &loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = -$0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = -loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = 2 + $0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = 2 + loop {
     $0
 };
     bar();

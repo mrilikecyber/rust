@@ -5,11 +5,13 @@ use std::fmt::{self, Display, Formatter, FormattingOptions};
 pub(crate) trait Joined: IntoIterator {
     /// Takes an iterator over elements that implement [`Display`], and format them into `f`, separated by `sep`.
     ///
-    /// This is similar to [`Itertools::format`](itertools::Itertools::format), but instead of returning an implementation of `Display`,
+    /// This is similar to [`Itertools::format`], but instead of returning an implementation of `Display`,
     /// it formats directly into a [`Formatter`].
     ///
     /// The performance of `joined` is slightly better than `format`, since it doesn't need to use a `Cell` to keep track of whether [`fmt`](Display::fmt)
     /// was already called (`joined`'s API doesn't allow it be called more than once).
+    ///
+    /// [`Itertools::format`]: https://docs.rs/itertools/latest/itertools/trait.Itertools.html#method.format
     fn joined(&mut self, sep: impl Display, f: &mut Formatter<'_>) -> fmt::Result;
 }
 
@@ -127,4 +129,14 @@ impl WithOpts {
             t.fmt(&mut f)
         })
     }
+}
+
+/// Creates a [`Display`] implementation that repeats `t` `count` times.
+pub(crate) fn repeat(t: impl Display, count: usize) -> impl Display {
+    fmt::from_fn(move |f| {
+        for _ in 0..count {
+            t.fmt(f)?;
+        }
+        Ok(())
+    })
 }

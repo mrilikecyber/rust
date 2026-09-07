@@ -17,10 +17,12 @@ rustc-hash.workspace = true
 either.workspace = true
 arrayvec.workspace = true
 itertools.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
-tracing.workspace = true
+tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
-indexmap.workspace = true
+la-arena.workspace = true
+salsa.workspace = true
 
 ra-ap-rustc_type_ir.workspace = true
 

@@ -3,6 +3,7 @@
 use std::hash::{BuildHasher, Hash};
 
 use hir::{CfgExpr, FilePositionWrapper, FileRangeWrapper, Semantics, Symbol};
+use itertools::Itertools;
 use smallvec::SmallVec;
 use span::{TextRange, TextSize};
 use syntax::{
@@ -25,18 +26,14 @@ impl RootDatabase {
         // We don't want a mistake in the fixture to crash r-a, so we wrap this in `catch_unwind()`.
         std::panic::catch_unwind(|| {
             let mut db = RootDatabase::default();
-            let fixture = test_fixture::ChangeFixture::parse_with_proc_macros(
-                &db,
-                text,
-                minicore.0,
-                Vec::new(),
-            );
+            let fixture =
+                test_fixture::ChangeFixture::parse_with_proc_macros(text, minicore.0, Vec::new());
             db.apply_change(fixture.change);
             let files = fixture
                 .files
                 .into_iter()
                 .zip(fixture.file_lines)
-                .map(|(file_id, range)| (file_id.file_id(&db), range))
+                .map(|(file_id, range)| (file_id.file_id(), range))
                 .collect();
             (db, files, fixture.sysroot_files)
         })
@@ -53,6 +50,18 @@ impl RootDatabase {
                 text,
             );
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RaFixtureConfig<'a> {
+    pub minicore: MiniCore<'a>,
+    pub disable_ra_fixture: bool,
+}
+
+impl<'a> RaFixtureConfig<'a> {
+    pub const fn default() -> Self {
+        Self { minicore: MiniCore::default(), disable_ra_fixture: false }
     }
 }
 
@@ -73,9 +82,14 @@ impl RaFixtureAnalysis {
         sema: &Semantics<'_, RootDatabase>,
         literal: ast::String,
         expanded: &ast::String,
-        minicore: MiniCore<'_>,
+        config: &RaFixtureConfig<'_>,
         on_cursor: &mut dyn FnMut(TextRange),
     ) -> Option<RaFixtureAnalysis> {
+        if config.disable_ra_fixture {
+            return None;
+        }
+        let minicore = config.minicore;
+
         if !literal.is_raw() {
             return None;
         }
@@ -83,9 +97,12 @@ impl RaFixtureAnalysis {
         let active_parameter = ActiveParameter::at_token(sema, expanded.syntax().clone())?;
         let has_rust_fixture_attr = active_parameter.attrs().is_some_and(|attrs| {
             attrs.filter_map(|attr| attr.as_simple_path()).any(|path| {
-                path.segments()
-                    .zip(["rust_analyzer", "rust_fixture"])
-                    .all(|(seg, name)| seg.name_ref().map_or(false, |nr| nr.text() == name))
+                let Some([Some(segment1), Some(segment2)]) =
+                    path.segments().map(|seg| seg.name_ref()).collect_array()
+                else {
+                    return false;
+                };
+                segment1.text() == "rust_analyzer" && segment2.text() == "rust_fixture"
             })
         });
         if !has_rust_fixture_attr {
@@ -526,7 +543,7 @@ impl_empty_upmap_from_ra_fixture!(
     String,
     Symbol,
     SmolStr,
-    Documentation,
+    Documentation<'_>,
     SymbolKind,
     CfgExpr,
     ReferenceCategory,

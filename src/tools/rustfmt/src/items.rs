@@ -24,7 +24,9 @@ use crate::expr::{
 use crate::lists::{ListFormatting, Separator, definitive_tactic, itemize_list, write_list};
 use crate::macros::{MacroPosition, rewrite_macro};
 use crate::overflow;
-use crate::rewrite::{Rewrite, RewriteContext, RewriteError, RewriteErrorExt, RewriteResult};
+use crate::rewrite::{
+    ExceedsMaxWidthError, Rewrite, RewriteContext, RewriteError, RewriteErrorExt, RewriteResult,
+};
 use crate::shape::{Indent, Shape};
 use crate::source_map::{LineRangeUtils, SpanUtils};
 use crate::spanned::Spanned;
@@ -37,7 +39,6 @@ use crate::visitor::FmtVisitor;
 const DEFAULT_VISIBILITY: ast::Visibility = ast::Visibility {
     kind: ast::VisibilityKind::Inherited,
     span: DUMMY_SP,
-    tokens: None,
 };
 
 fn type_annotation_separator(config: &Config) -> &str {
@@ -63,19 +64,17 @@ impl Rewrite for ast::Local {
             return Err(RewriteError::SkipFormatting);
         }
 
-        // FIXME(super_let): Implement formatting
-        if self.super_.is_some() {
-            return Err(RewriteError::SkipFormatting);
-        }
-
+        let super_ = self.super_.is_some();
+        // FIXME: deletes any comments in between super and let
+        let let_ = if super_ { "super let " } else { "let " };
         let attrs_str = self.attrs.rewrite_result(context, shape)?;
         let mut result = if attrs_str.is_empty() {
-            "let ".to_owned()
+            let_.to_owned()
         } else {
             combine_strs_with_missing_comments(
                 context,
                 &attrs_str,
-                "let ",
+                let_,
                 mk_sp(
                     self.attrs.last().map(|a| a.span.hi()).unwrap(),
                     self.span.lo(),
@@ -84,16 +83,11 @@ impl Rewrite for ast::Local {
                 false,
             )?
         };
-        let let_kw_offset = result.len() - "let ".len();
+        let let_kw_offset = result.len() - let_.len();
 
-        // 4 = "let ".len()
-        let pat_shape = shape
-            .offset_left(4)
-            .max_width_error(shape.width, self.span())?;
+        let pat_shape = shape.offset_left(let_.len(), self.span())?;
         // 1 = ;
-        let pat_shape = pat_shape
-            .sub_width(1)
-            .max_width_error(shape.width, self.span())?;
+        let pat_shape = pat_shape.sub_width(1, self.span())?;
         let pat_str = self.pat.rewrite_result(context, pat_shape)?;
 
         result.push_str(&pat_str);
@@ -109,11 +103,9 @@ impl Rewrite for ast::Local {
                 } else {
                     shape
                 }
-                .offset_left(last_line_width(&result) + separator.len())
-                .max_width_error(shape.width, self.span())?
+                .offset_left(last_line_width(&result) + separator.len(), self.span())?
                 // 2 = ` =`
-                .sub_width(2)
-                .max_width_error(shape.width, self.span())?;
+                .sub_width(2, self.span())?;
 
                 let rewrite = ty.rewrite_result(context, ty_shape)?;
 
@@ -132,9 +124,7 @@ impl Rewrite for ast::Local {
 
         if let Some((init, else_block)) = self.kind.init_else_opt() {
             // 1 = trailing semicolon;
-            let nested_shape = shape
-                .sub_width(1)
-                .max_width_error(shape.width, self.span())?;
+            let nested_shape = shape.sub_width(1, self.span())?;
 
             result = rewrite_assign_rhs(
                 context,
@@ -307,7 +297,7 @@ pub(crate) struct FnSig<'a> {
     decl: &'a ast::FnDecl,
     generics: &'a ast::Generics,
     ext: ast::Extern,
-    coroutine_kind: Cow<'a, Option<ast::CoroutineKind>>,
+    coroutine_marker: &'a Option<ast::CoroutineMarker>,
     constness: ast::Const,
     defaultness: ast::Defaultness,
     safety: ast::Safety,
@@ -319,12 +309,13 @@ impl<'a> FnSig<'a> {
         method_sig: &'a ast::FnSig,
         generics: &'a ast::Generics,
         visibility: &'a ast::Visibility,
+        defaultness: ast::Defaultness,
     ) -> FnSig<'a> {
         FnSig {
             safety: method_sig.header.safety,
-            coroutine_kind: Cow::Borrowed(&method_sig.header.coroutine_kind),
+            coroutine_marker: &method_sig.header.coroutine_marker,
             constness: method_sig.header.constness,
-            defaultness: ast::Defaultness::Final,
+            defaultness,
             ext: method_sig.header.ext,
             decl: &*method_sig.decl,
             generics,
@@ -339,16 +330,14 @@ impl<'a> FnSig<'a> {
     ) -> FnSig<'a> {
         match *fn_kind {
             visit::FnKind::Fn(visit::FnCtxt::Assoc(..), vis, ast::Fn { sig, generics, .. }) => {
-                let mut fn_sig = FnSig::from_method_sig(sig, generics, vis);
-                fn_sig.defaultness = defaultness;
-                fn_sig
+                FnSig::from_method_sig(sig, generics, vis, defaultness)
             }
             visit::FnKind::Fn(_, vis, ast::Fn { sig, generics, .. }) => FnSig {
                 decl,
                 generics,
                 ext: sig.header.ext,
                 constness: sig.header.constness,
-                coroutine_kind: Cow::Borrowed(&sig.header.coroutine_kind),
+                coroutine_marker: &sig.header.coroutine_marker,
                 defaultness,
                 safety: sig.header.safety,
                 visibility: vis,
@@ -363,8 +352,8 @@ impl<'a> FnSig<'a> {
         result.push_str(&*format_visibility(context, self.visibility));
         result.push_str(format_defaultness(self.defaultness));
         result.push_str(format_constness(self.constness));
-        self.coroutine_kind
-            .map(|coroutine_kind| result.push_str(format_coro(&coroutine_kind)));
+        self.coroutine_marker
+            .map(|coroutine_marker| result.push_str(format_coro(coroutine_marker)));
         result.push_str(format_safety(self.safety));
         result.push_str(&format_extern(
             self.ext,
@@ -459,6 +448,7 @@ impl<'a> FmtVisitor<'a> {
         sig: &ast::FnSig,
         vis: &ast::Visibility,
         generics: &ast::Generics,
+        defaultness: ast::Defaultness,
         span: Span,
     ) -> RewriteResult {
         // Drop semicolon or it will be interpreted as comment.
@@ -469,7 +459,7 @@ impl<'a> FmtVisitor<'a> {
             &context,
             indent,
             ident,
-            &FnSig::from_method_sig(sig, generics, vis),
+            &FnSig::from_method_sig(sig, generics, vis, defaultness),
             span,
             FnBraceStyle::None,
         )?;
@@ -653,7 +643,7 @@ impl<'a> FmtVisitor<'a> {
             items = itemize_list_with(0);
         }
 
-        let shape = self.shape().sub_width(2)?;
+        let shape = self.shape().sub_width_opt(2)?;
         let fmt = ListFormatting::new(shape, self.config)
             .trailing_separator(self.config.trailing_comma())
             .preserve_newline(true);
@@ -684,10 +674,10 @@ impl<'a> FmtVisitor<'a> {
             field.attrs.rewrite(&context, shape)?
         } else {
             // StyleEdition::Edition20{15|18|21} formatting that was off by 1. See issue #5801
-            field.attrs.rewrite(&context, shape.sub_width(1)?)?
+            field.attrs.rewrite(&context, shape.sub_width_opt(1)?)?
         };
         // sub_width(1) to take the trailing comma into account
-        let shape = shape.sub_width(1)?;
+        let shape = shape.sub_width_opt(1)?;
 
         let lo = field
             .attrs
@@ -801,7 +791,7 @@ pub(crate) fn format_impl(
     item: &ast::Item,
     iimpl: &ast::Impl,
     offset: Indent,
-) -> Option<String> {
+) -> RewriteResult {
     let ast::Impl {
         generics,
         self_ty,
@@ -821,7 +811,7 @@ pub(crate) fn format_impl(
 
     let mut option = WhereClauseOption::snuggled(&ref_and_type);
     let snippet = context.snippet(item.span);
-    let open_pos = snippet.find_uncommented("{")? + 1;
+    let open_pos = snippet.find_uncommented("{").unknown_error()? + 1;
     if !contains_comment(&snippet[open_pos..])
         && items.is_empty()
         && generics.where_clause.predicates.len() == 1
@@ -844,8 +834,7 @@ pub(crate) fn format_impl(
         where_span_end,
         self_ty.span.hi(),
         option,
-    )
-    .ok()?;
+    )?;
 
     // If there is no where-clause, we may have missing comments between the trait name and
     // the opening brace.
@@ -880,7 +869,7 @@ pub(crate) fn format_impl(
         } else {
             result.push_str(" {}");
         }
-        return Some(result);
+        return Ok(result);
     }
 
     result.push_str(&where_clause_str);
@@ -903,7 +892,7 @@ pub(crate) fn format_impl(
     // this is an impl body snippet(impl SampleImpl { /* here */ })
     let lo = max(self_ty.span.hi(), generics.where_clause.span.hi());
     let snippet = context.snippet(mk_sp(lo, item.span.hi()));
-    let open_pos = snippet.find_uncommented("{")? + 1;
+    let open_pos = snippet.find_uncommented("{").unknown_error()? + 1;
 
     if !items.is_empty() || contains_comment(&snippet[open_pos..]) {
         let mut visitor = FmtVisitor::from_context(context);
@@ -928,7 +917,7 @@ pub(crate) fn format_impl(
 
     result.push('}');
 
-    Some(result)
+    Ok(result)
 }
 
 fn is_impl_single_line(
@@ -937,17 +926,15 @@ fn is_impl_single_line(
     result: &str,
     where_clause_str: &str,
     item: &ast::Item,
-) -> Option<bool> {
+) -> Result<bool, RewriteError> {
     let snippet = context.snippet(item.span);
-    let open_pos = snippet.find_uncommented("{")? + 1;
+    let open_pos = snippet.find_uncommented("{").unknown_error()? + 1;
 
-    Some(
-        context.config.empty_item_single_line()
-            && items.is_empty()
-            && !result.contains('\n')
-            && result.len() + where_clause_str.len() <= context.config.max_width()
-            && !contains_comment(&snippet[open_pos..]),
-    )
+    Ok(context.config.empty_item_single_line()
+        && items.is_empty()
+        && !result.contains('\n')
+        && result.len() + where_clause_str.len() <= context.config.max_width()
+        && !contains_comment(&snippet[open_pos..]))
 }
 
 fn format_impl_ref_and_type(
@@ -955,7 +942,7 @@ fn format_impl_ref_and_type(
     item: &ast::Item,
     iimpl: &ast::Impl,
     offset: Indent,
-) -> Option<String> {
+) -> RewriteResult {
     let ast::Impl {
         generics,
         of_trait,
@@ -969,9 +956,10 @@ fn format_impl_ref_and_type(
 
     if let Some(of_trait) = of_trait.as_deref() {
         result.push_str(format_defaultness(of_trait.defaultness));
+        result.push_str(format_constness(*constness));
         result.push_str(format_safety(of_trait.safety));
     } else {
-        result.push_str(format_constness_right(*constness));
+        result.push_str(format_constness(*constness));
     }
 
     let shape = if context.config.style_edition() >= StyleEdition::Edition2024 {
@@ -981,14 +969,14 @@ fn format_impl_ref_and_type(
             context.config,
             Shape::indented(offset + last_line_width(&result), context.config),
             0,
+            item.span,
         )?
     };
-    let generics_str = rewrite_generics(context, "impl", generics, shape).ok()?;
+    let generics_str = rewrite_generics(context, "impl", generics, shape)?;
     result.push_str(&generics_str);
 
     let trait_ref_overhead;
     if let Some(of_trait) = of_trait.as_deref() {
-        result.push_str(format_constness_right(*constness));
         let polarity_str = match of_trait.polarity {
             ast::ImplPolarity::Negative(_) => "!",
             ast::ImplPolarity::Positive => "",
@@ -1028,7 +1016,7 @@ fn format_impl_ref_and_type(
                 result.push(' ');
             }
             result.push_str(&self_ty_str);
-            return Some(result);
+            return Ok(result);
         }
     }
 
@@ -1045,8 +1033,8 @@ fn format_impl_ref_and_type(
         IndentStyle::Visual => new_line_offset + trait_ref_overhead,
         IndentStyle::Block => new_line_offset,
     };
-    result.push_str(&*self_ty.rewrite(context, Shape::legacy(budget, type_offset))?);
-    Some(result)
+    result.push_str(&*self_ty.rewrite_result(context, Shape::legacy(budget, type_offset))?);
+    Ok(result)
 }
 
 fn rewrite_trait_ref(
@@ -1055,20 +1043,20 @@ fn rewrite_trait_ref(
     offset: Indent,
     polarity_str: &str,
     result_len: usize,
-) -> Option<String> {
+) -> RewriteResult {
     // 1 = space between generics and trait_ref
     let used_space = 1 + polarity_str.len() + result_len;
     let shape = Shape::indented(offset + used_space, context.config);
-    if let Some(trait_ref_str) = trait_ref.rewrite(context, shape) {
+    if let Ok(trait_ref_str) = trait_ref.rewrite_result(context, shape) {
         if !trait_ref_str.contains('\n') {
-            return Some(format!(" {polarity_str}{trait_ref_str}"));
+            return Ok(format!(" {polarity_str}{trait_ref_str}"));
         }
     }
     // We could not make enough space for trait_ref, so put it on new line.
     let offset = offset.block_indent(context.config);
     let shape = Shape::indented(offset, context.config);
-    let trait_ref_str = trait_ref.rewrite(context, shape)?;
-    Some(format!(
+    let trait_ref_str = trait_ref.rewrite_result(context, shape)?;
+    Ok(format!(
         "{}{}{}",
         offset.to_string_with_newline(context.config),
         polarity_str,
@@ -1159,12 +1147,11 @@ fn format_struct(
 pub(crate) fn format_trait(
     context: &RewriteContext<'_>,
     item: &ast::Item,
+    trait_: &ast::Trait,
     offset: Indent,
-) -> Option<String> {
-    let ast::ItemKind::Trait(trait_kind) = &item.kind else {
-        unreachable!();
-    };
+) -> RewriteResult {
     let ast::Trait {
+        ref impl_restriction,
         constness,
         is_auto,
         safety,
@@ -1172,12 +1159,13 @@ pub(crate) fn format_trait(
         ref generics,
         ref bounds,
         ref items,
-    } = **trait_kind;
+    } = *trait_;
 
     let mut result = String::with_capacity(128);
     let header = format!(
-        "{}{}{}{}trait ",
+        "{}{}{}{}{}trait ",
         format_visibility(context, &item.vis),
+        format_impl_restriction(context, impl_restriction),
         format_constness(constness),
         format_safety(safety),
         format_auto(is_auto),
@@ -1186,9 +1174,8 @@ pub(crate) fn format_trait(
 
     let body_lo = context.snippet_provider.span_after(item.span, "{");
 
-    let shape = Shape::indented(offset, context.config).offset_left(result.len())?;
-    let generics_str =
-        rewrite_generics(context, rewrite_ident(context, ident), generics, shape).ok()?;
+    let shape = Shape::indented(offset, context.config).offset_left(result.len(), item.span)?;
+    let generics_str = rewrite_generics(context, rewrite_ident(context, ident), generics, shape)?;
     result.push_str(&generics_str);
 
     // FIXME(#2055): rustfmt fails to format when there are comments between trait bounds.
@@ -1199,7 +1186,7 @@ pub(crate) fn format_trait(
         let bound_hi = bounds.last().unwrap().span().hi();
         let snippet = context.snippet(mk_sp(ident_hi, bound_hi));
         if contains_comment(snippet) {
-            return None;
+            return Err(RewriteError::Unknown);
         }
 
         result = rewrite_assign_rhs_with(
@@ -1209,8 +1196,7 @@ pub(crate) fn format_trait(
             shape,
             &RhsAssignKind::Bounds,
             RhsTactics::ForceNextLineWithoutIndent,
-        )
-        .ok()?;
+        )?;
     }
 
     // Rewrite where-clause.
@@ -1234,8 +1220,8 @@ pub(crate) fn format_trait(
             None,
             pos_before_where,
             option,
-        )
-        .ok()?;
+        )?;
+
         // If the where-clause cannot fit on the same line,
         // put the where-clause on a new line
         if !where_clause_str.contains('\n')
@@ -1275,7 +1261,7 @@ pub(crate) fn format_trait(
 
     let block_span = mk_sp(generics.where_clause.span.hi(), item.span.hi());
     let snippet = context.snippet(block_span);
-    let open_pos = snippet.find_uncommented("{")? + 1;
+    let open_pos = snippet.find_uncommented("{").unknown_error()? + 1;
 
     match context.config.brace_style() {
         _ if last_line_contains_single_line_comment(&result)
@@ -1289,7 +1275,7 @@ pub(crate) fn format_trait(
             && !contains_comment(&snippet[open_pos..]) =>
         {
             result.push_str(" {}");
-            return Some(result);
+            return Ok(result);
         }
         BraceStyle::AlwaysNextLine => {
             result.push_str(&offset.to_string_with_newline(context.config));
@@ -1330,7 +1316,7 @@ pub(crate) fn format_trait(
     }
 
     result.push('}');
-    Some(result)
+    Ok(result)
 }
 
 pub(crate) struct TraitAliasBounds<'a> {
@@ -1380,12 +1366,13 @@ pub(crate) fn format_trait_alias(
     context: &RewriteContext<'_>,
     ta: &ast::TraitAlias,
     vis: &ast::Visibility,
+    span: Span,
     shape: Shape,
-) -> Option<String> {
+) -> RewriteResult {
     let alias = rewrite_ident(context, ta.ident);
     // 6 = "trait ", 2 = " ="
-    let g_shape = shape.offset_left(6)?.sub_width(2)?;
-    let generics_str = rewrite_generics(context, alias, &ta.generics, g_shape).ok()?;
+    let g_shape = shape.offset_left(6, span)?.sub_width(2, span)?;
+    let generics_str = rewrite_generics(context, alias, &ta.generics, g_shape)?;
     let vis_str = format_visibility(context, vis);
     let constness = format_constness(ta.constness);
     let lhs = format!("{vis_str}{constness}trait {generics_str} =");
@@ -1394,15 +1381,14 @@ pub(crate) fn format_trait_alias(
         generic_bounds: &ta.bounds,
         generics: &ta.generics,
     };
-    rewrite_assign_rhs(
+    let result = rewrite_assign_rhs(
         context,
         lhs,
         &trait_alias_bounds,
         &RhsAssignKind::Bounds,
-        shape.sub_width(1)?,
-    )
-    .map(|s| s + ";")
-    .ok()
+        shape.sub_width(1, ta.generics.span)?,
+    )?;
+    Ok(result + ";")
 }
 
 fn format_unit_struct(
@@ -1506,7 +1492,7 @@ pub(crate) fn format_struct_struct(
     let items_str = rewrite_with_alignment(
         fields,
         context,
-        Shape::indented(offset.block_indent(context.config), context.config).sub_width(1)?,
+        Shape::indented(offset.block_indent(context.config), context.config).sub_width_opt(1)?,
         mk_sp(body_lo, span.hi()),
         one_line_budget,
     )?;
@@ -1539,7 +1525,7 @@ fn get_bytepos_after_visibility(vis: &ast::Visibility, default_span: Span) -> By
 
 // Format tuple or struct without any fields. We need to make sure that the comments
 // inside the delimiters are preserved.
-fn format_empty_struct_or_tuple(
+pub(crate) fn format_empty_struct_or_tuple(
     context: &RewriteContext<'_>,
     span: Span,
     offset: Indent,
@@ -1641,12 +1627,12 @@ fn format_tuple_struct(
         let inner_span = mk_sp(body_lo, body_hi);
         format_empty_struct_or_tuple(context, inner_span, offset, &mut result, "(", ")");
     } else {
-        let shape = Shape::indented(offset, context.config).sub_width(1)?;
         let lo = if let Some(generics) = struct_parts.generics {
             generics.span.hi()
         } else {
             struct_parts.ident.span.hi()
         };
+        let shape = Shape::indented(offset, context.config).sub_width_opt(1)?;
         result = overflow::rewrite_with_parens(
             context,
             &result,
@@ -1725,13 +1711,13 @@ pub(crate) fn rewrite_type_alias<'a>(
     match (visitor_kind, &op_ty) {
         (Item | AssocTraitItem | ForeignItem, Some(op_bounds)) => {
             let op = OpaqueType { bounds: op_bounds };
-            rewrite_ty(rw_info, Some(bounds), Some(&op), rhs_hi, vis)
+            rewrite_ty(rw_info, Some(bounds), Some(&op), rhs_hi, vis, defaultness)
         }
         (Item | AssocTraitItem | ForeignItem, None) => {
-            rewrite_ty(rw_info, Some(bounds), ty_opt, rhs_hi, vis)
+            rewrite_ty(rw_info, Some(bounds), ty_opt, rhs_hi, vis, defaultness)
         }
         (AssocImplItem, _) => {
-            let result = if let Some(op_bounds) = op_ty {
+            if let Some(op_bounds) = op_ty {
                 let op = OpaqueType { bounds: op_bounds };
                 rewrite_ty(
                     rw_info,
@@ -1739,13 +1725,10 @@ pub(crate) fn rewrite_type_alias<'a>(
                     Some(&op),
                     rhs_hi,
                     &DEFAULT_VISIBILITY,
+                    defaultness,
                 )
             } else {
-                rewrite_ty(rw_info, Some(bounds), ty_opt, rhs_hi, vis)
-            }?;
-            match defaultness {
-                ast::Defaultness::Default(..) => Ok(format!("default {result}")),
-                _ => Ok(result),
+                rewrite_ty(rw_info, Some(bounds), ty_opt, rhs_hi, vis, defaultness)
             }
         }
     }
@@ -1758,10 +1741,15 @@ fn rewrite_ty<R: Rewrite>(
     // the span of the end of the RHS (or the end of the generics, if there is no RHS)
     rhs_hi: BytePos,
     vis: &ast::Visibility,
+    defaultness: ast::Defaultness,
 ) -> RewriteResult {
     let mut result = String::with_capacity(128);
     let TyAliasRewriteInfo(context, indent, generics, after_where_clause, ident, span) = *rw_info;
-    result.push_str(&format!("{}type ", format_visibility(context, vis)));
+    result.push_str(&format!(
+        "{}{}type ",
+        format_visibility(context, vis),
+        format_defaultness(defaultness)
+    ));
     let ident_str = rewrite_ident(context, ident);
 
     if generics.params.is_empty() {
@@ -1770,9 +1758,8 @@ fn rewrite_ty<R: Rewrite>(
         // 2 = `= `
         let g_shape = Shape::indented(indent, context.config);
         let g_shape = g_shape
-            .offset_left(result.len())
-            .and_then(|s| s.sub_width(2))
-            .max_width_error(g_shape.width, span)?;
+            .offset_left(result.len(), span)?
+            .sub_width(2, span)?;
         let generics_str = rewrite_generics(context, ident_str, generics, g_shape)?;
         result.push_str(&generics_str);
     }
@@ -1781,9 +1768,7 @@ fn rewrite_ty<R: Rewrite>(
         if !bounds.is_empty() {
             // 2 = `: `
             let shape = Shape::indented(indent, context.config);
-            let shape = shape
-                .offset_left(result.len() + 2)
-                .max_width_error(shape.width, span)?;
+            let shape = shape.offset_left(result.len() + 2, span)?;
             let type_bounds = bounds
                 .rewrite_result(context, shape)
                 .map(|s| format!(": {}", s))?;
@@ -1843,9 +1828,7 @@ fn rewrite_ty<R: Rewrite>(
                     Shape::indented(indent, context.config)
                 } else {
                     let shape = Shape::indented(indent, context.config);
-                    shape
-                        .block_left(context.config.tab_spaces())
-                        .max_width_error(shape.width, span)?
+                    shape.block_left(context.config.tab_spaces(), span)?
                 };
 
                 combine_strs_with_missing_comments(
@@ -1863,9 +1846,7 @@ fn rewrite_ty<R: Rewrite>(
         // 1 = `;` unless there's a trailing where clause
         let shape = Shape::indented(indent, context.config);
         let shape = if after_where_clause.predicates.is_empty() {
-            Shape::indented(indent, context.config)
-                .sub_width(1)
-                .max_width_error(shape.width, span)?
+            Shape::indented(indent, context.config).sub_width(1, span)?
         } else {
             shape
         };
@@ -1906,15 +1887,16 @@ pub(crate) fn rewrite_struct_field_prefix(
     field: &ast::FieldDef,
 ) -> RewriteResult {
     let vis = format_visibility(context, &field.vis);
-    let safety = format_safety(field.safety);
+    let mut_restriction = format_mut_restriction(context, field.mut_restriction());
+    let safety = format_safety(field.safety());
     let type_annotation_spacing = type_annotation_spacing(context.config);
     Ok(match field.ident {
         Some(name) => format!(
-            "{vis}{safety}{}{}:",
+            "{vis}{mut_restriction}{safety}{}{}:",
             rewrite_ident(context, name),
             type_annotation_spacing.0
         ),
-        None => format!("{vis}{safety}"),
+        None => format!("{vis}{mut_restriction}{safety}"),
     })
 }
 
@@ -1935,7 +1917,7 @@ pub(crate) fn rewrite_struct_field(
     lhs_max_width: usize,
 ) -> RewriteResult {
     // FIXME(default_field_values): Implement formatting.
-    if field.default.is_some() {
+    if field.default_value().is_some() {
         return Err(RewriteError::Unknown);
     }
 
@@ -1978,7 +1960,7 @@ pub(crate) fn rewrite_struct_field(
     }
 
     let orig_ty = shape
-        .offset_left(overhead + spacing.len())
+        .offset_left_opt(overhead + spacing.len())
         .and_then(|ty_shape| field.ty.rewrite_result(context, ty_shape).ok());
 
     if let Some(ref ty) = orig_ty {
@@ -2028,12 +2010,16 @@ impl<'a> StaticParts<'a> {
                 ),
                 ast::ItemKind::Const(c) => (
                     Some(c.defaultness),
-                    "const",
+                    if c.kind == ast::ConstItemKind::TypeConst {
+                        "type const"
+                    } else {
+                        "const"
+                    },
                     ast::Safety::Default,
                     c.ident,
                     &c.ty,
                     ast::Mutability::Not,
-                    c.rhs.as_ref().map(|rhs| rhs.expr()),
+                    c.body.as_deref(),
                     Some(&c.generics),
                 ),
                 _ => unreachable!(),
@@ -2053,17 +2039,25 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_trait_item(ti: &'a ast::AssocItem, ident: Ident) -> Self {
-        let (defaultness, ty, expr_opt, generics) = match &ti.kind {
-            ast::AssocItemKind::Const(c) => (
-                c.defaultness,
-                &c.ty,
-                c.rhs.as_ref().map(|rhs| rhs.expr()),
-                Some(&c.generics),
-            ),
+        let (defaultness, ty, expr_opt, generics, prefix) = match &ti.kind {
+            ast::AssocItemKind::Const(c) => {
+                let prefix = if c.kind == ast::ConstItemKind::TypeConst {
+                    "type const"
+                } else {
+                    "const"
+                };
+                (
+                    c.defaultness,
+                    &c.ty,
+                    c.body.as_deref(),
+                    Some(&c.generics),
+                    prefix,
+                )
+            }
             _ => unreachable!(),
         };
         StaticParts {
-            prefix: "const",
+            prefix,
             safety: ast::Safety::Default,
             vis: &ti.vis,
             ident,
@@ -2077,17 +2071,25 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_impl_item(ii: &'a ast::AssocItem, ident: Ident) -> Self {
-        let (defaultness, ty, expr_opt, generics) = match &ii.kind {
-            ast::AssocItemKind::Const(c) => (
-                c.defaultness,
-                &c.ty,
-                c.rhs.as_ref().map(|rhs| rhs.expr()),
-                Some(&c.generics),
-            ),
+        let (defaultness, ty, expr_opt, generics, prefix) = match &ii.kind {
+            ast::AssocItemKind::Const(c) => {
+                let prefix = if c.kind == ast::ConstItemKind::TypeConst {
+                    "type const"
+                } else {
+                    "const"
+                };
+                (
+                    c.defaultness,
+                    &c.ty,
+                    c.body.as_deref(),
+                    Some(&c.generics),
+                    prefix,
+                )
+            }
             _ => unreachable!(),
         };
         StaticParts {
-            prefix: "const",
+            prefix,
             safety: ast::Safety::Default,
             vis: &ii.vis,
             ident,
@@ -2106,28 +2108,44 @@ fn rewrite_static(
     static_parts: &StaticParts<'_>,
     offset: Indent,
 ) -> Option<String> {
-    // For now, if this static (or const) has generics, then bail.
+    // For now, if this static (or const) has a where clause, then bail.
     if static_parts
         .generics
-        .is_some_and(|g| !g.params.is_empty() || !g.where_clause.is_empty())
+        .is_some_and(|g| !g.where_clause.is_empty())
     {
         return None;
     }
-
+    let generics = static_parts
+        .generics
+        .and_then(|g| {
+            format_generics(
+                context,
+                &g,
+                context.config.brace_style(),
+                BracePos::None,
+                offset,
+                // make a span that starts right after `const x<n>`
+                mk_sp(static_parts.ident.span.hi(), static_parts.ty.span.lo()),
+                offset.block_indent,
+            )
+        })
+        .map_or("".into(), |x| format!("{x}"));
     let colon = colon_spaces(context.config);
     let mut prefix = format!(
-        "{}{}{}{} {}{}{}",
+        "{}{}{}{} {}{}{}{}",
         format_visibility(context, static_parts.vis),
         static_parts.defaultness.map_or("", format_defaultness),
         format_safety(static_parts.safety),
         static_parts.prefix,
         format_mutability(static_parts.mutability),
         rewrite_ident(context, static_parts.ident),
-        colon,
+        generics,
+        colon
     );
+
     // 2 = " =".len()
-    let ty_shape =
-        Shape::indented(offset.block_only(), context.config).offset_left(prefix.len() + 2)?;
+    let ty_shape = Shape::indented(offset.block_only(), context.config)
+        .offset_left_opt(last_line_width(&prefix) + 2)?;
     let ty_str = match static_parts.ty.rewrite(context, ty_shape) {
         Some(ty_str) => ty_str,
         None => {
@@ -2183,7 +2201,7 @@ struct OpaqueType<'a> {
 
 impl<'a> Rewrite for OpaqueType<'a> {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
-        let shape = shape.offset_left(5)?; // `impl `
+        let shape = shape.offset_left_opt(5)?; // `impl `
         self.bounds
             .rewrite(context, shape)
             .map(|s| format!("impl {}", s))
@@ -2215,9 +2233,7 @@ impl Rewrite for ast::FnRetTy {
                         .map(|r| format!("-> {}", r));
                 }
 
-                let shape = shape
-                    .offset_left(arrow_width)
-                    .max_width_error(shape.width, self.span())?;
+                let shape = shape.offset_left(arrow_width, self.span())?;
 
                 ty.rewrite_result(context, shape)
                     .map(|s| format!("-> {}", s))
@@ -2363,7 +2379,14 @@ impl Rewrite for ast::Param {
 
             Ok(result)
         } else {
-            self.ty.rewrite_result(context, shape)
+            combine_strs_with_missing_comments(
+                context,
+                &param_attrs_result,
+                &self.ty.rewrite_result(context, shape)?,
+                span,
+                shape,
+                !has_multiple_attr_lines && !has_doc_comments,
+            )
         }
     }
 }
@@ -2587,13 +2610,13 @@ fn rewrite_fn_base(
             .map_or(false, |last_line| last_line.contains("//"));
 
         if context.config.style_edition() >= StyleEdition::Edition2024 {
-            if closing_paren_overflow_max_width {
-                result.push(')');
+            if params_last_line_contains_comment {
                 result.push_str(&indent.to_string_with_newline(context.config));
+                result.push(')');
                 no_params_and_over_max_width = true;
-            } else if params_last_line_contains_comment {
-                result.push_str(&indent.to_string_with_newline(context.config));
+            } else if closing_paren_overflow_max_width {
                 result.push(')');
+                result.push_str(&indent.to_string_with_newline(context.config));
                 no_params_and_over_max_width = true;
             } else {
                 result.push(')');
@@ -2651,7 +2674,7 @@ fn rewrite_fn_base(
                     // Aligning with nonexistent params looks silly.
                     force_new_line_for_brace = true;
                     ret_shape = if context.use_block_indent() {
-                        ret_shape.offset_left(4).unwrap_or(ret_shape)
+                        ret_shape.offset_left_opt(4).unwrap_or(ret_shape)
                     } else {
                         ret_shape.indent = ret_shape.indent + 4;
                         ret_shape
@@ -2672,11 +2695,16 @@ fn rewrite_fn_base(
 
             let ret_shape = Shape::indented(indent, context.config);
             ret_shape
-                .offset_left(last_line_width(&result))
+                .offset_left_opt(last_line_width(&result))
                 .unwrap_or(ret_shape)
         };
 
-        if multi_line_ret_str || ret_should_indent {
+        let exceeds_max_width = last_line_width(&result) + ret_str_len > context.config.max_width();
+
+        if multi_line_ret_str
+            || ret_should_indent
+            || (context.config.style_edition() >= StyleEdition::Edition2027 && exceeds_max_width)
+        {
             // Now that we know the proper indent and width, we need to
             // re-layout the return type.
             let ret_str = fd.output.rewrite_result(context, ret_shape)?;
@@ -2870,7 +2898,7 @@ fn rewrite_params(
         context
             .config
             .fn_params_layout()
-            .to_list_tactic(param_items.len()),
+            .to_list_tactic(context.config.style_edition(), param_items.len()),
         Separator::Comma,
         one_line_budget,
     );
@@ -2991,16 +3019,21 @@ fn rewrite_generics(
     overflow::rewrite_with_angle_brackets(context, ident, params, shape, generics.span)
 }
 
-fn generics_shape_from_config(config: &Config, shape: Shape, offset: usize) -> Option<Shape> {
+fn generics_shape_from_config(
+    config: &Config,
+    shape: Shape,
+    offset: usize,
+    span: Span,
+) -> Result<Shape, ExceedsMaxWidthError> {
     match config.indent_style() {
-        IndentStyle::Visual => shape.visual_indent(1 + offset).sub_width(offset + 2),
+        IndentStyle::Visual => shape.visual_indent(1 + offset).sub_width(offset + 2, span),
         IndentStyle::Block => {
             // 1 = ","
             shape
                 .block()
                 .block_indent(config.tab_spaces())
                 .with_max_width(config)
-                .sub_width(1)
+                .sub_width(1, span)
         }
     }
 }
@@ -3028,9 +3061,8 @@ fn rewrite_where_clause_rfc_style(
     let clause_shape = shape
         .block()
         .with_max_width(context.config)
-        .block_left(context.config.tab_spaces())
-        .and_then(|s| s.sub_width(1))
-        .max_width_error(shape.width, where_span)?;
+        .block_left(context.config.tab_spaces(), where_span)?
+        .sub_width(1, where_span)?;
     let force_single_line = context.config.where_single_line()
         && predicates.len() == 1
         && !where_clause_option.veto_single_line;
@@ -3070,9 +3102,8 @@ fn rewrite_where_keyword(
     let block_shape = shape.block().with_max_width(context.config);
     // 1 = `,`
     let clause_shape = block_shape
-        .block_left(context.config.tab_spaces())
-        .and_then(|s| s.sub_width(1))
-        .max_width_error(block_shape.width, where_span)?;
+        .block_left(context.config.tab_spaces(), where_span)?
+        .sub_width(1, where_span)?;
 
     let comment_separator = |comment: &str, shape: Shape| {
         if comment.is_empty() {
@@ -3475,7 +3506,7 @@ impl Rewrite for ast::ForeignItem {
                         context,
                         shape.indent,
                         ident,
-                        &FnSig::from_method_sig(sig, generics, &self.vis),
+                        &FnSig::from_method_sig(sig, generics, &self.vis, defaultness),
                         span,
                         FnBraceStyle::None,
                     )
@@ -3501,9 +3532,7 @@ impl Rewrite for ast::ForeignItem {
                     prefix,
                     &static_foreign_item.ty,
                     &RhsAssignKind::Ty,
-                    shape
-                        .sub_width(1)
-                        .max_width_error(shape.width, static_foreign_item.ty.span)?,
+                    shape.sub_width(1, static_foreign_item.ty.span)?,
                 )
                 .map(|s| s + ";")
             }
@@ -3538,9 +3567,9 @@ fn rewrite_attrs(
     item: &ast::Item,
     item_str: &str,
     shape: Shape,
-) -> Option<String> {
+) -> RewriteResult {
     let attrs = filter_inline_attrs(&item.attrs, item.span());
-    let attrs_str = attrs.rewrite(context, shape)?;
+    let attrs_str = attrs.rewrite_result(context, shape)?;
 
     let missed_span = if attrs.is_empty() {
         mk_sp(item.span.lo(), item.span.lo())
@@ -3564,7 +3593,6 @@ fn rewrite_attrs(
         shape,
         allow_extend,
     )
-    .ok()
 }
 
 /// Rewrite an inline mod.
@@ -3574,7 +3602,7 @@ pub(crate) fn rewrite_mod(
     item: &ast::Item,
     ident: Ident,
     attrs_shape: Shape,
-) -> Option<String> {
+) -> RewriteResult {
     let mut result = String::with_capacity(32);
     result.push_str(&*format_visibility(context, &item.vis));
     result.push_str("mod ");
@@ -3589,7 +3617,7 @@ pub(crate) fn rewrite_extern_crate(
     context: &RewriteContext<'_>,
     item: &ast::Item,
     attrs_shape: Shape,
-) -> Option<String> {
+) -> RewriteResult {
     assert!(is_extern_crate(item));
     let new_str = context.snippet(item.span);
     let item_str = if contains_comment(new_str) {

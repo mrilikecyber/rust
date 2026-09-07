@@ -1,20 +1,17 @@
 //! Type inhabitedness logic.
 use std::ops::ControlFlow::{self, Break, Continue};
 
-use hir_def::{AdtId, EnumVariantId, ModuleId, VariantId, visibility::Visibility};
-use rustc_hash::FxHashSet;
-use rustc_type_ir::{
-    TypeSuperVisitable, TypeVisitable, TypeVisitor,
-    inherent::{AdtDef, IntoKind},
+use hir_def::{
+    AdtId, EnumVariantId, ModuleId, VariantId, signatures::VariantFields, visibility::Visibility,
 };
-use triomphe::Arc;
+use rustc_hash::FxHashSet;
+use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor, inherent::IntoKind};
 
 use crate::{
-    TraitEnvironment,
     consteval::try_const_usize,
     db::HirDatabase,
     next_solver::{
-        DbInterner, EarlyBinder, GenericArgs, Ty, TyKind,
+        DbInterner, EarlyBinder, GenericArgs, ParamEnv, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -26,7 +23,7 @@ pub(crate) fn is_ty_uninhabited_from<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,
     target_mod: ModuleId,
-    env: Arc<TraitEnvironment<'db>>,
+    env: ParamEnv<'db>,
 ) -> bool {
     let _p = tracing::info_span!("is_ty_uninhabited_from", ?ty).entered();
     let mut uninhabited_from = UninhabitedFrom::new(infcx, target_mod, env);
@@ -41,7 +38,7 @@ pub(crate) fn is_enum_variant_uninhabited_from<'db>(
     variant: EnumVariantId,
     subst: GenericArgs<'db>,
     target_mod: ModuleId,
-    env: Arc<TraitEnvironment<'db>>,
+    env: ParamEnv<'db>,
 ) -> bool {
     let _p = tracing::info_span!("is_enum_variant_uninhabited_from").entered();
 
@@ -56,7 +53,7 @@ struct UninhabitedFrom<'a, 'db> {
     // guard for preventing stack overflow in non trivial non terminating types
     max_depth: usize,
     infcx: &'a InferCtxt<'db>,
-    env: Arc<TraitEnvironment<'db>>,
+    env: ParamEnv<'db>,
 }
 
 const CONTINUE_OPAQUELY_INHABITED: ControlFlow<VisiblyUninhabited> = Continue(());
@@ -78,14 +75,14 @@ impl<'db> TypeVisitor<DbInterner<'db>> for UninhabitedFrom<'_, 'db> {
 
         if matches!(ty.kind(), TyKind::Alias(..)) {
             let mut ocx = ObligationCtxt::new(self.infcx);
-            match ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env.env, ty) {
+            match ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty) {
                 Ok(it) => ty = it,
                 Err(_) => return CONTINUE_OPAQUELY_INHABITED,
             }
         }
 
         let r = match ty.kind() {
-            TyKind::Adt(adt, subst) => self.visit_adt(adt.def_id().0, subst),
+            TyKind::Adt(adt, subst) => self.visit_adt(adt.def_id(), subst),
             TyKind::Never => BREAK_VISIBLY_UNINHABITED,
             TyKind::Tuple(..) => ty.super_visit_with(self),
             TyKind::Array(item_ty, len) => match try_const_usize(self.infcx.interner.db, len) {
@@ -101,11 +98,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for UninhabitedFrom<'_, 'db> {
 }
 
 impl<'a, 'db> UninhabitedFrom<'a, 'db> {
-    fn new(
-        infcx: &'a InferCtxt<'db>,
-        target_mod: ModuleId,
-        env: Arc<TraitEnvironment<'db>>,
-    ) -> Self {
+    fn new(infcx: &'a InferCtxt<'db>, target_mod: ModuleId, env: ParamEnv<'db>) -> Self {
         Self { target_mod, recursive_ty: FxHashSet::default(), max_depth: 500, infcx, env }
     }
 
@@ -132,7 +125,7 @@ impl<'a, 'db> UninhabitedFrom<'a, 'db> {
             AdtId::EnumId(e) => {
                 let enum_data = e.enum_variants(self.db());
 
-                for &(variant, _, _) in enum_data.variants.iter() {
+                for &(variant, _) in enum_data.variants.values() {
                     let variant_inhabitedness = self.visit_variant(variant.into(), subst);
                     match variant_inhabitedness {
                         Break(VisiblyUninhabited) => (),
@@ -157,10 +150,14 @@ impl<'a, 'db> UninhabitedFrom<'a, 'db> {
 
         let is_enum = matches!(variant, VariantId::EnumVariantId(..));
         let field_tys = self.db().field_types(variant);
-        let field_vis = if is_enum { None } else { Some(self.db().field_visibilities(variant)) };
+        let field_vis = if is_enum {
+            None
+        } else {
+            Some(VariantFields::field_visibilities(self.db(), variant))
+        };
 
         for (fid, _) in fields.iter() {
-            self.visit_field(field_vis.as_ref().map(|it| it[fid]), &field_tys[fid], subst)?;
+            self.visit_field(field_vis.as_ref().map(|it| it[fid]), &field_tys[fid].ty(), subst)?;
         }
         CONTINUE_OPAQUELY_INHABITED
     }
@@ -172,7 +169,7 @@ impl<'a, 'db> UninhabitedFrom<'a, 'db> {
         subst: GenericArgs<'db>,
     ) -> ControlFlow<VisiblyUninhabited> {
         if vis.is_none_or(|it| it.is_visible_from(self.db(), self.target_mod)) {
-            let ty = ty.instantiate(self.interner(), subst);
+            let ty = ty.instantiate(self.interner(), subst).skip_norm_wip();
             ty.visit_with(self)
         } else {
             CONTINUE_OPAQUELY_INHABITED

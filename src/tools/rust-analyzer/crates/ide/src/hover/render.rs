@@ -1,17 +1,16 @@
 //! Logic for rendering the different hover messages
-use std::{env, mem, ops::Not};
+use std::{borrow::Cow, env, mem, ops::Not};
 
 use either::Either;
 use hir::{
     Adt, AsAssocItem, AsExternAssocItem, CaptureKind, DisplayTarget, DropGlue,
     DynCompatibilityViolation, HasCrate, HasSource, HirDisplay, Layout, LayoutError,
-    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, VariantDef,
-    db::ExpandDatabase,
+    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, Variant,
 };
 use ide_db::{
     RootDatabase,
     defs::{Definition, find_std_module},
-    documentation::{DocsRangeMap, HasDocs},
+    documentation::{Documentation, HasDocs},
     famous_defs::FamousDefs,
     generated::lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
     syntax_helpers::prettify_macro_expansion,
@@ -74,7 +73,7 @@ pub(super) fn try_expr(
                 ast::Fn(fn_) => sema.to_def(&fn_)?.ret_type(sema.db),
                 ast::Item(__) => return None,
                 ast::ClosureExpr(closure) => sema.type_of_expr(&closure.body()?)?.original,
-                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try(_)| ast::BlockModifier::Const(_))) {
+                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try { .. } | ast::BlockModifier::Const(_))) {
                     sema.type_of_expr(&block_expr.into())?.original
                 } else {
                     continue;
@@ -228,37 +227,14 @@ pub(super) fn underscore(
         return None;
     }
     let parent = token.parent()?;
-    let _it = match_ast! {
+    match_ast! {
         match parent {
-            ast::InferType(it) => it,
-            ast::UnderscoreExpr(it) => return type_info_of(sema, config, &Either::Left(ast::Expr::UnderscoreExpr(it)),edition, display_target),
-            ast::WildcardPat(it) => return type_info_of(sema, config, &Either::Right(ast::Pat::WildcardPat(it)),edition, display_target),
-            _ => return None,
+            ast::InferType(it) => type_info(sema, config, TypeInfo { original: sema.resolve_type(&ast::Type::InferType(it))?, adjusted: None}, edition, display_target),
+            ast::UnderscoreExpr(it) => type_info(sema, config, sema.type_of_expr(&ast::Expr::UnderscoreExpr(it))?, edition, display_target),
+            ast::WildcardPat(it) => type_info(sema, config, sema.type_of_pat(&ast::Pat::WildcardPat(it))?, edition, display_target),
+            _ => None,
         }
-    };
-    // let it = infer_type.syntax().parent()?;
-    // match_ast! {
-    //     match it {
-    //         ast::LetStmt(_it) => (),
-    //         ast::Param(_it) => (),
-    //         ast::RetType(_it) => (),
-    //         ast::TypeArg(_it) => (),
-
-    //         ast::CastExpr(_it) => (),
-    //         ast::ParenType(_it) => (),
-    //         ast::TupleType(_it) => (),
-    //         ast::PtrType(_it) => (),
-    //         ast::RefType(_it) => (),
-    //         ast::ArrayType(_it) => (),
-    //         ast::SliceType(_it) => (),
-    //         ast::ForType(_it) => (),
-    //         _ => return None,
-    //     }
-    // }
-
-    // FIXME: https://github.com/rust-lang/rust-analyzer/issues/11762, this currently always returns Unknown
-    // type_info(sema, config, sema.resolve_type(&ast::Type::InferType(it))?, None)
-    None
+    }
 }
 
 pub(super) fn keyword(
@@ -278,9 +254,9 @@ pub(super) fn keyword(
         keyword_hints(sema, token, parent, edition, display_target);
 
     let doc_owner = find_std_module(&famous_defs, &keyword_mod, edition)?;
-    let (docs, range_map) = doc_owner.docs_with_rangemap(sema.db)?;
+    let docs = doc_owner.docs_with_rangemap(sema.db)?;
     let (markup, range_map) =
-        markup(Some(docs.into()), Some(range_map), description, None, None, String::new());
+        markup(Some(Either::Left(docs)), description, None, None, String::new());
     let markup = process_markup(sema.db, Definition::Module(doc_owner), &markup, range_map, config);
     Some(HoverResult { markup, actions })
 }
@@ -295,9 +271,9 @@ pub(super) fn struct_rest_pat(
     edition: Edition,
     display_target: DisplayTarget,
 ) -> HoverResult {
-    let missing_fields = sema.record_pattern_missing_fields(pattern);
+    let matched_fields = sema.record_pattern_matched_fields(pattern);
 
-    // if there are no missing fields, the end result is a hover that shows ".."
+    // if there are no matched fields, the end result is a hover that shows ".."
     // should be left in to indicate that there are no more fields in the pattern
     // example, S {a: 1, b: 2, ..} when struct S {a: u32, b: u32}
 
@@ -308,13 +284,13 @@ pub(super) fn struct_rest_pat(
             targets.push(item);
         }
     };
-    for (_, t) in &missing_fields {
+    for (_, t) in &matched_fields {
         walk_and_push_ty(sema.db, t, &mut push_new_def);
     }
 
     res.markup = {
         let mut s = String::from(".., ");
-        for (f, _) in &missing_fields {
+        for (f, _) in &matched_fields {
             s += f.display(sema.db, display_target).to_string().as_ref();
             s += ", ";
         }
@@ -350,13 +326,7 @@ pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<Hove
         _ => return None,
     };
 
-    let tmp;
-    let needle = if is_clippy {
-        tmp = format!("clippy::{}", token.text());
-        &tmp
-    } else {
-        token.text()
-    };
+    let needle = if is_clippy { &format!("clippy::{}", token.text()) } else { token.text() };
 
     let lint =
         lints.binary_search_by_key(&needle, |lint| lint.label).ok().map(|idx| &lints[idx])?;
@@ -368,35 +338,39 @@ pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<Hove
 
 pub(super) fn process_markup(
     db: &RootDatabase,
-    def: Definition,
+    def: Definition<'_>,
     markup: &Markup,
-    markup_range_map: Option<DocsRangeMap>,
+    markup_range_map: Option<hir::Docs>,
     config: &HoverConfig<'_>,
 ) -> Markup {
     let markup = markup.as_str();
     let markup = if config.links_in_hover {
-        rewrite_links(db, markup, def, markup_range_map)
+        rewrite_links(db, markup, def, markup_range_map.as_ref())
     } else {
         remove_links(markup)
     };
     Markup::from(markup)
 }
 
-fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -> Option<String> {
+fn definition_owner_name(
+    db: &RootDatabase,
+    def: Definition<'_>,
+    edition: Edition,
+) -> Option<String> {
     match def {
         Definition::Field(f) => {
             let parent = f.parent_def(db);
             let parent_name = parent.name(db);
             let parent_name = parent_name.display(db, edition).to_string();
             return match parent {
-                VariantDef::Variant(variant) => {
+                Variant::EnumVariant(variant) => {
                     let enum_name = variant.parent_enum(db).name(db);
                     Some(format!("{}::{parent_name}", enum_name.display(db, edition)))
                 }
                 _ => Some(parent_name),
             };
         }
-        Definition::Variant(e) => Some(e.parent_enum(db).name(db)),
+        Definition::EnumVariant(e) => Some(e.parent_enum(db).name(db)),
         Definition::GenericParam(generic_param) => match generic_param.parent() {
             hir::GenericDef::Adt(it) => Some(it.name(db)),
             hir::GenericDef::Trait(it) => Some(it.name(db)),
@@ -464,47 +438,49 @@ pub(super) fn path(
     item_name: Option<String>,
     edition: Edition,
 ) -> String {
-    let crate_name = module.krate().display_name(db).as_ref().map(|it| it.to_string());
-    let module_path = module
-        .path_to_root(db)
-        .into_iter()
-        .rev()
-        .flat_map(|it| it.name(db).map(|name| name.display(db, edition).to_string()));
+    let crate_name = module.krate(db).display_name(db).as_ref().map(|it| it.to_string());
+    let module_path = module.path_segments(db).map(|it| it.display(db, edition).to_string());
     crate_name.into_iter().chain(module_path).chain(item_name).join("::")
 }
 
 pub(super) fn definition(
     db: &RootDatabase,
-    def: Definition,
+    def: Definition<'_>,
     famous_defs: Option<&FamousDefs<'_, '_>>,
     notable_traits: &[(Trait, Vec<(Option<Type<'_>>, Name)>)],
     macro_arm: Option<u32>,
     render_extras: bool,
+    render_private_fields: bool,
     subst_types: Option<&Vec<(Symbol, Type<'_>)>>,
     config: &HoverConfig<'_>,
     edition: Edition,
     display_target: DisplayTarget,
-) -> (Markup, Option<DocsRangeMap>) {
+) -> (Markup, Option<hir::Docs>) {
     let mod_path = definition_path(db, &def, edition);
     let label = match def {
         Definition::Trait(trait_) => trait_
             .display_limited(db, config.max_trait_assoc_items_count, display_target)
+            .with_private_fields(render_private_fields)
             .to_string(),
-        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
-            adt.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::Variant(variant) => {
-            variant.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::Adt(adt @ Adt::Enum(_)) => {
-            adt.display_limited(db, config.max_enum_variants_count, display_target).to_string()
-        }
+        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => adt
+            .display_limited(db, config.max_fields_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
+        Definition::EnumVariant(variant) => variant
+            .display_limited(db, config.max_fields_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
+        Definition::Adt(adt @ Adt::Enum(_)) => adt
+            .display_limited(db, config.max_enum_variants_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
         Definition::SelfType(impl_def) => {
             let self_ty = &impl_def.self_ty(db);
             match self_ty.as_adt() {
-                Some(adt) => {
-                    adt.display_limited(db, config.max_fields_count, display_target).to_string()
-                }
+                Some(adt) => adt
+                    .display_limited(db, config.max_fields_count, display_target)
+                    .with_private_fields(render_private_fields)
+                    .to_string(),
                 None => self_ty.display(db, display_target).to_string(),
             }
         }
@@ -520,21 +496,20 @@ pub(super) fn definition(
         }
         _ => def.label(db, display_target),
     };
-    let (docs, range_map) =
-        if let Some((docs, doc_range)) = def.docs_with_rangemap(db, famous_defs, display_target) {
-            (Some(docs), doc_range)
-        } else {
-            (None, None)
-        };
+    let docs = if config.documentation {
+        def.docs_with_rangemap(db, famous_defs, display_target)
+    } else {
+        None
+    };
     let value = || match def {
-        Definition::Variant(it) => {
+        Definition::EnumVariant(it) => {
             if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
                     Ok(it) => {
                         Some(if it >= 10 { format!("{it} ({it:#X})") } else { format!("{it}") })
                     }
                     Err(err) => {
-                        let res = it.value(db).map(|it| format!("{it:?}"));
+                        let res = it.value(db).map(|it| it.to_string());
                         if env::var_os("RA_DEV").is_some() {
                             let res = res.as_deref().unwrap_or("");
                             Some(format!(
@@ -554,7 +529,8 @@ pub(super) fn definition(
             let body = it.eval(db);
             Some(match body {
                 Ok(it) => match it.render_debug(db) {
-                    Ok(it) => it,
+                    Ok(rendered) if rendered.is_empty() => it.render(db, display_target),
+                    Ok(rendered) => rendered,
                     Err(err) => {
                         let it = it.render(db, display_target);
                         if env::var_os("RA_DEV").is_some() {
@@ -571,8 +547,8 @@ pub(super) fn definition(
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
-                        let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        let span_map = macro_file.expansion_span_map(db);
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -586,7 +562,9 @@ pub(super) fn definition(
             let body = it.eval(db);
             Some(match body {
                 Ok(it) => match it.render_debug(db) {
-                    Ok(it) => it,
+                    Ok(rendered) if rendered.is_empty() => it.render(db, display_target),
+                    Ok(rendered) => rendered,
+
                     Err(err) => {
                         let it = it.render(db, display_target);
                         if env::var_os("RA_DEV").is_some() {
@@ -603,8 +581,8 @@ pub(super) fn definition(
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
-                        let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        let span_map = macro_file.expansion_span_map(db);
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -624,7 +602,7 @@ pub(super) fn definition(
             |_| {
                 let var_def = it.parent_def(db);
                 match var_def {
-                    hir::VariantDef::Struct(s) => {
+                    hir::Variant::Struct(s) => {
                         Adt::from(s).layout(db).ok().and_then(|layout| layout.field_offset(it))
                     }
                     _ => None,
@@ -655,7 +633,7 @@ pub(super) fn definition(
             |_| None,
             |_| None,
         ),
-        Definition::Variant(it) => render_memory_layout(
+        Definition::EnumVariant(it) => render_memory_layout(
             config.memory_layout,
             || it.layout(db),
             |_| None,
@@ -692,14 +670,14 @@ pub(super) fn definition(
         }
         let drop_info = match def {
             Definition::Field(field) => {
-                DropInfo { drop_glue: field.ty(db).to_type(db).drop_glue(db), has_dtor: None }
+                DropInfo { drop_glue: field.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Adt(Adt::Struct(strukt)) => {
-                let struct_drop_glue = strukt.ty_params(db).drop_glue(db);
+                let struct_drop_glue = strukt.ty(db).drop_glue(db);
                 let mut fields_drop_glue = strukt
                     .fields(db)
                     .iter()
-                    .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                    .map(|field| field.ty(db).drop_glue(db))
                     .max()
                     .unwrap_or(DropGlue::None);
                 let has_dtor = match (fields_drop_glue, struct_drop_glue) {
@@ -716,10 +694,10 @@ pub(super) fn definition(
             // Unions cannot have fields with drop glue.
             Definition::Adt(Adt::Union(union)) => DropInfo {
                 drop_glue: DropGlue::None,
-                has_dtor: Some(union.ty_params(db).drop_glue(db) != DropGlue::None),
+                has_dtor: Some(union.ty(db).drop_glue(db) != DropGlue::None),
             },
             Definition::Adt(Adt::Enum(enum_)) => {
-                let enum_drop_glue = enum_.ty_params(db).drop_glue(db);
+                let enum_drop_glue = enum_.ty(db).drop_glue(db);
                 let fields_drop_glue = enum_
                     .variants(db)
                     .iter()
@@ -727,7 +705,7 @@ pub(super) fn definition(
                         variant
                             .fields(db)
                             .iter()
-                            .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                            .map(|field| field.ty(db).drop_glue(db))
                             .max()
                             .unwrap_or(DropGlue::None)
                     })
@@ -738,17 +716,17 @@ pub(super) fn definition(
                     has_dtor: Some(enum_drop_glue > fields_drop_glue),
                 }
             }
-            Definition::Variant(variant) => {
+            Definition::EnumVariant(variant) => {
                 let fields_drop_glue = variant
                     .fields(db)
                     .iter()
-                    .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                    .map(|field| field.ty(db).drop_glue(db))
                     .max()
                     .unwrap_or(DropGlue::None);
                 DropInfo { drop_glue: fields_drop_glue, has_dtor: None }
             }
             Definition::TypeAlias(type_alias) => {
-                DropInfo { drop_glue: type_alias.ty_params(db).drop_glue(db), has_dtor: None }
+                DropInfo { drop_glue: type_alias.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Local(local) => {
                 DropInfo { drop_glue: local.ty(db).drop_glue(db), has_dtor: None }
@@ -842,14 +820,7 @@ pub(super) fn definition(
         }
     };
 
-    markup(
-        docs.map(Into::into),
-        range_map,
-        desc,
-        extra.is_empty().not().then_some(extra),
-        mod_path,
-        subst_types,
-    )
+    markup(docs, desc, extra.is_empty().not().then_some(extra), mod_path, subst_types)
 }
 
 #[derive(Debug)]
@@ -1044,8 +1015,9 @@ fn closure_ty(
     display_target: DisplayTarget,
 ) -> Option<HoverResult> {
     let c = original.as_closure()?;
-    let mut captures_rendered = c.captured_items(sema.db)
-        .into_iter()
+    let captures = c.captured_items(sema.db);
+    let mut captures_rendered = captures
+        .iter()
         .map(|it| {
             let borrow_kind = match it.kind() {
                 CaptureKind::SharedRef => "immutable borrow",
@@ -1053,7 +1025,7 @@ fn closure_ty(
                 CaptureKind::MutableRef => "mutable borrow",
                 CaptureKind::Move => "move",
             };
-            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
+            format!("* `{}` by {}", it.display_place_source_code(sema.db, display_target.edition), borrow_kind)
         })
         .join("\n");
     if captures_rendered.trim().is_empty() {
@@ -1066,8 +1038,8 @@ fn closure_ty(
         }
     };
     walk_and_push_ty(sema.db, original, &mut push_new_def);
-    c.capture_types(sema.db).into_iter().for_each(|ty| {
-        walk_and_push_ty(sema.db, &ty, &mut push_new_def);
+    captures.iter().for_each(|capture| {
+        walk_and_push_ty(sema.db, &capture.ty(sema.db), &mut push_new_def);
     });
 
     let adjusted = if let Some(adjusted_ty) = adjusted {
@@ -1083,8 +1055,8 @@ fn closure_ty(
     };
     let mut markup = format!("```rust\n{}\n```", c.display_with_impl(sema.db, display_target));
 
-    if let Some(trait_) = c.fn_trait(sema.db).get_id(sema.db, original.krate(sema.db).into()) {
-        push_new_def(hir::Trait::from(trait_).into())
+    if let Some(trait_) = c.fn_trait(sema.db).get_id(sema.db, original.krate(sema.db)) {
+        push_new_def(trait_.into())
     }
     if let Some(layout) = render_memory_layout(
         config.memory_layout,
@@ -1105,7 +1077,7 @@ fn closure_ty(
     Some(res)
 }
 
-fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Option<String> {
+fn definition_path(db: &RootDatabase, &def: &Definition<'_>, edition: Edition) -> Option<String> {
     if matches!(
         def,
         Definition::TupleField(_)
@@ -1124,13 +1096,12 @@ fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Op
 }
 
 fn markup(
-    docs: Option<String>,
-    range_map: Option<DocsRangeMap>,
+    docs: Option<Either<Cow<'_, hir::Docs>, Documentation<'_>>>,
     rust: String,
     extra: Option<String>,
     mod_path: Option<String>,
     subst_types: String,
-) -> (Markup, Option<DocsRangeMap>) {
+) -> (Markup, Option<hir::Docs>) {
     let mut buf = String::new();
 
     if let Some(mod_path) = mod_path
@@ -1151,21 +1122,32 @@ fn markup(
     if let Some(doc) = docs {
         format_to!(buf, "\n___\n\n");
         let offset = TextSize::new(buf.len() as u32);
-        let buf_range_map = range_map.map(|range_map| range_map.shift_docstring_line_range(offset));
-        format_to!(buf, "{}", doc);
+        let docs_str = match &doc {
+            Either::Left(docs) => docs.docs(),
+            Either::Right(docs) => docs.as_str(),
+        };
+        format_to!(buf, "{}", docs_str);
+        let range_map = match doc {
+            Either::Left(range_map) => {
+                let mut range_map = range_map.into_owned();
+                range_map.shift_by(offset);
+                Some(range_map)
+            }
+            Either::Right(_) => None,
+        };
 
-        (buf.into(), buf_range_map)
+        (buf.into(), range_map)
     } else {
         (buf.into(), None)
     }
 }
 
-fn render_memory_layout(
+fn render_memory_layout<'db>(
     config: Option<MemoryLayoutHoverConfig>,
-    layout: impl FnOnce() -> Result<Layout, LayoutError>,
-    offset: impl FnOnce(&Layout) -> Option<u64>,
-    padding: impl FnOnce(&Layout) -> Option<(&str, u64)>,
-    tag: impl FnOnce(&Layout) -> Option<usize>,
+    layout: impl FnOnce() -> Result<Layout<'db>, LayoutError>,
+    offset: impl FnOnce(&Layout<'db>) -> Option<u64>,
+    padding: impl for<'a> FnOnce(&'a Layout<'db>) -> Option<(&'a str, u64)>,
+    tag: impl FnOnce(&Layout<'db>) -> Option<usize>,
 ) -> Option<String> {
     let config = config?;
     let layout = layout().ok()?;

@@ -1,8 +1,7 @@
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::span_lint_and_help;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -56,7 +55,7 @@ impl<'tcx> LateLintPass<'tcx> for ZeroDiv {
                 expr.span,
                 "constant division of `0.0` with `0.0` will always result in NaN",
                 None,
-                format!("consider using `{float_type}::NAN` if you would like a constant representing NaN",),
+                format!("consider using `{float_type}::NAN` if you would like a constant representing NaN"),
             );
         }
     }

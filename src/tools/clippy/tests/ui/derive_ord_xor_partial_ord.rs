@@ -1,6 +1,5 @@
 #![warn(clippy::derive_ord_xor_partial_ord)]
-#![allow(clippy::unnecessary_wraps)]
-#![allow(clippy::non_canonical_partial_ord_impl)]
+#![expect(clippy::non_canonical_partial_ord_impl)]
 
 use std::cmp::Ordering;
 
@@ -88,6 +87,20 @@ mod issue15708 {
     impl Ord for DerivePartialOrdInUseOrd {
         fn cmp(&self, other: &Self) -> Ordering {
             Ordering::Less
+        }
+    }
+}
+
+mod issue16298 {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+    struct Normalized<S>(S);
+
+    impl<S: Eq> Eq for Normalized<S> {}
+
+    #[expect(clippy::derive_ord_xor_partial_ord)]
+    impl<S: Eq + PartialOrd> Ord for Normalized<S> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.partial_cmp(other).unwrap()
         }
     }
 }

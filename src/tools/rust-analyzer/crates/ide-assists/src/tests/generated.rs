@@ -70,6 +70,27 @@ enum TheEnum {
 }
 
 #[test]
+fn doctest_add_explicit_method_call_deref() {
+    check_doc_test(
+        "add_explicit_method_call_deref",
+        r#####"
+struct Foo;
+impl Foo { fn foo(&self) {} }
+fn test() {
+    Foo$0.$0foo();
+}
+"#####,
+        r#####"
+struct Foo;
+impl Foo { fn foo(&self) {} }
+fn test() {
+    (&Foo).foo();
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_add_explicit_type() {
     check_doc_test(
         "add_explicit_type",
@@ -183,8 +204,8 @@ fn main() {
 "#####,
         r#####"
 fn main() {
-    ${1:'l}: loop {
-        break ${2:'l};
+    ${0:'l}: loop {
+        break ${0:'l};
         continue ${0:'l};
     }
 }
@@ -425,11 +446,24 @@ fn main() {
 }
 
 #[test]
+fn doctest_convert_char_literal() {
+    check_doc_test(
+        "convert_char_literal",
+        r#####"
+const _: char = 'a'$0;
+"#####,
+        r#####"
+const _: char = '\x61';
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_closure_to_fn() {
     check_doc_test(
         "convert_closure_to_fn",
         r#####"
-//- minicore: copy
+//- minicore: copy, fn
 struct String;
 impl String {
     fn new() -> Self {}
@@ -473,8 +507,8 @@ fn main() {
         r#####"
 fn main() {
     let x = vec![1, 2, 3];
-    let mut tmp = x.into_iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = x.into_iter();
+    while let Some(v) = iter.next() {
         let y = v * 2;
     };
 }
@@ -773,6 +807,26 @@ fn main() {
     }
     foo();
     bar();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_to_guarded_return_1() {
+    check_doc_test(
+        "convert_to_guarded_return",
+        r#####"
+//- minicore: option
+fn foo() -> Option<i32> { None }
+fn main() {
+    $0let x = foo();
+}
+"#####,
+        r#####"
+fn foo() -> Option<i32> { None }
+fn main() {
+    let Some(x) = foo() else { return };
 }
 "#####,
     )
@@ -2228,7 +2282,7 @@ macro_rules! const_maker {
     };
 }
 
-trait ${0:NewTrait}<const N: usize> {
+trait ${0:Create}<const N: usize> {
     // Used as an associated constant.
     const CONST_ASSOC: usize = N * 4;
 
@@ -2237,7 +2291,7 @@ trait ${0:NewTrait}<const N: usize> {
     const_maker! {i32, 7}
 }
 
-impl<const N: usize> ${0:NewTrait}<N> for Foo<N> {
+impl<const N: usize> ${0:Create}<N> for Foo<N> {
     // Used as an associated constant.
     const CONST_ASSOC: usize = N * 4;
 
@@ -3173,6 +3227,23 @@ fn main() {
 }
 
 #[test]
+fn doctest_replace_arith_with_strict() {
+    check_doc_test(
+        "replace_arith_with_strict",
+        r#####"
+fn main() {
+  let x = 1 $0+ 2;
+}
+"#####,
+        r#####"
+fn main() {
+  let x = 1.strict_add(2);
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_replace_arith_with_wrapping() {
     check_doc_test(
         "replace_arith_with_wrapping",
@@ -3682,6 +3753,29 @@ fn doctest_unwrap_block() {
         "unwrap_block",
         r#####"
 fn foo() {
+    match () {
+        _ => {$0
+            bar()
+        }
+    }
+}
+"#####,
+        r#####"
+fn foo() {
+    match () {
+        _ => bar(),
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_unwrap_branch() {
+    check_doc_test(
+        "unwrap_branch",
+        r#####"
+fn foo() {
     if true {$0
         println!("foo");
     }
@@ -3798,7 +3892,7 @@ struct S {
 }
 "#####,
         r#####"
-#[cfg_attr($0, derive(Debug))]
+#[cfg_attr(${0:cfg}, derive(Debug))]
 struct S {
    field: i32
 }

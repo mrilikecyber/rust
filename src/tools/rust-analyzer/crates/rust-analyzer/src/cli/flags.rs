@@ -40,6 +40,8 @@ xflags::xflags! {
         cmd parse {
             /// Suppress printing.
             optional --no-dump
+            /// Output as JSON.
+            optional --json
         }
 
         /// Parse stdin and print the list of symbols.
@@ -78,6 +80,8 @@ xflags::xflags! {
             optional --disable-proc-macros
             /// Run the proc-macro-srv binary at the specified path.
             optional --proc-macro-srv path: PathBuf
+            /// Skip lang items fetching.
+            optional --skip-lang-items
             /// Skip body lowering.
             optional --skip-lowering
             /// Skip type inference.
@@ -187,6 +191,9 @@ xflags::xflags! {
 
             /// Exclude code from vendored libraries from the resulting index.
             optional --exclude-vendored-libraries
+
+            /// The number of worker threads for cache priming. Defaults to the number of physical cores.
+            optional --num-threads num_threads: usize
         }
     }
 }
@@ -231,6 +238,7 @@ pub struct LspServer {
 #[derive(Debug)]
 pub struct Parse {
     pub no_dump: bool,
+    pub json: bool,
 }
 
 #[derive(Debug)]
@@ -255,6 +263,7 @@ pub struct AnalysisStats {
     pub disable_build_scripts: bool,
     pub disable_proc_macros: bool,
     pub proc_macro_srv: Option<PathBuf>,
+    pub skip_lang_items: bool,
     pub skip_lowering: bool,
     pub skip_inference: bool,
     pub skip_mir_stats: bool,
@@ -332,6 +341,7 @@ pub struct Scip {
     pub output: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub exclude_vendored_libraries: bool,
+    pub num_threads: Option<usize>,
 }
 
 impl RustAnalyzer {

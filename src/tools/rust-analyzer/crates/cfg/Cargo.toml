@@ -18,6 +18,7 @@ tracing.workspace = true
 
 # locals deps
 tt = { workspace = true, optional = true }
+syntax = { workspace = true, optional = true }
 intern.workspace = true
 
 [dev-dependencies]
@@ -27,10 +28,15 @@ arbitrary = { version = "1.4.1", features = ["derive"] }
 
 # local deps
 syntax-bridge.workspace = true
-syntax.workspace = true
 
-# tt is needed for testing
-cfg = { path = ".", default-features = false, features = ["tt"] }
+# tt and syntax are needed for testing
+cfg = { path = ".", default-features = false, features = ["tt", "syntax"] }
+
+[features]
+default = []
+syntax = ["dep:syntax"]
+tt = ["dep:tt"]
+in-rust-tree = []
 
 [lints]
 workspace = true

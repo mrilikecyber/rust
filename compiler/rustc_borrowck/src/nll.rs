@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use polonius_engine::{Algorithm, AllFacts, Output};
 use rustc_data_structures::frozen::Frozen;
+use rustc_hir::find_attr;
 use rustc_index::IndexSlice;
 use rustc_middle::mir::pretty::PrettyPrintMirOptions;
 use rustc_middle::mir::{Body, MirDumper, PassWhere, Promoted};
@@ -15,17 +16,16 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir_dataflow::move_paths::MoveData;
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_session::config::MirIncludeSpans;
-use rustc_span::sym;
 use tracing::{debug, instrument};
 
 use crate::borrow_set::BorrowSet;
 use crate::consumers::RustcFacts;
 use crate::diagnostics::RegionErrors;
 use crate::handle_placeholders::compute_sccs_applying_placeholder_outlives_constraints;
+use crate::polonius::PoloniusContext;
 use crate::polonius::legacy::{
     PoloniusFacts, PoloniusFactsExt, PoloniusLocationTable, PoloniusOutput,
 };
-use crate::polonius::{PoloniusContext, PoloniusDiagnosticsContext};
 use crate::region_infer::RegionInferenceContext;
 use crate::type_check::MirTypeckRegionConstraints;
 use crate::type_check::free_region_relations::UniversalRegionRelations;
@@ -46,7 +46,7 @@ pub(crate) struct NllOutput<'tcx> {
 
     /// When using `-Zpolonius=next`: the data used to compute errors and diagnostics, e.g.
     /// localized typeck and liveness constraints.
-    pub polonius_diagnostics: Option<PoloniusDiagnosticsContext>,
+    pub polonius_context: Option<PoloniusContext>,
 }
 
 /// Rewrites the regions in the MIR to use NLL variables, also scraping out the set of universal
@@ -111,7 +111,7 @@ pub(crate) fn compute_closure_requirements_modulo_opaques<'tcx>(
 ///
 /// This may result in errors being reported.
 pub(crate) fn compute_regions<'tcx>(
-    root_cx: &mut BorrowCheckRootCtxt<'tcx>,
+    root_cx: &BorrowCheckRootCtxt<'_, 'tcx>,
     infcx: &BorrowckInferCtxt<'tcx>,
     body: &Body<'tcx>,
     location_table: &PoloniusLocationTable,
@@ -121,12 +121,12 @@ pub(crate) fn compute_regions<'tcx>(
     universal_region_relations: Frozen<UniversalRegionRelations<'tcx>>,
     constraints: MirTypeckRegionConstraints<'tcx>,
     mut polonius_facts: Option<AllFacts<RustcFacts>>,
-    polonius_context: Option<PoloniusContext>,
+    mut polonius_context: Option<PoloniusContext>,
 ) -> NllOutput<'tcx> {
     let polonius_output = root_cx.consumer.as_ref().map_or(false, |c| c.polonius_output())
         || infcx.tcx.sess.opts.unstable_opts.polonius.is_legacy_enabled();
 
-    let lowered_constraints = compute_sccs_applying_placeholder_outlives_constraints(
+    let mut lowered_constraints = compute_sccs_applying_placeholder_outlives_constraints(
         constraints,
         &universal_region_relations,
         infcx,
@@ -144,18 +144,29 @@ pub(crate) fn compute_regions<'tcx>(
         &lowered_constraints,
     );
 
+    let num_points = location_map.num_points();
+
+    // If requested for `-Zpolonius=next`, compute loan liveness information.
+    // This is done prior to `RegionInferenceContext::new`, because we may add
+    // additional liveness constraints.
+    if let Some(polonius_context) = polonius_context.as_mut() {
+        let _timer = infcx.tcx.prof.generic_activity("borrowck_polonius_loan_liveness");
+        polonius_context.compute_loan_liveness(
+            &mut lowered_constraints.liveness_constraints,
+            lowered_constraints.outlives_constraints.outlives().iter().copied(),
+            &universal_region_relations.universal_regions,
+            body,
+            borrow_set,
+            num_points,
+        );
+    }
+
     let mut regioncx = RegionInferenceContext::new(
         infcx,
         lowered_constraints,
         universal_region_relations,
         location_map,
     );
-
-    // If requested for `-Zpolonius=next`, convert NLL constraints to localized outlives constraints
-    // and use them to compute loan liveness.
-    let polonius_diagnostics = polonius_context.map(|polonius_context| {
-        polonius_context.compute_loan_liveness(infcx.tcx, &mut regioncx, body, borrow_set)
-    });
 
     // If requested: dump NLL facts, and run legacy polonius analysis.
     let polonius_output = polonius_facts.as_ref().and_then(|polonius_facts| {
@@ -188,7 +199,7 @@ pub(crate) fn compute_regions<'tcx>(
         polonius_output,
         opt_closure_req: closure_region_requirements,
         nll_errors,
-        polonius_diagnostics,
+        polonius_context,
     }
 }
 
@@ -230,13 +241,13 @@ pub(super) fn dump_nll_mir<'tcx>(
     dumper.dump_mir(body);
 
     // Also dump the region constraint graph as a graphviz file.
-    let _: io::Result<()> = try {
+    let _ = try {
         let mut file = dumper.create_dump_file("regioncx.all.dot", body)?;
         regioncx.dump_graphviz_raw_constraints(tcx, &mut file)?;
     };
 
     // Also dump the region constraint SCC graph as a graphviz file.
-    let _: io::Result<()> = try {
+    let _ = try {
         let mut file = dumper.create_dump_file("regioncx.scc.dot", body)?;
         regioncx.dump_graphviz_scc_constraints(tcx, &mut file)?;
     };
@@ -287,17 +298,15 @@ pub(crate) fn emit_nll_mir<'tcx>(
     Ok(())
 }
 
-#[allow(rustc::diagnostic_outside_of_impl)]
-#[allow(rustc::untranslatable_diagnostic)]
-pub(super) fn dump_annotation<'tcx, 'infcx>(
-    infcx: &'infcx BorrowckInferCtxt<'tcx>,
+pub(super) fn dump_annotation<'tcx>(
+    infcx: &BorrowckInferCtxt<'tcx>,
     body: &Body<'tcx>,
     regioncx: &RegionInferenceContext<'tcx>,
     closure_region_requirements: &Option<ClosureRegionRequirements<'tcx>>,
 ) {
     let tcx = infcx.tcx;
     let base_def_id = tcx.typeck_root_def_id(body.source.def_id());
-    if !tcx.has_attr(base_def_id, sym::rustc_regions) {
+    if !find_attr!(tcx, base_def_id, RustcRegions) {
         return;
     }
 

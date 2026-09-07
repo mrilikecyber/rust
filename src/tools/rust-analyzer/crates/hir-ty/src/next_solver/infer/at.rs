@@ -28,13 +28,12 @@
 use rustc_type_ir::{
     FnSig, GenericArgKind, TypeFoldable, TypingMode, Variance,
     error::ExpectedFound,
-    inherent::{IntoKind, Span as _},
     relate::{Relate, TypeRelation, solver_relating::RelateExt},
 };
 
 use crate::next_solver::{
     AliasTerm, AliasTy, Binder, Const, DbInterner, GenericArg, Goal, ParamEnv,
-    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, Predicate, Region, Span, Term,
+    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, Predicate, Region, Term,
     TraitRef, Ty,
     fulfill::NextSolverError,
     infer::relate::lattice::{LatticeOp, LatticeOpKind},
@@ -68,6 +67,7 @@ impl<'db> InferCtxt<'db> {
             inner: self.inner.clone(),
             tainted_by_errors: self.tainted_by_errors.clone(),
             universe: self.universe.clone(),
+            obligation_inspector: self.obligation_inspector.clone(),
         }
     }
 
@@ -84,6 +84,7 @@ impl<'db> InferCtxt<'db> {
             inner: self.inner.clone(),
             tainted_by_errors: self.tainted_by_errors.clone(),
             universe: self.universe.clone(),
+            obligation_inspector: self.obligation_inspector.clone(),
         }
     }
 }
@@ -107,7 +108,7 @@ impl<'a, 'db> At<'a, 'db> {
             expected,
             Variance::Contravariant,
             actual,
-            Span::dummy(),
+            self.cause.span(),
         )
         .map(|goals| self.goals_to_obligations(goals))
     }
@@ -123,7 +124,7 @@ impl<'a, 'db> At<'a, 'db> {
             expected,
             Variance::Covariant,
             actual,
-            Span::dummy(),
+            self.cause.span(),
         )
         .map(|goals| self.goals_to_obligations(goals))
     }
@@ -139,7 +140,7 @@ impl<'a, 'db> At<'a, 'db> {
             expected,
             Variance::Invariant,
             actual,
-            Span::dummy(),
+            self.cause.span(),
         )
         .map(|goals| self.goals_to_obligations(goals))
     }
@@ -198,7 +199,7 @@ impl<'a, 'db> At<'a, 'db> {
                 .map(|goal| {
                     Obligation::new(
                         self.infcx.interner,
-                        self.cause.clone(),
+                        *self.cause,
                         goal.param_env,
                         goal.predicate,
                     )
@@ -211,7 +212,7 @@ impl<'a, 'db> At<'a, 'db> {
 impl<'db> ToTrace<'db> for Ty<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::Terms(ExpectedFound::new(a.into(), b.into())),
         }
     }
@@ -219,14 +220,14 @@ impl<'db> ToTrace<'db> for Ty<'db> {
 
 impl<'db> ToTrace<'db> for Region<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
-        TypeTrace { cause: cause.clone(), values: ValuePairs::Regions(ExpectedFound::new(a, b)) }
+        TypeTrace { cause: *cause, values: ValuePairs::Regions(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'db> ToTrace<'db> for Const<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::Terms(ExpectedFound::new(a.into(), b.into())),
         }
     }
@@ -235,7 +236,7 @@ impl<'db> ToTrace<'db> for Const<'db> {
 impl<'db> ToTrace<'db> for GenericArg<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: match (a.kind(), b.kind()) {
                 (GenericArgKind::Lifetime(a), GenericArgKind::Lifetime(b)) => {
                     ValuePairs::Regions(ExpectedFound::new(a, b))
@@ -254,20 +255,20 @@ impl<'db> ToTrace<'db> for GenericArg<'db> {
 
 impl<'db> ToTrace<'db> for Term<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
-        TypeTrace { cause: cause.clone(), values: ValuePairs::Terms(ExpectedFound::new(a, b)) }
+        TypeTrace { cause: *cause, values: ValuePairs::Terms(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'db> ToTrace<'db> for TraitRef<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
-        TypeTrace { cause: cause.clone(), values: ValuePairs::TraitRefs(ExpectedFound::new(a, b)) }
+        TypeTrace { cause: *cause, values: ValuePairs::TraitRefs(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'db> ToTrace<'db> for AliasTy<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::Aliases(ExpectedFound::new(a.into(), b.into())),
         }
     }
@@ -275,14 +276,14 @@ impl<'db> ToTrace<'db> for AliasTy<'db> {
 
 impl<'db> ToTrace<'db> for AliasTerm<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
-        TypeTrace { cause: cause.clone(), values: ValuePairs::Aliases(ExpectedFound::new(a, b)) }
+        TypeTrace { cause: *cause, values: ValuePairs::Aliases(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'db> ToTrace<'db> for FnSig<DbInterner<'db>> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::PolySigs(ExpectedFound::new(Binder::dummy(a), Binder::dummy(b))),
         }
     }
@@ -290,14 +291,14 @@ impl<'db> ToTrace<'db> for FnSig<DbInterner<'db>> {
 
 impl<'db> ToTrace<'db> for PolyFnSig<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
-        TypeTrace { cause: cause.clone(), values: ValuePairs::PolySigs(ExpectedFound::new(a, b)) }
+        TypeTrace { cause: *cause, values: ValuePairs::PolySigs(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'db> ToTrace<'db> for PolyExistentialTraitRef<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::ExistentialTraitRef(ExpectedFound::new(a, b)),
         }
     }
@@ -306,7 +307,7 @@ impl<'db> ToTrace<'db> for PolyExistentialTraitRef<'db> {
 impl<'db> ToTrace<'db> for PolyExistentialProjection<'db> {
     fn to_trace(cause: &ObligationCause, a: Self, b: Self) -> TypeTrace<'db> {
         TypeTrace {
-            cause: cause.clone(),
+            cause: *cause,
             values: ValuePairs::ExistentialProjection(ExpectedFound::new(a, b)),
         }
     }

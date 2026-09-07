@@ -91,7 +91,7 @@ impl PartialOrd for PermissionPriv {
 impl PermissionPriv {
     /// Check if `self` can be the initial state of a pointer.
     fn is_initial(&self) -> bool {
-        matches!(self, ReservedFrz { conflicted: false } | Frozen | ReservedIM | Cell)
+        matches!(self, ReservedFrz { conflicted: false } | Frozen | ReservedIM | Cell | Unique)
     }
 
     /// Reject `ReservedIM` that cannot exist in the presence of a protector.
@@ -265,14 +265,17 @@ impl Permission {
         self.inner == Cell
     }
 
-    /// Default initial permission of the root of a new tree at inbounds positions.
-    /// Must *only* be used for the root, this is not in general an "initial" permission!
+    /// Check if `self` is a Permission of type `Unique`
+    pub fn is_unique(&self) -> bool {
+        self.inner == Unique
+    }
+
+    /// Create a new Permission of type `Unique`
     pub fn new_unique() -> Self {
         Self { inner: Unique }
     }
 
-    /// Default initial permission of a reborrowed mutable reference that is either
-    /// protected or not interior mutable.
+    /// Create a new Permission of type `ReservedFrz` with conflictedReserved set to false
     pub fn new_reserved_frz() -> Self {
         Self { inner: ReservedFrz { conflicted: false } }
     }
@@ -304,8 +307,8 @@ impl Permission {
         self.inner.compatible_with_protector()
     }
 
-    /// What kind of access to perform before releasing the protector.
-    pub fn protector_end_access(&self) -> Option<AccessKind> {
+    /// What kind of access to perform before releasing the protector or on a reborrow.
+    pub fn associated_access(&self) -> Option<AccessKind> {
         match self.inner {
             // Do not do perform access if it is a `Cell`, as this
             // can cause data races when using thread-safe data types.
@@ -374,9 +377,9 @@ impl Permission {
         self.inner.strongest_idempotent_foreign_access(prot)
     }
 
-    /// Returns the strongest access allowed from a child to this node without
+    /// Returns the strongest access allowed that is local to this node without
     /// causing UB (only considers possible transitions to this permission).
-    pub fn strongest_allowed_child_access(&self, protected: bool) -> WildcardAccessLevel {
+    pub fn strongest_allowed_local_access(&self, protected: bool) -> WildcardAccessLevel {
         match self.inner {
             // Everything except disabled can be accessed by read access.
             Disabled => WildcardAccessLevel::None,
@@ -459,7 +462,7 @@ pub mod diagnostics {
                 ReservedFrz { conflicted: false } => "Res ",
                 ReservedFrz { conflicted: true } => "ResC",
                 ReservedIM => "ReIM",
-                Unique => "Act ",
+                Unique => "Unq ",
                 Frozen => "Frz ",
                 Disabled => "Dis ",
             }
@@ -578,7 +581,7 @@ pub mod diagnostics {
                         // - created as Reserved { conflicted: false },
                         //   then Unique -> Disabled is forbidden
                         // A potential `Reserved { conflicted: false }
-                        //   -> Reserved { conflicted: true }` is inexistant or irrelevant,
+                        //   -> Reserved { conflicted: true }` is inexistent or irrelevant,
                         // and so is the `Reserved { conflicted: false } -> Unique`
                         (Unique, Frozen) => false,
                         (ReservedFrz { conflicted: true }, _) => false,
@@ -794,9 +797,9 @@ mod propagation_optimization_checks {
     /// Checks that  `strongest_allowed_child_access` correctly
     /// represents which transitions are possible.
     #[test]
-    fn strongest_allowed_child_access() {
+    fn strongest_allowed_local_access() {
         for (permission, protected) in <(Permission, bool)>::exhaustive() {
-            let strongest_child_access = permission.strongest_allowed_child_access(protected);
+            let strongest_local_access = permission.strongest_allowed_local_access(protected);
 
             let is_read_valid = Permission::perform_access(
                 AccessKind::Read,
@@ -814,8 +817,8 @@ mod propagation_optimization_checks {
             )
             .is_some();
 
-            assert_eq!(is_read_valid, strongest_child_access >= WildcardAccessLevel::Read);
-            assert_eq!(is_write_valid, strongest_child_access >= WildcardAccessLevel::Write);
+            assert_eq!(is_read_valid, strongest_local_access >= WildcardAccessLevel::Read);
+            assert_eq!(is_write_valid, strongest_local_access >= WildcardAccessLevel::Write);
         }
     }
 }

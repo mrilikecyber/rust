@@ -1,9 +1,10 @@
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeDef as _;
 use rustc_errors::Diag;
 use rustc_hir as hir;
-use rustc_lint::{LateContext, LintContext};
+use rustc_lint::{LateContext, LintContext as _};
 use rustc_middle::ty::{self, Ty};
+use rustc_span::def_id::DefIdSet;
 use rustc_span::{Span, sym};
 
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
@@ -22,20 +23,35 @@ fn result_err_ty<'tcx>(
 ) -> Option<(&'tcx hir::Ty<'tcx>, Ty<'tcx>)> {
     if !item_span.in_external_macro(cx.sess().source_map())
         && let hir::FnRetTy::Return(hir_ty) = decl.output
-        && let ty = cx
-            .tcx
-            .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(id).instantiate_identity().output())
-        && ty.is_diag_item(cx, sym::Result)
-        && let ty::Adt(_, args) = ty.kind()
     {
-        let err_ty = args.type_at(1);
-        Some((hir_ty, err_ty))
-    } else {
-        None
+        let mut ty = cx
+            .tcx
+            .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(id).instantiate_identity().skip_norm_wip().output());
+
+        // for async functions, peel through `impl Future<Output = T>` to get `T`
+        if cx.tcx.ty_is_opaque_future(ty)
+            && let Some(future_output_ty) = cx.tcx.get_impl_future_output_ty(ty)
+        {
+            ty = future_output_ty;
+        }
+
+        if let ty::Adt(adt_def, args) = ty.kind()
+            && cx.tcx.is_diagnostic_item(sym::Result, adt_def.did())
+        {
+            let err_ty = args.type_at(1);
+            return Some((hir_ty, err_ty));
+        }
     }
+    None
 }
 
-pub(super) fn check_item<'tcx>(cx: &LateContext<'tcx>, item: &hir::Item<'tcx>, large_err_threshold: u64, msrv: Msrv) {
+pub(super) fn check_item<'tcx>(
+    cx: &LateContext<'tcx>,
+    item: &hir::Item<'tcx>,
+    large_err_threshold: u64,
+    large_err_ignored: &DefIdSet,
+    msrv: Msrv,
+) {
     if let hir::ItemKind::Fn { ref sig, .. } = item.kind
         && let Some((hir_ty, err_ty)) = result_err_ty(cx, sig.decl, item.owner_id.def_id, item.span)
     {
@@ -43,7 +59,7 @@ pub(super) fn check_item<'tcx>(cx: &LateContext<'tcx>, item: &hir::Item<'tcx>, l
             let fn_header_span = item.span.with_hi(sig.decl.output.span().hi());
             check_result_unit_err(cx, err_ty, fn_header_span, msrv);
         }
-        check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold);
+        check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold, large_err_ignored, false);
     }
 }
 
@@ -51,6 +67,7 @@ pub(super) fn check_impl_item<'tcx>(
     cx: &LateContext<'tcx>,
     item: &hir::ImplItem<'tcx>,
     large_err_threshold: u64,
+    large_err_ignored: &DefIdSet,
     msrv: Msrv,
 ) {
     // Don't lint if method is a trait's implementation, we can't do anything about those
@@ -62,7 +79,7 @@ pub(super) fn check_impl_item<'tcx>(
             let fn_header_span = item.span.with_hi(sig.decl.output.span().hi());
             check_result_unit_err(cx, err_ty, fn_header_span, msrv);
         }
-        check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold);
+        check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold, large_err_ignored, false);
     }
 }
 
@@ -70,6 +87,7 @@ pub(super) fn check_trait_item<'tcx>(
     cx: &LateContext<'tcx>,
     item: &hir::TraitItem<'tcx>,
     large_err_threshold: u64,
+    large_err_ignored: &DefIdSet,
     msrv: Msrv,
 ) {
     if let hir::TraitItemKind::Fn(ref sig, _) = item.kind {
@@ -78,7 +96,7 @@ pub(super) fn check_trait_item<'tcx>(
             if cx.effective_visibilities.is_exported(item.owner_id.def_id) {
                 check_result_unit_err(cx, err_ty, fn_header_span, msrv);
             }
-            check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold);
+            check_result_large_err(cx, err_ty, hir_ty.span, large_err_threshold, large_err_ignored, false);
         }
     }
 }
@@ -96,7 +114,21 @@ fn check_result_unit_err(cx: &LateContext<'_>, err_ty: Ty<'_>, fn_header_span: S
     }
 }
 
-fn check_result_large_err<'tcx>(cx: &LateContext<'tcx>, err_ty: Ty<'tcx>, hir_ty_span: Span, large_err_threshold: u64) {
+fn check_result_large_err<'tcx>(
+    cx: &LateContext<'tcx>,
+    err_ty: Ty<'tcx>,
+    hir_ty_span: Span,
+    large_err_threshold: u64,
+    large_err_ignored: &DefIdSet,
+    is_closure: bool,
+) {
+    if let ty::Adt(adt, _) = err_ty.kind()
+        && large_err_ignored.contains(&adt.did())
+    {
+        return;
+    }
+
+    let subject = if is_closure { "closure" } else { "function" };
     if let ty::Adt(adt, subst) = err_ty.kind()
         && let Some(local_def_id) = adt.did().as_local()
         && let hir::Node::Item(item) = cx.tcx.hir_node_by_def_id(local_def_id)
@@ -110,7 +142,7 @@ fn check_result_large_err<'tcx>(cx: &LateContext<'tcx>, err_ty: Ty<'tcx>, hir_ty
                 cx,
                 RESULT_LARGE_ERR,
                 hir_ty_span,
-                "the `Err`-variant returned from this function is very large",
+                format!("the `Err`-variant returned from this {subject} is very large"),
                 |diag| {
                     diag.span_label(
                         def.variants[first_variant.ind].span,
@@ -141,12 +173,42 @@ fn check_result_large_err<'tcx>(cx: &LateContext<'tcx>, err_ty: Ty<'tcx>, hir_ty
                 cx,
                 RESULT_LARGE_ERR,
                 hir_ty_span,
-                "the `Err`-variant returned from this function is very large",
+                format!("the `Err`-variant returned from this {subject} is very large"),
                 |diag: &mut Diag<'_, ()>| {
                     diag.span_label(hir_ty_span, format!("the `Err`-variant is at least {ty_size} bytes"));
                     diag.help(format!("try reducing the size of `{err_ty}`, for example by boxing large elements or replacing it with `Box<{err_ty}>`"));
                 },
             );
         }
+    }
+}
+
+pub(super) fn check_expr<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    large_err_threshold: u64,
+    large_err_ignored: &DefIdSet,
+) {
+    if let hir::ExprKind::Closure(closure) = expr.kind
+        && let ty::Closure(_, args) = cx.typeck_results().expr_ty(expr).kind()
+        && let closure_sig = args.as_closure().sig()
+        && let Ok(err_binder) = closure_sig.output().try_map_bound(|output_ty| {
+            if let ty::Adt(adt, args) = output_ty.kind()
+                && let [_, err_arg] = args.as_slice()
+                && let Some(err_ty) = err_arg.as_type()
+                && adt.is_diag_item(cx, sym::Result)
+            {
+                return Ok(err_ty);
+            }
+
+            Err(())
+        })
+    {
+        let err_ty = cx.tcx.instantiate_bound_regions_with_erased(err_binder);
+        let hir_ty_span = match closure.fn_decl.output {
+            hir::FnRetTy::Return(hir_ty) => hir_ty.span,
+            hir::FnRetTy::DefaultReturn(_) => expr.span,
+        };
+        check_result_large_err(cx, err_ty, hir_ty_span, large_err_threshold, large_err_ignored, true);
     }
 }

@@ -2,24 +2,24 @@
 
 use std::{cell::LazyCell, fmt};
 
-use hir_def::{EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId};
-use intern::sym;
+use hir_def::{
+    EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId, attrs::AttrFlags,
+    signatures::VariantFields, unstable_features::UnstableFeatures,
+};
 use rustc_pattern_analysis::{
     IndexVec, PatCx, PrivateUninhabitedField,
     constructor::{Constructor, ConstructorSet, VariantVisibility},
     usefulness::{PlaceValidity, UsefulnessReport, compute_match_usefulness},
 };
-use rustc_type_ir::inherent::{AdtDef, IntoKind, SliceLike};
+use rustc_type_ir::inherent::IntoKind;
 use smallvec::{SmallVec, smallvec};
 use stdx::never;
-use triomphe::Arc;
 
 use crate::{
-    TraitEnvironment,
     db::HirDatabase,
     inhabitedness::{is_enum_variant_uninhabited_from, is_ty_uninhabited_from},
     next_solver::{
-        Ty, TyKind,
+        ParamEnv, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
     },
 };
@@ -49,8 +49,7 @@ pub(crate) struct EnumVariantContiguousIndex(usize);
 impl EnumVariantContiguousIndex {
     fn from_enum_variant_id(db: &dyn HirDatabase, target_evid: EnumVariantId) -> Self {
         // Find the index of this variant in the list of variants.
-        use hir_def::Lookup;
-        let i = target_evid.lookup(db).index as usize;
+        let i = target_evid.index(db);
         EnumVariantContiguousIndex(i)
     }
 
@@ -74,19 +73,14 @@ pub(crate) struct MatchCheckCtx<'a, 'db> {
     module: ModuleId,
     pub(crate) db: &'db dyn HirDatabase,
     exhaustive_patterns: bool,
-    env: Arc<TraitEnvironment<'db>>,
+    env: ParamEnv<'db>,
     infcx: &'a InferCtxt<'db>,
 }
 
 impl<'a, 'db> MatchCheckCtx<'a, 'db> {
-    pub(crate) fn new(
-        module: ModuleId,
-        infcx: &'a InferCtxt<'db>,
-        env: Arc<TraitEnvironment<'db>>,
-    ) -> Self {
+    pub(crate) fn new(module: ModuleId, infcx: &'a InferCtxt<'db>, env: ParamEnv<'db>) -> Self {
         let db = infcx.interner.db;
-        let def_map = module.crate_def_map(db);
-        let exhaustive_patterns = def_map.is_unstable_feature_enabled(&sym::exhaustive_patterns);
+        let exhaustive_patterns = UnstableFeatures::query(db, module.krate(db)).exhaustive_patterns;
         Self { module, db, exhaustive_patterns, env, infcx }
     }
 
@@ -112,13 +106,13 @@ impl<'a, 'db> MatchCheckCtx<'a, 'db> {
     }
 
     fn is_uninhabited(&self, ty: Ty<'db>) -> bool {
-        is_ty_uninhabited_from(self.infcx, ty, self.module, self.env.clone())
+        is_ty_uninhabited_from(self.infcx, ty, self.module, self.env)
     }
 
     /// Returns whether the given ADT is from another crate declared `#[non_exhaustive]`.
     fn is_foreign_non_exhaustive(&self, adt: hir_def::AdtId) -> bool {
-        let is_local = adt.krate(self.db) == self.module.krate();
-        !is_local && self.db.attrs(adt.into()).by_key(sym::non_exhaustive).exists()
+        let is_local = adt.krate(self.db) == self.module.krate(self.db);
+        !is_local && AttrFlags::query(self.db, adt.into()).contains(AttrFlags::NON_EXHAUSTIVE)
     }
 
     fn variant_id_for_adt(
@@ -154,10 +148,10 @@ impl<'a, 'db> MatchCheckCtx<'a, 'db> {
         let fields_len = variant.fields(self.db).fields().len() as u32;
 
         (0..fields_len).map(|idx| LocalFieldId::from_raw(idx.into())).map(move |fid| {
-            let ty = field_tys[fid].instantiate(self.infcx.interner, substs);
+            let ty = field_tys[fid].ty().instantiate(self.infcx.interner, substs).skip_norm_wip();
             let ty = self
                 .infcx
-                .at(&ObligationCause::dummy(), self.env.env)
+                .at(&ObligationCause::dummy(), self.env)
                 .deeply_normalize(ty)
                 .unwrap_or(ty);
             (fid, ty)
@@ -202,7 +196,7 @@ impl<'a, 'db> MatchCheckCtx<'a, 'db> {
                         arity = substs.len();
                     }
                     TyKind::Adt(adt_def, _) => {
-                        let adt = adt_def.def_id().0;
+                        let adt = adt_def.def_id();
                         ctor = match pat.kind.as_ref() {
                             PatKind::Leaf { .. } if matches!(adt, hir_def::AdtId::UnionId(_)) => {
                                 UnionField
@@ -270,7 +264,7 @@ impl<'a, 'db> MatchCheckCtx<'a, 'db> {
                 },
                 TyKind::Adt(adt, substs) => {
                     let variant =
-                        Self::variant_id_for_adt(self.db, pat.ctor(), adt.def_id().0).unwrap();
+                        Self::variant_id_for_adt(self.db, pat.ctor(), adt.def_id()).unwrap();
                     let subpatterns = self
                         .list_variant_fields(*pat.ty(), variant)
                         .zip(subpatterns)
@@ -330,7 +324,7 @@ impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
                 TyKind::Tuple(tys) => tys.len(),
                 TyKind::Adt(adt_def, ..) => {
                     let variant =
-                        Self::variant_id_for_adt(self.db, ctor, adt_def.def_id().0).unwrap();
+                        Self::variant_id_for_adt(self.db, ctor, adt_def.def_id()).unwrap();
                     variant.fields(self.db).fields().len()
                 }
                 _ => {
@@ -364,10 +358,11 @@ impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
                 }
                 TyKind::Ref(_, rty, _) => single(rty),
                 TyKind::Adt(adt_def, ..) => {
-                    let adt = adt_def.def_id().0;
+                    let adt = adt_def.def_id();
                     let variant = Self::variant_id_for_adt(self.db, ctor, adt).unwrap();
 
-                    let visibilities = LazyCell::new(|| self.db.field_visibilities(variant));
+                    let visibilities =
+                        LazyCell::new(|| VariantFields::field_visibilities(self.db, variant));
 
                     self.list_variant_fields(*ty, variant)
                         .map(move |(fid, ty)| {
@@ -432,7 +427,7 @@ impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
             TyKind::Int(..) | TyKind::Uint(..) => unhandled(),
             TyKind::Array(..) | TyKind::Slice(..) => unhandled(),
             TyKind::Adt(adt_def, subst) => {
-                let adt = adt_def.def_id().0;
+                let adt = adt_def.def_id();
                 match adt {
                     hir_def::AdtId::EnumId(enum_id) => {
                         let enum_data = enum_id.enum_variants(cx.db);
@@ -442,13 +437,9 @@ impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
                             ConstructorSet::NoConstructors
                         } else {
                             let mut variants = IndexVec::with_capacity(enum_data.variants.len());
-                            for &(variant, _, _) in enum_data.variants.iter() {
+                            for &(variant, _) in enum_data.variants.values() {
                                 let is_uninhabited = is_enum_variant_uninhabited_from(
-                                    cx.infcx,
-                                    variant,
-                                    subst,
-                                    cx.module,
-                                    self.env.clone(),
+                                    cx.infcx, variant, subst, cx.module, self.env,
                                 );
                                 let visibility = if is_uninhabited {
                                     VariantVisibility::Empty

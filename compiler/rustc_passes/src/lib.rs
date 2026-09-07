@@ -5,20 +5,22 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![feature(if_let_guard)]
-#![feature(map_try_insert)]
+#![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
-use rustc_middle::util::Providers;
+use rustc_middle::query::Providers;
 
 pub mod abi_test;
+mod canonical_symbols;
 mod check_attr;
 mod check_export;
 pub mod dead;
 mod debugger_visualizer;
+pub mod delegation;
 mod diagnostic_items;
+mod diagnostics;
+mod eii;
 pub mod entry;
-mod errors;
 pub mod hir_id_validator;
 pub mod input_stats;
 mod lang_items;
@@ -29,9 +31,8 @@ pub mod stability;
 mod upvars;
 mod weak_lang_items;
 
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
-
 pub fn provide(providers: &mut Providers) {
+    canonical_symbols::provide(providers);
     check_attr::provide(providers);
     dead::provide(providers);
     debugger_visualizer::provide(providers);
@@ -43,4 +44,5 @@ pub fn provide(providers: &mut Providers) {
     stability::provide(providers);
     upvars::provide(providers);
     check_export::provide(providers);
+    providers.check_externally_implementable_items = eii::check_externally_implementable_items;
 }

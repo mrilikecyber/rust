@@ -1,23 +1,19 @@
 use std::num::NonZero;
 use std::sync::Mutex;
-use std::time::Duration;
 use std::{cmp, iter};
 
-use rand::RngCore;
+use rand::Rng;
 use rustc_abi::{Align, ExternAbi, FieldIdx, FieldsShape, Size, Variants};
-use rustc_apfloat::Float;
-use rustc_hash::FxHashSet;
-use rustc_hir::Safety;
+use rustc_data_structures::fx::{FxBuildHasher, FxHashSet};
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{CRATE_DEF_INDEX, CrateNum, DefId, LOCAL_CRATE};
-use rustc_index::IndexVec;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::ty::layout::{LayoutOf, MaybeResult, TyAndLayout};
-use rustc_middle::ty::{self, IntTy, Ty, TyCtxt, UintTy};
-use rustc_session::config::CrateType;
+use rustc_middle::ty::{self, FnSigKind, IntTy, Ty, TyCtxt, UintTy};
 use rustc_span::{Span, Symbol};
+use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::Os;
 
@@ -63,7 +59,7 @@ fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>)
         // Go over the modules.
         for &segment in modules {
             let Some(next_item) = find_children(tcx, cur_item, segment)
-                .find(|item| tcx.def_kind(item) == DefKind::Mod)
+                .find(|&item| tcx.def_kind(item) == DefKind::Mod)
             else {
                 continue 'crates;
             };
@@ -73,7 +69,7 @@ fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>)
         match item {
             Some((item_name, namespace)) => {
                 let Some(item) = find_children(tcx, cur_item, item_name)
-                    .find(|item| tcx.def_kind(item).ns() == Some(namespace))
+                    .find(|&item| tcx.def_kind(item).ns() == Some(namespace))
                 else {
                     continue 'crates;
                 };
@@ -120,28 +116,28 @@ pub fn path_ty_layout<'tcx>(cx: &impl LayoutOf<'tcx>, path: &[&str]) -> TyAndLay
 /// Call `f` for each exported symbol.
 pub fn iter_exported_symbols<'tcx>(
     tcx: TyCtxt<'tcx>,
-    mut f: impl FnMut(CrateNum, DefId) -> InterpResult<'tcx>,
+    mut f: impl FnMut(CrateNum, DefId, /* used */ bool) -> InterpResult<'tcx>,
 ) -> InterpResult<'tcx> {
-    // First, the symbols in the local crate. We can't use `exported_symbols` here as that
-    // skips `#[used]` statics (since `reachable_set` skips them in binary crates).
-    // So we walk all HIR items ourselves instead.
+    // First, the symbols in the local crate. We can't use `exported_symbols` here as that skips
+    // `#[used]` statics (since `reachable_set` does not specifically include them in binary crates,
+    // only in library crates). So we walk all HIR items ourselves instead.
     let crate_items = tcx.hir_crate_items(());
     for def_id in crate_items.definitions() {
-        let exported = tcx.def_kind(def_id).has_codegen_attrs() && {
-            let codegen_attrs = tcx.codegen_fn_attrs(def_id);
-            codegen_attrs.contains_extern_indicator()
-                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
-                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
-        };
-        if exported {
-            f(LOCAL_CRATE, def_id.into())?;
+        if !tcx.def_kind(def_id).has_codegen_attrs() || tcx.is_foreign_item(def_id) {
+            continue;
         }
+        let codegen_attrs = tcx.codegen_fn_attrs(def_id);
+        let used = codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
+            || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER);
+        if !(used || codegen_attrs.contains_extern_indicator()) {
+            continue;
+        }
+        f(LOCAL_CRATE, def_id.into(), used)?;
     }
 
     // Next, all our dependencies.
-    // `dependency_formats` includes all the transitive informations needed to link a crate,
-    // which is what we need here since we need to dig out `exported_symbols` from all transitive
-    // dependencies.
+    // `dependency_formats` includes all the transitive information needed to link a crate, which is
+    // what we need to dig out `exported_symbols` from all transitive dependencies.
     let dependency_formats = tcx.dependency_formats(());
     // Find the dependencies of the executable we are running.
     let dependency_format = dependency_formats
@@ -155,59 +151,16 @@ pub fn iter_exported_symbols<'tcx>(
             continue; // Already handled above
         }
 
-        // We can ignore `_export_info` here: we are a Rust crate, and everything is exported
-        // from a Rust crate.
-        for &(symbol, _export_info) in tcx.exported_non_generic_symbols(cnum) {
-            if let ExportedSymbol::NonGeneric(def_id) = symbol {
-                f(cnum, def_id)?;
+        for &(symbol, export_info) in tcx.exported_non_generic_symbols(cnum) {
+            if let ExportedSymbol::NonGeneric(def_id) = symbol
+                // Sometimes Rust has to re-export FFI imports; skip those.
+                && !tcx.is_foreign_item(def_id)
+            {
+                f(cnum, def_id, export_info.used)?;
             }
         }
     }
     interp_ok(())
-}
-
-/// Convert a softfloat type to its corresponding hostfloat type.
-pub trait ToHost {
-    type HostFloat;
-    fn to_host(self) -> Self::HostFloat;
-}
-
-/// Convert a hostfloat type to its corresponding softfloat type.
-pub trait ToSoft {
-    type SoftFloat;
-    fn to_soft(self) -> Self::SoftFloat;
-}
-
-impl ToHost for rustc_apfloat::ieee::Double {
-    type HostFloat = f64;
-
-    fn to_host(self) -> Self::HostFloat {
-        f64::from_bits(self.to_bits().try_into().unwrap())
-    }
-}
-
-impl ToSoft for f64 {
-    type SoftFloat = rustc_apfloat::ieee::Double;
-
-    fn to_soft(self) -> Self::SoftFloat {
-        Float::from_bits(self.to_bits().into())
-    }
-}
-
-impl ToHost for rustc_apfloat::ieee::Single {
-    type HostFloat = f32;
-
-    fn to_host(self) -> Self::HostFloat {
-        f32::from_bits(self.to_bits().try_into().unwrap())
-    }
-}
-
-impl ToSoft for f32 {
-    type SoftFloat = rustc_apfloat::ieee::Single;
-
-    fn to_soft(self) -> Self::SoftFloat {
-        Float::from_bits(self.to_bits().into())
-    }
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -241,6 +194,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
         self.eval_path_scalar(&["libc", name])
+    }
+
+    /// Helper function to get a `libc` constant as an `i16`.
+    fn eval_libc_i16(&self, name: &str) -> i16 {
+        // TODO: Cache the result.
+        self.eval_libc(name).to_i16().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `i16`): {name}")
+        })
+    }
+
+    /// Helper function to get a `libc` constant as an `u16`.
+    fn eval_libc_u16(&self, name: &str) -> u16 {
+        // TODO: Cache the result.
+        self.eval_libc(name).to_u16().unwrap_or_else(|_err| {
+            panic!("required libc item has unexpected type (not `u16`): {name}")
+        })
     }
 
     /// Helper function to get a `libc` constant as an `i32`.
@@ -454,9 +423,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let sig = this.tcx.mk_fn_sig(
             args.iter().map(|a| a.layout.ty),
             dest.layout.ty,
-            /*c_variadic*/ false,
-            Safety::Safe,
-            caller_abi,
+            // FIXME(splat): Do we need to set splatted here?
+            // (Currently this also ignores c_variadic)
+            FnSigKind::default().set_abi(caller_abi).set_safety(rustc_hir::Safety::Safe),
         );
         let caller_fn_abi = this.fn_abi_of_fn_ptr(ty::Binder::dummy(sig), ty::List::empty())?;
 
@@ -470,6 +439,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             &dest.into(),
             cont,
         )
+    }
+
+    /// Call a function in an "empty" thread.
+    fn call_thread_root_function(
+        &mut self,
+        f: ty::Instance<'tcx>,
+        caller_abi: ExternAbi,
+        args: &[ImmTy<'tcx>],
+        dest: Option<&MPlaceTy<'tcx>>,
+        span: Span,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        assert!(this.active_thread_stack().is_empty());
+        assert!(this.active_thread_ref().origin_span.is_dummy());
+        this.active_thread_mut().origin_span = span;
+        this.call_function(f, caller_abi, args, dest, ReturnContinuation::Stop { cleanup: true })
     }
 
     /// Visits the memory covered by `place`, sensitive to freezing: the 2nd parameter
@@ -567,13 +552,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 self.ecx
             }
 
-            fn aggregate_field_iter(
-                memory_index: &IndexVec<FieldIdx, u32>,
-            ) -> impl Iterator<Item = FieldIdx> + 'static {
-                let inverse_memory_index = memory_index.invert_bijective_mapping();
-                inverse_memory_index.into_iter()
-            }
-
             // Hook to detect `UnsafeCell`.
             fn visit_value(&mut self, v: &MPlaceTy<'tcx>) -> InterpResult<'tcx> {
                 trace!("UnsafeCellVisitor: {:?} {:?}", *v, v.layout.ty);
@@ -647,7 +625,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             RejectOpWith::WarningWithoutBacktrace => {
                 // Deduplicate these warnings *by shim* (not by span)
                 static DEDUP: Mutex<FxHashSet<String>> =
-                    Mutex::new(FxHashSet::with_hasher(rustc_hash::FxBuildHasher));
+                    Mutex::new(FxHashSet::with_hasher(FxBuildHasher));
                 let mut emitted_warnings = DEDUP.lock().unwrap();
                 if !emitted_warnings.contains(op_name) {
                     // First time we are seeing this.
@@ -754,33 +732,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.write_scalar(value, &value_place)
     }
 
-    /// Parse a `timespec` struct and return it as a `std::time::Duration`. It returns `None`
-    /// if the value in the `timespec` struct is invalid. Some libc functions will return
-    /// `EINVAL` in this case.
-    fn read_timespec(&mut self, tp: &MPlaceTy<'tcx>) -> InterpResult<'tcx, Option<Duration>> {
-        let this = self.eval_context_mut();
-        let seconds_place = this.project_field(tp, FieldIdx::ZERO)?;
-        let seconds_scalar = this.read_scalar(&seconds_place)?;
-        let seconds = seconds_scalar.to_target_isize(this)?;
-        let nanoseconds_place = this.project_field(tp, FieldIdx::ONE)?;
-        let nanoseconds_scalar = this.read_scalar(&nanoseconds_place)?;
-        let nanoseconds = nanoseconds_scalar.to_target_isize(this)?;
-
-        interp_ok(
-            try {
-                // tv_sec must be non-negative.
-                let seconds: u64 = seconds.try_into().ok()?;
-                // tv_nsec must be non-negative.
-                let nanoseconds: u32 = nanoseconds.try_into().ok()?;
-                if nanoseconds >= 1_000_000_000 {
-                    // tv_nsec must not be greater than 999,999,999.
-                    None?
-                }
-                Duration::new(seconds, nanoseconds)
-            },
-        )
-    }
-
     /// Read bytes from a byte slice.
     fn read_byte_slice<'a>(&'a self, slice: &ImmTy<'tcx>) -> InterpResult<'tcx, &'a [u8]>
     where
@@ -788,7 +739,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     {
         let this = self.eval_context_ref();
         let (ptr, len) = slice.to_scalar_pair();
-        let ptr = ptr.to_pointer(this)?;
+        let ptr = ptr.to_pointer(this);
         let len = len.to_target_usize(this)?;
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
         interp_ok(bytes)
@@ -947,8 +898,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let frame_crate = this.tcx.def_path(instance.def_id()).krate;
         let crate_name = this.tcx.crate_name(frame_crate);
         let crate_name = crate_name.as_str();
-        // On miri-test-libstd, the name of the crate is different.
-        crate_name == "std" || crate_name == "std_miri_test"
+        crate_name == "std"
     }
 
     /// Mark a machine allocation that was just created as immutable.
@@ -987,7 +937,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         target_feature: &str,
     ) -> InterpResult<'tcx, ()> {
         let this = self.eval_context_ref();
-        if !this.tcx.sess.unstable_target_features.contains(&Symbol::intern(target_feature)) {
+        if !this.tcx.sess.internal_target_features.contains(&Symbol::intern(target_feature)) {
             throw_ub_format!(
                 "attempted to call intrinsic `{intrinsic}` that requires missing target feature {target_feature}"
             );
@@ -995,23 +945,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
-    /// Lookup an array of immediates from any linker sections matching the provided predicate.
+    /// Lookup an array of immediates from any linker sections matching the provided predicate,
+    /// with the spans of where they were found.
     fn lookup_link_section(
         &mut self,
         include_name: impl Fn(&str) -> bool,
-    ) -> InterpResult<'tcx, Vec<ImmTy<'tcx>>> {
+    ) -> InterpResult<'tcx, Vec<(ImmTy<'tcx>, Span)>> {
         let this = self.eval_context_mut();
         let tcx = this.tcx.tcx;
 
         let mut array = vec![];
 
-        iter_exported_symbols(tcx, |_cnum, def_id| {
+        iter_exported_symbols(tcx, |_cnum, def_id, used| {
             let attrs = tcx.codegen_fn_attrs(def_id);
+            if !used {
+                // We don't know if the symbol is actually going to be in the final binary,
+                // so we conservatively skip it.
+                return interp_ok(());
+            }
             let Some(link_section) = attrs.link_section else {
                 return interp_ok(());
             };
             if include_name(link_section.as_str()) {
                 let instance = ty::Instance::mono(tcx, def_id);
+                let span = tcx.def_span(def_id);
                 let const_val = this.eval_global(instance).unwrap_or_else(|err| {
                     panic!(
                         "failed to evaluate static in required link_section: {def_id:?}\n{err:?}"
@@ -1019,12 +976,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 });
                 match const_val.layout.ty.kind() {
                     ty::FnPtr(..) => {
-                        array.push(this.read_immediate(&const_val)?);
+                        array.push((this.read_immediate(&const_val)?, span));
                     }
                     ty::Array(elem_ty, _) if matches!(elem_ty.kind(), ty::FnPtr(..)) => {
                         let mut elems = this.project_array_fields(&const_val)?;
                         while let Some((_idx, elem)) = elems.next(this)? {
-                            array.push(this.read_immediate(&elem)?);
+                            array.push((this.read_immediate(&elem)?, span));
                         }
                     }
                     _ =>
@@ -1126,6 +1083,11 @@ pub(crate) fn windows_check_buffer_size((success, len): (bool, u64)) -> u32 {
     }
 }
 
+/// Check whether the local crate has the `#![no_core]` attribute.
+pub fn is_no_core(tcx: TyCtxt<'_>) -> bool {
+    rustc_hir::find_attr!(tcx, crate, NoCore)
+}
+
 /// We don't support 16-bit systems, so let's have ergonomic conversion from `u32` to `usize`.
 pub trait ToUsize {
     fn to_usize(self) -> usize;
@@ -1138,7 +1100,7 @@ impl ToUsize for u32 {
 }
 
 /// Similarly, a maximum address size of `u64` is assumed widely here, so let's have ergonomic
-/// converion from `usize` to `u64`.
+/// conversion from `usize` to `u64`.
 pub trait ToU64 {
     fn to_u64(self) -> u64;
 }

@@ -1,6 +1,6 @@
 use super::CMP_NULL;
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::{is_lint_allowed, sym};
 use rustc_errors::Applicability;
@@ -14,13 +14,14 @@ pub(super) fn check<'tcx>(
     l: &Expr<'_>,
     r: &Expr<'_>,
 ) -> bool {
+    let mut applicability = Applicability::MachineApplicable;
     let non_null_path_snippet = match (
         is_lint_allowed(cx, CMP_NULL, expr.hir_id),
         is_null_path(cx, l),
         is_null_path(cx, r),
     ) {
-        (false, true, false) if let Some(sugg) = Sugg::hir_opt(cx, r) => sugg.maybe_paren(),
-        (false, false, true) if let Some(sugg) = Sugg::hir_opt(cx, l) => sugg.maybe_paren(),
+        (false, true, false) => Sugg::hir_with_context(cx, r, expr.span.ctxt(), "..", &mut applicability).maybe_paren(),
+        (false, false, true) => Sugg::hir_with_context(cx, l, expr.span.ctxt(), "..", &mut applicability).maybe_paren(),
         _ => return false,
     };
     let invert = if op == BinOpKind::Eq { "" } else { "!" };
@@ -31,8 +32,8 @@ pub(super) fn check<'tcx>(
         expr.span,
         "comparing with null is better expressed by the `.is_null()` method",
         "try",
-        format!("{invert}{non_null_path_snippet}.is_null()",),
-        Applicability::MachineApplicable,
+        format!("{invert}{non_null_path_snippet}.is_null()"),
+        applicability,
     );
     true
 }

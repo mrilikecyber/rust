@@ -1,15 +1,10 @@
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_macros::HashStable_Generic;
-use rustc_span::Span;
+use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_error_messages::MultiSpan;
+use rustc_errors::{Diag, DiagCtxtHandle, Level};
+use rustc_hir_id::HirId;
+use rustc_lint_defs::LintId;
 
-use crate::{AttrPath, HirId, Target};
-
-#[derive(Debug)]
-pub struct DelayedLints {
-    pub lints: Box<[DelayedLint]>,
-    // Only present when the crate hash is needed.
-    pub opt_hash: Option<Fingerprint>,
-}
+pub type DelayedLints = Box<[DelayedLint]>;
 
 /// During ast lowering, no lints can be emitted.
 /// That is because lints attach to nodes either in the AST, or on the built HIR.
@@ -17,49 +12,24 @@ pub struct DelayedLints {
 /// and then there's a gap where no lints can be emitted until HIR is done.
 /// The variants in this enum represent lints that are temporarily stashed during
 /// AST lowering to be emitted once HIR is built.
-#[derive(Clone, Debug, HashStable_Generic)]
-pub enum DelayedLint {
-    AttributeParsing(AttributeLint<HirId>),
+pub struct DelayedLint {
+    pub lint_id: LintId,
+    pub id: HirId,
+    pub span: MultiSpan,
+    pub callback: Box<
+        dyn for<'a> FnOnce(DiagCtxtHandle<'a>, Level, &dyn std::any::Any) -> Diag<'a, ()>
+            + DynSend
+            + DynSync
+            + 'static,
+    >,
 }
 
-#[derive(Clone, Debug, HashStable_Generic)]
-pub struct AttributeLint<Id> {
-    pub id: Id,
-    pub span: Span,
-    pub kind: AttributeLintKind,
-}
-
-#[derive(Clone, Debug, HashStable_Generic)]
-pub enum AttributeLintKind {
-    /// Copy of `IllFormedAttributeInput`
-    /// specifically for the `invalid_macro_export_arguments` lint until that is removed,
-    /// see <https://github.com/rust-lang/rust/pull/143857#issuecomment-3079175663>
-    InvalidMacroExportArguments {
-        suggestions: Vec<String>,
-    },
-    UnusedDuplicate {
-        this: Span,
-        other: Span,
-        warning: bool,
-    },
-    IllFormedAttributeInput {
-        suggestions: Vec<String>,
-    },
-    EmptyAttribute {
-        first_span: Span,
-        attr_path: AttrPath,
-        valid_without_list: bool,
-    },
-    InvalidTarget {
-        name: AttrPath,
-        target: Target,
-        applied: Vec<String>,
-        only: &'static str,
-    },
-    InvalidStyle {
-        name: AttrPath,
-        is_used_as_inner: bool,
-        target: Target,
-        target_span: Span,
-    },
+impl std::fmt::Debug for DelayedLint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelayedLint")
+            .field("lint_id", &self.lint_id)
+            .field("id", &self.id)
+            .field("span", &self.span)
+            .finish()
+    }
 }

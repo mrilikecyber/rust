@@ -1,7 +1,6 @@
 use either::Either;
 use rustc_abi::Size;
 use rustc_apfloat::{Float, FloatConvert};
-use rustc_middle::mir::NullOp;
 use rustc_middle::mir::interpret::{InterpResult, PointerArithmetic, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, FloatTy, ScalarInt};
@@ -10,6 +9,19 @@ use rustc_span::sym;
 use tracing::trace;
 
 use super::{ImmTy, InterpCx, Machine, MemPlaceMeta, interp_ok, throw_ub};
+
+/// Describes an atomic RMW operation.
+pub enum AtomicRmwOp {
+    MirOp {
+        op: mir::BinOp,
+        /// Indicates whether the result of the operation should be negated (`UnOp::Not`, must be a
+        /// boolean/integer-typed operation).
+        neg: bool,
+    },
+    Max,
+    Min,
+    Swap,
+}
 
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     fn three_way_compare<T: Ord>(&self, lhs: T, rhs: T) -> ImmTy<'tcx, M::Provenance> {
@@ -312,7 +324,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         match bin_op {
             // Pointer ops that are always supported.
             Offset => {
-                let ptr = left.to_scalar().to_pointer(self)?;
+                let ptr = left.to_scalar().to_pointer(self);
                 let pointee_ty = left.layout.ty.builtin_deref(true).unwrap();
                 let pointee_layout = self.layout_of(pointee_ty)?;
                 assert!(pointee_layout.is_sized());
@@ -429,8 +441,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
     }
 
-    /// Returns the result of the specified operation, whether it overflowed, and
-    /// the result type.
+    /// Returns the result of the specified operation.
     pub fn unary_op(
         &self,
         un_op: mir::UnOp,
@@ -487,6 +498,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
             ty::RawPtr(..) | ty::Ref(..) => {
                 assert_eq!(un_op, PtrMetadata);
+                self.deref_pointer(val)?; // validity check
                 let (_, meta) = val.to_scalar_and_meta();
                 interp_ok(match meta {
                     MemPlaceMeta::Meta(scalar) => {
@@ -506,10 +518,26 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
     }
 
-    pub fn nullary_op(&self, null_op: NullOp) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
-        use rustc_middle::mir::NullOp::*;
-        interp_ok(match null_op {
-            RuntimeChecks(r) => ImmTy::from_bool(M::runtime_checks(self, r)?, *self.tcx),
+    pub fn atomic_rmw_op(
+        &self,
+        op: AtomicRmwOp,
+        left: &ImmTy<'tcx, M::Provenance>,
+        right: &ImmTy<'tcx, M::Provenance>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
+        interp_ok(match op {
+            AtomicRmwOp::MirOp { op, neg } => {
+                let val = self.binary_op(op, &left, right)?;
+                if neg { self.unary_op(mir::UnOp::Not, &val)? } else { val }
+            }
+            AtomicRmwOp::Max => {
+                let lt = self.binary_op(mir::BinOp::Lt, &left, right)?.to_scalar().to_bool()?;
+                if lt { right } else { &left }.clone()
+            }
+            AtomicRmwOp::Min => {
+                let lt = self.binary_op(mir::BinOp::Lt, &left, right)?.to_scalar().to_bool()?;
+                if lt { &left } else { right }.clone()
+            }
+            AtomicRmwOp::Swap => right.clone(),
         })
     }
 }

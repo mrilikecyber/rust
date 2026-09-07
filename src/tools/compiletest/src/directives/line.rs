@@ -2,13 +2,15 @@ use std::fmt;
 
 use camino::Utf8Path;
 
+use crate::directives::LineNumber;
+
 const COMPILETEST_DIRECTIVE_PREFIX: &str = "//@";
 
 /// If the given line begins with the appropriate comment prefix for a directive,
 /// returns a struct containing various parts of the directive.
 pub(crate) fn line_directive<'a>(
     file_path: &'a Utf8Path,
-    line_number: usize,
+    line_number: LineNumber,
     original_line: &'a str,
 ) -> Option<DirectiveLine<'a>> {
     // Ignore lines that don't start with the comment prefix.
@@ -28,6 +30,20 @@ pub(crate) fn line_directive<'a>(
 
         revision = Some(line_revision);
         raw_directive = after_close_bracket.trim_start();
+
+        if line_revision.contains(",") {
+            let suggestion: Vec<_> = line_revision
+                .split(",")
+                .map(|revision| {
+                    format!("{COMPILETEST_DIRECTIVE_PREFIX} [{revision}]: {raw_directive}")
+                })
+                .collect();
+            panic!(
+                "malformed condition directive: multiple revisions aren't supported yet in `{}`, split them like\n{}",
+                original_line,
+                suggestion.join("\n"),
+            );
+        }
     } else {
         revision = None;
         raw_directive = after_comment;
@@ -60,7 +76,7 @@ pub(crate) struct DirectiveLine<'a> {
     /// Mostly used for diagnostics, but some directives (e.g. `//@ pp-exact`)
     /// also use it to compute a value based on the filename.
     pub(crate) file_path: &'a Utf8Path,
-    pub(crate) line_number: usize,
+    pub(crate) line_number: LineNumber,
 
     /// Some test directives start with a revision name in square brackets
     /// (e.g. `[foo]`), and only apply to that revision of the test.

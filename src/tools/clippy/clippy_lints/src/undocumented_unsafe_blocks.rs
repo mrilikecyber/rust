@@ -4,16 +4,15 @@ use std::sync::Arc;
 use clippy_config::Conf;
 use clippy_utils::consts::const_item_rhs_to_expr;
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::is_lint_allowed;
 use clippy_utils::source::walk_span_to_context;
 use clippy_utils::visitors::{Descend, for_each_expr};
+use clippy_utils::{higher, is_lint_allowed};
 use hir::HirId;
 use rustc_errors::Applicability;
 use rustc_hir::{self as hir, Block, BlockCheckMode, FnSig, Impl, ItemKind, Node, UnsafeSource};
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
-use rustc_span::{BytePos, Pos, RelativeBytePos, Span, SyntaxContext};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
+use rustc_span::{BytePos, Pos as _, RelativeBytePos, Span, SyntaxContext};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -63,6 +62,7 @@ declare_clippy_lint! {
     restriction,
     "creating an unsafe block without explaining why it is safe"
 }
+
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for `// SAFETY: ` comments on safe code.
@@ -92,6 +92,11 @@ declare_clippy_lint! {
     "annotating safe code with a safety comment"
 }
 
+impl_lint_pass!(UndocumentedUnsafeBlocks => [
+    UNDOCUMENTED_UNSAFE_BLOCKS,
+    UNNECESSARY_SAFETY_COMMENT,
+]);
+
 pub struct UndocumentedUnsafeBlocks {
     accept_comment_above_statement: bool,
     accept_comment_above_attributes: bool,
@@ -106,8 +111,6 @@ impl UndocumentedUnsafeBlocks {
     }
 }
 
-impl_lint_pass!(UndocumentedUnsafeBlocks => [UNDOCUMENTED_UNSAFE_BLOCKS, UNNECESSARY_SAFETY_COMMENT]);
-
 impl<'tcx> LateLintPass<'tcx> for UndocumentedUnsafeBlocks {
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>) {
         if block.rules == BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)
@@ -115,6 +118,7 @@ impl<'tcx> LateLintPass<'tcx> for UndocumentedUnsafeBlocks {
             && !is_lint_allowed(cx, UNDOCUMENTED_UNSAFE_BLOCKS, block.hir_id)
             && !is_unsafe_from_proc_macro(cx, block.span)
             && !block_has_safety_comment(cx, block.span, self.accept_comment_above_attributes)
+            && !block_has_inner_safety_comment(cx, block.span)
             && !block_parents_have_safety_comment(
                 self.accept_comment_above_statement,
                 self.accept_comment_above_attributes,
@@ -167,6 +171,9 @@ impl<'tcx> LateLintPass<'tcx> for UndocumentedUnsafeBlocks {
         else {
             return;
         };
+        // Compound assignments are expanded into a safe block, but the safety
+        // comment apply to the undesugared assignment nevertheless.
+        let expr = higher::CompoundAssignment::hir(expr).map_or(expr, |c| c.init);
         if !is_lint_allowed(cx, UNNECESSARY_SAFETY_COMMENT, stmt.hir_id)
             && !stmt.span.in_external_macro(cx.tcx.sess.source_map())
             && let HasSafetyComment::Yes(pos, _) =
@@ -388,7 +395,7 @@ fn expr_has_unnecessary_safety_comment<'tcx>(
     }
 
     // this should roughly be the reverse of `block_parents_have_safety_comment`
-    if for_each_expr(cx, expr, |expr| match expr.kind {
+    if for_each_expr(cx.tcx, expr, |expr| match expr.kind {
         hir::ExprKind::Block(
             Block {
                 rules: BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided),
@@ -821,7 +828,9 @@ fn text_has_safety_comment(
             // Don't lint if the safety comment is part of a codeblock in a doc comment.
             // It may or may not be required, and we can't very easily check it (and we shouldn't, since
             // the safety comment isn't referring to the node we're currently checking)
-            if line.trim_start_matches("///").trim_start().starts_with("```") {
+            if let Some(doc) = line.strip_prefix("///").or_else(|| line.strip_prefix("//!"))
+                && doc.trim_start().starts_with("```")
+            {
                 in_codeblock = !in_codeblock;
             }
 
@@ -838,6 +847,23 @@ fn text_has_safety_comment(
                 _ => return HasSafetyComment::No,
             }
         }
+    }
+    // Check for a comment that appears after other code on the same line (e.g., `let x = // SAFETY:`)
+    // This handles cases in macros where the comment is on the same line as preceding code.
+    // We only check the first (immediate preceding) line for this pattern.
+    // Only whitespace is allowed between the comment marker and `SAFETY:`.
+    if let Some(comment_start) = [line.find("//"), line.find("/*")].into_iter().flatten().min()
+        && let after_marker = &line[comment_start + 2..] // skip marker
+        && let trimmed = after_marker.trim_start() // skip whitespace
+        && trimmed.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("SAFETY:"))
+    {
+        let safety_offset = 2 + (after_marker.len() - trimmed.len());
+        return HasSafetyComment::Yes(
+            start_pos
+                + BytePos(u32::try_from(line_start).unwrap())
+                + BytePos(u32::try_from(comment_start + safety_offset).unwrap()),
+            false,
+        );
     }
     // No line comments; look for the start of a block comment.
     // This will only find them if they are at the start of a line.
@@ -893,4 +919,21 @@ fn is_const_or_static(node: &Node<'_>) -> bool {
             ..
         })
     )
+}
+
+fn block_has_inner_safety_comment(cx: &LateContext<'_>, span: Span) -> bool {
+    let source_map = cx.sess().source_map();
+    if let Ok(src) = source_map.span_to_snippet(span)
+        && let Some(after_brace) = src
+            .strip_prefix("unsafe")
+            .and_then(|s| s.trim_start().strip_prefix('{'))
+        && let Some(comment) = after_brace
+            .trim_start()
+            .strip_prefix("//")
+            .or_else(|| after_brace.trim_start().strip_prefix("/*"))
+    {
+        comment.trim_start().to_ascii_uppercase().starts_with("SAFETY:")
+    } else {
+        false
+    }
 }

@@ -1,5 +1,3 @@
-//@compile-flags: -Zmiri-genmc -Zmiri-disable-stacked-borrows
-
 // This test check for correct handling of atomic read-modify-write operations for all integer sizes.
 // Atomic max and min should return the previous value, and store the result in the atomic.
 // Atomic addition and subtraction should have wrapping semantics.
@@ -67,7 +65,7 @@ macro_rules! test_rmw_edge_cases {
         x.store(10, ORD);
         assert_eq(10, x.fetch_add(<$int>::MAX, ORD)); // definitely overflows, so new value of x is smaller than 10
         assert_eq(<$int>::MAX.wrapping_add(10), x.fetch_max(10, ORD)); // new value of x should be 10
-        // assert_eq(10, x.load(ORD)); // FIXME(genmc,#4572): enable this check once GenMC correctly handles min/max truncation.
+        assert_eq(10, x.load(ORD));
     }};
 }
 

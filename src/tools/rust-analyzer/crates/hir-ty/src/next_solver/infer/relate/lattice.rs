@@ -18,21 +18,26 @@
 //! [lattices]: https://en.wikipedia.org/wiki/Lattice_(order)
 
 use rustc_type_ir::{
-    AliasRelationDirection, TypeVisitableExt, Upcast, Variance,
-    inherent::{IntoKind, Span as _},
+    AliasRelationDirection, Interner, TypeVisitableExt, Upcast, Variance,
+    inherent::IntoKind,
     relate::{
         Relate, StructurallyRelateAliases, TypeRelation, VarianceDiagInfo,
-        combine::{PredicateEmittingRelation, super_combine_consts, super_combine_tys},
+        combine::{
+            PredicateEmittingRelation, combine_ty_args, super_combine_consts, super_combine_tys,
+        },
     },
 };
 
-use crate::next_solver::{
-    AliasTy, Binder, Const, DbInterner, Goal, ParamEnv, Predicate, PredicateKind, Region, Span, Ty,
-    TyKind,
-    infer::{
-        InferCtxt, TypeTrace,
-        relate::RelateResult,
-        traits::{Obligation, PredicateObligations},
+use crate::{
+    Span,
+    next_solver::{
+        AliasTy, Binder, Const, DbInterner, GenericArgs, Goal, ParamEnv, Predicate, PredicateKind,
+        Region, SolverDefId, Ty, TyKind,
+        infer::{
+            InferCtxt, TypeTrace,
+            relate::RelateResult,
+            traits::{Obligation, PredicateObligations},
+        },
     },
 };
 
@@ -80,6 +85,19 @@ impl<'infcx, 'db> LatticeOp<'infcx, 'db> {
 impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
     fn cx(&self) -> DbInterner<'db> {
         self.infcx.interner
+    }
+
+    fn relate_ty_args(
+        &mut self,
+        a_ty: Ty<'db>,
+        b_ty: Ty<'db>,
+        def_id: SolverDefId<'db>,
+        a_args: GenericArgs<'db>,
+        b_args: GenericArgs<'db>,
+        mk: impl FnOnce(GenericArgs<'db>) -> Ty<'db>,
+    ) -> RelateResult<'db, Ty<'db>> {
+        let variances = self.cx().variances_of(def_id);
+        combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, mk)
     }
 
     fn relate_with_variance<T: Relate<DbInterner<'db>>>(
@@ -139,19 +157,19 @@ impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
             // iterate on the subtype obligations that are returned, but I
             // think this suffices. -nmatsakis
             (TyKind::Infer(rustc_type_ir::TyVar(..)), _) => {
-                let v = infcx.next_ty_var();
+                let v = infcx.next_ty_var(self.span());
                 self.relate_bound(v, b, a)?;
                 Ok(v)
             }
             (_, TyKind::Infer(rustc_type_ir::TyVar(..))) => {
-                let v = infcx.next_ty_var();
+                let v = infcx.next_ty_var(self.span());
                 self.relate_bound(v, a, b)?;
                 Ok(v)
             }
 
             (
-                TyKind::Alias(rustc_type_ir::Opaque, AliasTy { def_id: a_def_id, .. }),
-                TyKind::Alias(rustc_type_ir::Opaque, AliasTy { def_id: b_def_id, .. }),
+                TyKind::Alias(AliasTy { kind: rustc_type_ir::Opaque { def_id: a_def_id }, .. }),
+                TyKind::Alias(AliasTy { kind: rustc_type_ir::Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id => super_combine_tys(infcx, self, a, b),
 
             _ => super_combine_tys(infcx, self, a, b),
@@ -163,10 +181,10 @@ impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
         let mut constraints = inner.unwrap_region_constraints();
         Ok(match self.kind {
             // GLB(&'static u8, &'a u8) == &RegionLUB('static, 'a) u8 == &'static u8
-            LatticeOpKind::Glb => constraints.lub_regions(self.cx(), a, b),
+            LatticeOpKind::Glb => constraints.lub_regions(self.cx(), self.span(), a, b),
 
             // LUB(&'static u8, &'a u8) == &RegionGLB('static, 'a) u8 == &'a u8
-            LatticeOpKind::Lub => constraints.glb_regions(self.cx(), a, b),
+            LatticeOpKind::Lub => constraints.glb_regions(self.cx(), self.span(), a, b),
         })
     }
 
@@ -224,7 +242,7 @@ impl<'infcx, 'db> LatticeOp<'infcx, 'db> {
 
 impl<'db> PredicateEmittingRelation<InferCtxt<'db>> for LatticeOp<'_, 'db> {
     fn span(&self) -> Span {
-        Span::dummy()
+        self.trace.cause.span()
     }
 
     fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
@@ -240,18 +258,13 @@ impl<'db> PredicateEmittingRelation<InferCtxt<'db>> for LatticeOp<'_, 'db> {
         preds: impl IntoIterator<Item: Upcast<DbInterner<'db>, Predicate<'db>>>,
     ) {
         self.obligations.extend(preds.into_iter().map(|pred| {
-            Obligation::new(self.infcx.interner, self.trace.cause.clone(), self.param_env, pred)
+            Obligation::new(self.infcx.interner, self.trace.cause, self.param_env, pred)
         }))
     }
 
     fn register_goals(&mut self, goals: impl IntoIterator<Item = Goal<'db, Predicate<'db>>>) {
         self.obligations.extend(goals.into_iter().map(|goal| {
-            Obligation::new(
-                self.infcx.interner,
-                self.trace.cause.clone(),
-                goal.param_env,
-                goal.predicate,
-            )
+            Obligation::new(self.infcx.interner, self.trace.cause, goal.param_env, goal.predicate)
         }))
     }
 

@@ -6,15 +6,12 @@ use rustc_ast::ast::LitKind;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::hir_id::CRATE_HIR_ID;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ExprKind, HirId, Item, MutTy, Mutability, Path, TyKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_hir::{CRATE_HIR_ID, ExprKind, HirId, Item, MutTy, Mutability, Path, TyKind};
+use rustc_lint::{LateContext, LateLintPass, declare_tool_lint, impl_lint_pass};
 use rustc_middle::hir::nested_filter;
-use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Symbol;
+use rustc_span::{Span, Spanned};
 
 declare_tool_lint! {
     /// ### What it does
@@ -250,8 +247,8 @@ pub(super) fn extract_clippy_version_value(cx: &LateContext<'_>, item: &'_ Item<
         if let hir::Attribute::Unparsed(attr_kind) = &attr
             // Identify attribute
             && let [tool_name, attr_name] = &attr_kind.path.segments[..]
-            && tool_name.name == sym::clippy
-            && attr_name.name == sym::version
+            && tool_name == &sym::clippy
+            && attr_name == &sym::version
             && let Some(version) = attr.value_str()
         {
             Some(version)
